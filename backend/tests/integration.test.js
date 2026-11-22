@@ -282,3 +282,92 @@ describe('Integration Tests - Error Handling', () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe('Integration Tests - Heavy Work Offloading', () => {
+  let issuerToken;
+
+  beforeAll(() => {
+    issuerToken = jwt.sign(
+      {
+        publicKey: process.env.ADMIN_PUBLIC_KEY || 'GADMIN',
+        role: 'issuer',
+        sub: process.env.ADMIN_PUBLIC_KEY || 'GADMIN',
+        wallet: process.env.ADMIN_PUBLIC_KEY || 'GADMIN',
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+  });
+
+  const REQUEST_BUDGET_MS = 500;
+
+  async function timedRequest(build) {
+    const start = Date.now();
+    const res = await build();
+    return { res, elapsed: Date.now() - start };
+  }
+
+  it('should return promptly from event scan endpoint', async () => {
+    const { res, elapsed } = await timedRequest(() =>
+      request(app)
+        .get('/events/scan')
+        .set('Authorization', `Bearer ${issuerToken}`)
+    );
+
+    expect([200, 202]).toContain(res.status);
+    expect(elapsed).toBeLessThan(REQUEST_BUDGET_MS);
+  });
+
+  it('should return promptly from analytics aggregation endpoint', async () => {
+    const { res, elapsed } = await timedRequest(() =>
+      request(app)
+        .get('/analytics/aggregate')
+        .set('Authorization', `Bearer ${issuerToken}`)
+    );
+
+    expect([200, 202]).toContain(res.status);
+    expect(elapsed).toBeLessThan(REQUEST_BUDGET_MS);
+  });
+
+  it('should return promptly from batch verification endpoint', async () => {
+    const { res, elapsed } = await timedRequest(() =>
+      request(app)
+        .post('/verify/batch')
+        .set('Authorization', `Bearer ${issuerToken}`)
+        .send({ wallets: [VALID_WALLET] })
+    );
+
+    expect([200, 202]).toContain(res.status);
+    expect(elapsed).toBeLessThan(REQUEST_BUDGET_MS);
+  });
+
+  it('should expose observable job status via jobs endpoint', async () => {
+    const res = await request(app)
+      .get('/jobs')
+      .set('Authorization', `Bearer ${issuerToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty('jobs');
+    expect(Array.isArray(res.body.jobs)).toBe(true);
+  });
+
+  it('should report status for a specific job', async () => {
+    const listRes = await request(app)
+      .get('/jobs')
+      .set('Authorization', `Bearer ${issuerToken}`);
+
+    expect(listRes.status).toBe(200);
+    expect(Array.isArray(listRes.body.jobs)).toBe(true);
+
+    if (listRes.body.jobs.length > 0) {
+      const jobId = listRes.body.jobs[0].id;
+      const res = await request(app)
+        .get(`/jobs/${jobId}`)
+        .set('Authorization', `Bearer ${issuerToken}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty('id', jobId);
+      expect(res.body).toHaveProperty('status');
+    }
+  });
+});

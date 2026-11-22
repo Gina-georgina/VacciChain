@@ -287,9 +287,107 @@ Content-Type: application/json
 
 ---
 
-## 5. Security Notes
+## 5. Verifier API Keys
+
+Third-party verifiers (schools, employers, border agencies) that need programmatic access to verification endpoints use **verifier API keys** instead of SEP-10 JWTs. Keys are managed by the VacciChain admin team and are designed to be individually scoped, rotated, and revoked.
+
+### 5.1 Provisioning
+
+Request a key through your VacciChain account manager or by emailing `integrations@vaccichain.io` with:
+
+- Your organization name and a technical contact.
+- The scopes you need (see below).
+- The environments you will call (`sandbox`, `production`).
+
+You will receive the key **once**, at creation time, in the form:
+
+```
+vc_live_<key_id>_<secret>
+```
+
+**Store it in a secrets manager.** VacciChain only stores a salted hash of the secret portion; the plaintext key cannot be retrieved again. If you lose it, you must rotate (see 5.3).
+
+### 5.2 Scopes
+
+Each key carries an explicit set of scopes. A request made with a key that lacks the required scope is rejected with `403`.
+
+| Scope | Grants access to |
+|-------|------------------|
+| `verify:read` | `GET /verify/:wallet` |
+| `batch:verify` | `POST /batch/verify` |
+| `records:read` | `GET /vaccination/:wallet` (authenticated record detail) |
+
+Keys are scoped per environment; a `sandbox` key cannot be used against `production`. Request the minimum scopes your integration needs — do not request `records:read` unless you actually display record details.
+
+### 5.3 Rotation
+
+Rotate keys on a schedule (we recommend every 90 days) and immediately if a key may have been exposed.
+
+1. Request a new key with the **same scopes** as the existing one.
+2. Deploy the new key to your systems and confirm traffic succeeds.
+3. Revoke the old key (see 5.4).
+
+Both keys are valid during the overlap window, so rotation requires no downtime. The overlap window is capped at **7 days**; after that the old key is revoked automatically.
+
+### 5.4 Revocation
+
+Revoke a key via the admin API or by contacting support:
+
+```
+DELETE /admin/verifier-keys/:key_id
+Authorization: Bearer <admin token>
+```
+
+Revocation takes effect immediately. Requests using a revoked key receive `401` with `error: "API key revoked"`. Revocation is permanent — a revoked key cannot be re-enabled; issue a new one instead.
+
+### 5.5 Audit
+
+Every key lifecycle event (creation, scope change, rotation, revocation) is recorded in an audit log with the actor, timestamp, and affected `key_id`. Key usage is also logged per request (key id, endpoint, status, timestamp) so you can detect unexpected traffic. Contact support to obtain an audit export for your organization.
+
+### 5.6 Handling `401` and `403` for keys
+
+| Status | Error message | Cause | Action |
+|--------|--------------|-------|--------|
+| `401` | `API key required` | No `X-API-Key` header sent | Add the header |
+| `401` | `API key revoked` | Key was revoked | Stop using it; issue a new key |
+| `401` | `API key expired` | Key passed its rotation deadline | Rotate to a new key |
+| `403` | `Insufficient scope` | Key lacks the scope for this endpoint | Request the scope or use a different key |
+
+Send the key in the `X-API-Key` header:
+
+```js
+const res = await fetch("https://api.vaccichain.io/verify/GABCDEF...", {
+  headers: { "X-API-Key": process.env.VACCICHAIN_API_KEY },
+});
+if (res.status === 401 || res.status === 403) {
+  // Do not retry blindly — the key is revoked, expired, or out of scope.
+  throw new Error(`Verifier key rejected: ${(await res.json()).error}`);
+}
+```
+
+```python
+import os, httpx
+
+def verify_with_key(wallet: str) -> dict:
+    r = httpx.get(
+        f"https://api.vaccichain.io/verify/{wallet}",
+        headers={"X-API-Key": os.environ["VACCICHAIN_API_KEY"]},
+    )
+    if r.status_code in (401, 403):
+        # Do not retry blindly — the key is revoked, expired, or out of scope.
+        raise RuntimeError(f"Verifier key rejected: {r.json()['error']}")
+    r.raise_for_status()
+    return r.json()
+```
+
+Do **not** retry `401`/`403` responses in a loop; they indicate a configuration problem that requires operator action.
+
+---
+
+## 6. Security Notes
 
 - Vaccination records are **soulbound on-chain** — they cannot be transferred or forged at the contract level. A positive `vaccinated: true` response is cryptographically guaranteed.
 - Always verify the wallet address belongs to the person presenting it through your own identity verification process. VacciChain confirms the record exists on-chain; it does not confirm identity.
 - JWTs are scoped by role (`patient` or `issuer`) and expire after 1 hour.
 - SEP-10 nonces are single-use. A replayed challenge will be rejected with `401`.
+- Verifier API keys are stored only as salted hashes; treat the plaintext key like a password and never commit it to source control.

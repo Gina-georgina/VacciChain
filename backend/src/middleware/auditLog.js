@@ -36,6 +36,32 @@ function audit({ actor, action, target = null, result, meta = {} }) {
 }
 
 /**
+ * Record a structured verifier API-key lifecycle event.
+ *
+ * Lifecycle actions:
+ *   'verifier_key.provision', 'verifier_key.rotate', 'verifier_key.revoke'
+ *
+ * @param {object} opts
+ * @param {string} opts.keyId   - Identifier of the verifier API key (actor)
+ * @param {string} opts.action  - Lifecycle action (see above)
+ * @param {string} [opts.target] - Verifier/org the key belongs to
+ * @param {string} opts.result  - 'success' | 'failure'
+ * @param {string[]} [opts.scopes] - Scopes attached to the key at event time
+ * @param {string} [opts.reason]   - Human-readable reason (e.g. revocation cause)
+ * @param {object} [opts.meta]     - Any extra context
+ */
+function auditVerifierKey({ keyId, action, target = null, result, scopes = [], reason = null, meta = {} }) {
+  audit({
+    actor: keyId,
+    action,
+    target,
+    result,
+    meta: { ...meta, scopes, reason },
+  });
+}
+=======
+
+/**
  * Read all audit entries, optionally filtered by actor and/or date range.
  *
  * @param {object} filters
@@ -44,7 +70,7 @@ function audit({ actor, action, target = null, result, meta = {} }) {
  * @param {string} [filters.to]     - ISO date string (inclusive)
  * @returns {object[]}
  */
-function queryAuditLog({ actor, from, to } = {}) {
+function queryAuditLog({ actor, action, from, to } = {}) {
   if (!fs.existsSync(AUDIT_LOG_PATH)) return [];
 
   const fromMs = from ? new Date(from).getTime() : null;
@@ -61,6 +87,7 @@ function queryAuditLog({ actor, from, to } = {}) {
 
   return entries.filter(e => {
     if (actor && e.actor !== actor) return false;
+    if (action && e.action !== action) return false;
     const ts = new Date(e.timestamp).getTime();
     if (fromMs && ts < fromMs) return false;
     if (toMs   && ts > toMs)   return false;
@@ -68,4 +95,19 @@ function queryAuditLog({ actor, from, to } = {}) {
   });
 }
 
-module.exports = { audit, queryAuditLog };
+/**
+ * Query audit entries for a single verifier API key, optionally narrowed to
+ * one lifecycle action. Useful for asserting rotation/revocation history.
+ *
+ * @param {string} keyId
+ * @param {object} [filters]
+ * @param {string} [filters.action]
+ * @param {string} [filters.from]
+ * @param {string} [filters.to]
+ * @returns {object[]}
+ */
+function queryVerifierKeyAudit(keyId, { action, from, to } = {}) {
+  return queryAuditLog({ actor: keyId, action, from, to });
+}
+
+module.exports = { audit, auditVerifierKey, queryAuditLog, queryVerifierKeyAudit };

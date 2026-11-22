@@ -10,6 +10,83 @@ The backend validates its variables at startup via [Zod](https://zod.dev/). A mi
 
 ---
 
+## Startup validation
+
+Configuration is validated **before the HTTP port is bound**. If any check fails the process prints an aggregated report to stderr and exits with code `1`; the server never starts in a half-configured state.
+
+Validation runs in two phases:
+
+1. **Field validation** — each variable is checked against its type/format rule (see the [validation summary](#validation-summary)).
+2. **Cross-field validation** — combinations of variables are checked for contradictions (see [cross-field constraints](#cross-field-constraints)).
+
+All failures from both phases are collected and reported together, so a single startup attempt surfaces every problem instead of one at a time.
+
+### Aggregated error format
+
+Each failing check is printed on its own line as `VARIABLE: message`, grouped under a header, followed by a hint:
+
+```
+Invalid configuration — 3 problem(s) found:
+
+  HORIZON_URL: must be a valid URL (received "horizon-testnet")
+  STELLAR_NETWORK_PASSPHRASE: does not match STELLAR_NETWORK=testnet (expected "Test SDF Network ; September 2015")
+  ADMIN_PUBLIC_KEY: does not correspond to ADMIN_SECRET_KEY
+
+Fix the variables above and restart. See docs/configuration.md for details.
+```
+
+Cross-field failures name every variable involved so the contradiction is obvious. The process exits with code `1` and no port is bound.
+
+### Cross-field constraints
+
+| Constraint | Rule | Example failure |
+|---|---|---|
+| Network ↔ Horizon | `HORIZON_URL` host must belong to the network selected by `STELLAR_NETWORK` | `STELLAR_NETWORK=mainnet` with `HORIZON_URL=https://horizon-testnet.stellar.org` |
+| Network ↔ Soroban RPC | `SOROBAN_RPC_URL` host must belong to the network selected by `STELLAR_NETWORK` | `STELLAR_NETWORK=testnet` with `SOROBAN_RPC_URL=https://mainnet.sorobanrpc.com` |
+| Network ↔ passphrase | `STELLAR_NETWORK_PASSPHRASE` must equal the canonical passphrase for `STELLAR_NETWORK` | `STELLAR_NETWORK=testnet` with the mainnet passphrase |
+| Admin key pair | `ADMIN_PUBLIC_KEY` must be the public key derived from `ADMIN_SECRET_KEY` | Public key from a different account |
+| Key separation | `SEP10_SERVER_KEY` and `ISSUER_SECRET_KEY` must differ from `ADMIN_SECRET_KEY` | Reusing the admin key as the SEP-10 signer |
+| Contract address | `VACCINATIONS_CONTRACT_ID` must be a 56-character `C...` address | `VACCINATIONS_CONTRACT_ID=my-contract` |
+| Ports | `PORT` and `ANALYTICS_PORT` must differ | Both set to `4000` |
+| Rate limits | `RATE_LIMIT_SEP10` and `RATE_LIMIT_VERIFY` must be positive integers | `RATE_LIMIT_VERIFY=0` |
+| Webhook type ↔ secret | `PAGERDUTY_ROUTING_KEY` required when `ALERT_WEBHOOK_TYPE=pagerduty`; `ALERT_EMAIL_TO` required when `ALERT_WEBHOOK_TYPE=email` | `ALERT_WEBHOOK_TYPE=pagerduty` with no routing key |
+| Webhook URL | `ALERT_WEBHOOK_URL` must be HTTPS when set | `ALERT_WEBHOOK_URL=http://hooks.example.com` |
+
+### Examples of contradictory configurations
+
+**Wrong network pairing** — mainnet selected but testnet endpoints supplied:
+
+```bash
+STELLAR_NETWORK=mainnet
+HORIZON_URL=https://horizon-testnet.stellar.org
+SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
+STELLAR_NETWORK_PASSPHRASE=Test SDF Network ; September 2015
+```
+
+**Mismatched admin key pair** — public key does not belong to the secret key:
+
+```bash
+ADMIN_SECRET_KEY=SCZANGBA5RLMPI7JMTP2UOF4BIZX4ICOAP7MWKPKZUEZFEKNUMBMFTA
+ADMIN_PUBLIC_KEY=GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZWM9CQJKR3BSQNEWVZSR
+```
+
+**Webhook type without its secret** — PagerDuty selected but no routing key:
+
+```bash
+ALERT_WEBHOOK_TYPE=pagerduty
+ALERT_WEBHOOK_URL=https://events.pagerduty.com/v2/enqueue
+# PAGERDUTY_ROUTING_KEY is missing
+```
+
+**Port collision** — backend and analytics bound to the same port:
+
+```bash
+PORT=4000
+ANALYTICS_PORT=4000
+```
+
+---
+
 ## Stellar / Soroban
 
 ### `STELLAR_NETWORK`
