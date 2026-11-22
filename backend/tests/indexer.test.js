@@ -137,6 +137,97 @@ describe('poller — parseEvent', () => {
   });
 });
 
+describe('persistence strategy — locking, backup, failover, migration', () => {
+  const { backupDb, restoreDb, migrateDb, withWriteLock } = require('../src/indexer/db');
+  const strategy = require('../src/indexer/persistenceStrategy');
+
+  it('documents a load and failure analysis comparing SQLite with a multi-writer database', () => {
+    const analysis = strategy.loadAndFailureAnalysis();
+    expect(analysis).toBeDefined();
+    expect(analysis.currentStorage).toMatch(/sqlite/i);
+    expect(analysis.multiWriterOption).toBeDefined();
+    expect(typeof analysis.multiWriterOption.name).toBe('string');
+    expect(analysis.multiWriterOption.name.length).toBeGreaterThan(0);
+    expect(Array.isArray(analysis.comparison)).toBe(true);
+    expect(analysis.comparison.length).toBeGreaterThan(0);
+    expect(analysis.selectedArchitecture).toBeDefined();
+  });
+
+  it('serialises concurrent writes through the write lock without losing events', async () => {
+    const writes = [];
+    for (let i = 0; i < 20; i += 1) {
+      writes.push(
+        withWriteLock(() =>
+          upsertEvents([
+            {
+              id: `lock-${i}`,
+              event_type: 'VaccinationMinted',
+              ledger: 500 + i,
+              timestamp: 1700000000 + i,
+              contract_id: 'CABC',
+              payload: { seq: i },
+            },
+          ])
+        )
+      );
+    }
+    await Promise.all(writes);
+    const stored = queryEvents({ event_type: 'VaccinationMinted' }).filter((e) =>
+      e.id.startsWith('lock-')
+    );
+    expect(stored.length).toBe(20);
+  });
+
+  it('backs up and restores the index without data loss', async () => {
+    const backupPath = path.join(os.tmpdir(), `vaccichain-backup-${Date.now()}.db`);
+    try {
+      await backupDb(backupPath);
+      expect(fs.existsSync(backupPath)).toBe(true);
+
+      const before = queryEvents().length;
+      await restoreDb(backupPath);
+      const after = queryEvents().length;
+      expect(after).toBe(before);
+    } finally {
+      if (fs.existsSync(backupPath)) fs.unlinkSync(backupPath);
+    }
+  });
+
+  it('recovers from a simulated failover by reopening the database', async () => {
+    const failoverPath = path.join(os.tmpdir(), `vaccichain-failover-${Date.now()}.db`);
+    try {
+      await initDb(failoverPath);
+      upsertEvents([
+        {
+          id: 'failover-001',
+          event_type: 'IssuerAdded',
+          ledger: 900,
+          timestamp: 1700000000,
+          contract_id: 'CABC',
+          payload: { issuer: 'GISSUER9' },
+        },
+      ]);
+      // Simulate failover: re-initialise against the same file.
+      await initDb(failoverPath);
+      const recovered = queryEvents({ event_type: 'IssuerAdded' }).filter(
+        (e) => e.id === 'failover-001'
+      );
+      expect(recovered.length).toBe(1);
+    } finally {
+      await initDb(tmpDb);
+      if (fs.existsSync(failoverPath)) fs.unlinkSync(failoverPath);
+    }
+  });
+
+  it('runs migrations idempotently and reports the schema version', async () => {
+    const first = await migrateDb();
+    const second = await migrateDb();
+    expect(typeof first.version).toBe('number');
+    expect(second.version).toBe(first.version);
+    expect(second.applied).toBe(0);
+  });
+});
+
 describe('GET /events route', () => {
   const request = require('supertest');
   const app = require('../src/app');

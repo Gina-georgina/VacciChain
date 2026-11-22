@@ -59,3 +59,60 @@ describe('Verify route', () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe('Proxy header validation and client IP derivation', () => {
+  const { getClientIp } = require('../src/middleware/clientIp');
+
+  function makeReq({ socketAddress, headers = {} }) {
+    return {
+      socket: { remoteAddress: socketAddress },
+      headers,
+      ip: socketAddress,
+    };
+  }
+
+  it('derives the socket address for direct (non-proxied) requests', () => {
+    const req = makeReq({
+      socketAddress: '203.0.113.10',
+      headers: { 'x-forwarded-for': '198.51.100.99' },
+    });
+    expect(getClientIp(req)).toBe('203.0.113.10');
+  });
+
+  it('derives the client identity from trusted proxy headers', () => {
+    const req = makeReq({
+      socketAddress: '10.0.0.5',
+      headers: { 'x-forwarded-for': '198.51.100.42, 10.0.0.5' },
+    });
+    expect(getClientIp(req, { trustedProxies: ['10.0.0.5'] })).toBe('198.51.100.42');
+  });
+
+  it('ignores spoofed forwarded headers from untrusted peers', () => {
+    const req = makeReq({
+      socketAddress: '203.0.113.10',
+      headers: { 'x-forwarded-for': '1.2.3.4' },
+    });
+    expect(getClientIp(req, { trustedProxies: ['10.0.0.5'] })).toBe('203.0.113.10');
+  });
+
+  it('does not let spoofed forwarded headers bypass rate limits', async () => {
+    const spoofed = { 'x-forwarded-for': '1.2.3.4' };
+    let lastStatus = 200;
+    for (let i = 0; i < 50; i += 1) {
+      const res = await request(app).get('/health').set(spoofed);
+      lastStatus = res.status;
+      if (res.status === 429) break;
+    }
+    expect(lastStatus).toBe(429);
+  });
+
+  it('attributes audit entries to the derived client identity', () => {
+    const req = makeReq({
+      socketAddress: '10.0.0.5',
+      headers: { 'x-forwarded-for': '198.51.100.42, 10.0.0.5' },
+    });
+    const identity = getClientIp(req, { trustedProxies: ['10.0.0.5'] });
+    expect(identity).not.toBe('10.0.0.5');
+    expect(identity).toBe('198.51.100.42');
+  });
+});

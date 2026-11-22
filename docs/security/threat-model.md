@@ -19,7 +19,7 @@
 | JWT secret (`JWT_SECRET`) | Backend environment | High — forging it grants arbitrary role claims |
 | Verifier API keys | Backend SQLite DB (`api_keys` table) | Medium — grants bulk verification access |
 | SEP-10 nonces | In-memory nonce store | Medium — single-use; expiry limits window |
-| Audit log (`audit.log`) | Backend filesystem | Medium — append-only NDJSON; contains wallet + action history |
+| Audit log (`audit.log`) | Backend filesystem | Medium — append-only NDJSON with hash chaining (tamper-evident); contains wallet + action history |
 | Backend indexer SQLite DB | Backend filesystem | Medium — indexed on-chain events cache |
 | Contract WASM / upgrade path | On-chain deployer | Critical — malicious upgrade replaces all logic |
 
@@ -103,12 +103,14 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 | B-S2 | Spoofing | Attacker forges a JWT to claim `issuer` role | JWTs signed with `JWT_SECRET` (HS256); `authMiddleware` validates `sub`, `role`, `wallet`, `exp` claims | Low — depends on `JWT_SECRET` secrecy |
 | B-S3 | Spoofing | Attacker submits a crafted SEP-10 transaction with a fake server signature | `verifyChallenge` checks server signature against `SEP10_SERVER_KEY` before accepting | Low |
 | B-T1 | Tampering | Attacker injects malicious wallet address into `/vaccination/issue` body | `wallet.js` middleware validates Stellar public key format (starts with `G`, 56 chars); Soroban contract re-validates | Low |
-| B-T2 | Tampering | Attacker tampers with audit log to hide actions | Audit log is append-only NDJSON; no delete endpoint exists | Medium — filesystem access enables tampering; use write-once storage in production |
-| B-R1 | Repudiation | Issuer denies calling `/vaccination/issue` | `auditLog.js` middleware records every mutating request with wallet, role, endpoint, timestamp, and response status | Low |
+| B-T2 | Tampering | Attacker tampers with audit log to hide actions | Audit log is append-only NDJSON with hash chaining: each entry includes `prevHash` and its own `hash`, so any modification or deletion breaks the chain and is detected by the integrity verifier; no delete endpoint exists | Low — filesystem access still enables wholesale replacement; use write-once storage in production |
+| B-R1 | Repudiation | Issuer denies calling `/vaccination/issue` | `auditLog.js` middleware records every mutating request (mint, revoke, consent, administrative changes) with actor, request ID, action outcome, timestamp, and response status | Low |
+| B-S4 | Spoofing | Attacker spoofs `X-Forwarded-For` / `Forwarded` headers to bypass rate limits or corrupt audit attribution | Express `trust proxy` is configured to match the deployed load-balancer topology; client IP is derived only from trusted hops, and untrusted forwarded headers are ignored | Low — depends on correct deployment configuration |
 | B-I1 | Information Disclosure | Secret keys leaked via error responses or logs | `config.js` validates env vars at startup; logger uses structured JSON (no raw error stack to client) | Medium — review all error handlers before mainnet |
 | B-I2 | Information Disclosure | CORS misconfiguration exposes API to arbitrary origins | CORS configured in `app.js`; verify allowed origins are restricted in production | Medium — confirm production CORS allowlist |
 | B-D1 | Denial of Service | Flood `/auth/sep10` to exhaust Horizon account sequence numbers | `sep10Limiter`: 10 req/IP/min; `verifyLimiter`: 60 req/IP/min | Low |
 | B-D2 | Denial of Service | Oversized request body crashes the parser | `body-limit` middleware enforced (tested in `body-limit.test.js`) | Low |
+| B-D4 | Denial of Service | Unbounded record histories or batch inputs exhaust memory, CPU, or response bandwidth | Public record responses are paginated/truncated to a documented maximum; batch requests are capped at a documented maximum size and rejected above it; boundary behavior tested at, below, and above each limit | Low |
 | B-D3 | Denial of Service | Soroban RPC unavailability blocks all minting | `withRetry` in `soroban.js` retries with exponential backoff up to `SOROBAN_RPC_MAX_RETRIES` | Medium — no circuit breaker; prolonged RPC outage blocks all writes |
 | B-E1 | Elevation of Privilege | Patient JWT used to call issuer-only `/vaccination/issue` | `issuerMiddleware` checks `req.user.role === 'issuer'` after `authMiddleware` | Low |
 | B-E2 | Elevation of Privilege | Verifier API key used to call authenticated patient/issuer routes | Verifier routes use `verifierApiKey` middleware, not JWT; separate middleware chains | Low |
@@ -132,7 +134,7 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 | A-S1 | Spoofing | Unauthenticated caller accesses analytics endpoints | `/analytics/*` endpoints currently have no auth; `_bearer` variable is defined but not applied as a dependency in routes | **High — add auth before production** |
 | A-T1 | Tampering | Attacker sends crafted event data to skew analytics | Analytics reads from backend `/events` endpoint (read-only); no write path into analytics | Low |
 | A-I1 | Information Disclosure | Bulk harvest of issuer activity and anomaly data | No rate limiting on analytics endpoints; no auth (see A-S1) | High — blocked by fixing A-S1 |
-| A-D1 | Denial of Service | Flood `/batch/verify` with 100-wallet requests to amplify load on backend | Batch capped at 100 wallets per request; no rate limit on the analytics service itself | Medium — add rate limiting |
+| A-D1 | Denial of Service | Flood `/batch/verify` with 100-wallet requests to amplify load on backend | Batch capped at 100 wallets per request (documented limit; oversized batches rejected); no rate limit on the analytics service itself | Medium — add rate limiting |
 | A-E1 | Elevation of Privilege | Analytics service calls backend with elevated privileges | Analytics only calls public `/verify/:wallet` and `/events`; no JWT or admin key used | Low |
 
 ---
@@ -145,11 +147,12 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 | OR-2 | Analytics endpoints have no authentication (`_bearer` defined but not wired) | **High** | Python service | Apply `HTTPBearer` dependency to all analytics routes |
 | OR-3 | JWT storage in frontend — if stored in localStorage, vulnerable to XSS | **High** | Frontend | Move to `httpOnly` cookie or confirm current storage is safe |
 | OR-4 | Admin key is a single point of failure; compromise enables malicious issuer addition and contract upgrade | **High** | DevOps | Store in hardware wallet or cloud HSM; monitor `iss_add` and `upgraded` events |
-| OR-5 | Audit log on local filesystem — writable by process; no integrity protection | **Medium** | Backend / Infra | Use append-only log sink (e.g., Loki, CloudWatch Logs) in production |
+| OR-5 | Audit log on local filesystem — writable by process; hash chaining detects tampering but not wholesale replacement | **Medium** | Backend / Infra | Ship to append-only log sink (e.g., Loki, CloudWatch Logs); document and test rotation, retention, integrity verification, and failure handling |
 | OR-6 | No rate limiting on Python analytics service | **Medium** | Python service | Add `slowapi` or nginx rate limiting in front of the service |
 | OR-7 | CORS allowlist not verified for production — may be open | **Medium** | Backend | Restrict `Access-Control-Allow-Origin` to known frontend domain |
 | OR-8 | Soroban RPC outage has no circuit breaker — prolonged outage blocks all writes with no user feedback | **Low** | Backend | Add circuit breaker or health-check endpoint |
 | OR-9 | `nonceStore` is in-memory — restarting the backend invalidates all in-flight SEP-10 challenges | **Low** | Backend | Acceptable for single-instance; use Redis-backed store for multi-instance deployments |
+| OR-10 | `trust proxy` misconfiguration could allow spoofed forwarded headers to bypass rate limits or corrupt audit attribution | **Medium** | Backend / Infra | Verify trust-proxy settings match load-balancer topology; integration tests cover direct and proxied client identity derivation |
 
 ---
 
@@ -159,9 +162,11 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 - [ ] OR-2: Analytics routes protected with JWT or API key auth
 - [ ] OR-3: JWT stored in `httpOnly` cookie, not localStorage
 - [ ] OR-4: Admin key in HSM or hardware wallet; event monitoring configured
-- [ ] OR-5: Audit log shipped to tamper-evident sink
+- [ ] OR-5: Audit log shipped to tamper-evident sink; rotation, retention, integrity verification, and failure handling documented and tested
 - [ ] OR-6: Rate limiting on analytics service
 - [ ] OR-7: CORS restricted to production frontend domain
+- [ ] OR-10: `trust proxy` configured for deployed load-balancer topology; proxied client identity verified by integration tests
+- [ ] Public verification response and batch size limits documented; boundary tests pass
 - [ ] All secret keys rotated from testnet values
 - [ ] `STELLAR_NETWORK` set to `mainnet` with correct `STELLAR_NETWORK_PASSPHRASE`
 - [ ] Threat model reviewed and signed off by security reviewer
@@ -173,3 +178,4 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 | Date | Version | Author | Notes |
 |---|---|---|---|
 | 2026-04-28 | 1.0 | — | Initial full threat model (issue #112) |
+| 2026-04-28 | 1.1 | — | Added hash-chained audit logging, proxy header validation, and bounded verification response mitigations (issues #54, #56, #57) |

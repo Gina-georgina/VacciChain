@@ -72,6 +72,50 @@
         {
           "name": "PORT",
           "value": "4000"
+        },
+        {
+          "name": "PERSISTENCE_STRATEGY",
+          "value": "sqlite"
+        },
+        {
+          "name": "SQLITE_BUSY_TIMEOUT_MS",
+          "value": "5000"
+        },
+        {
+          "name": "SQLITE_JOURNAL_MODE",
+          "value": "WAL"
+        },
+        {
+          "name": "TRUST_PROXY",
+          "value": "1"
+        },
+        {
+          "name": "PUBLIC_VERIFICATION_MAX_RECORDS",
+          "value": "100"
+        },
+        {
+          "name": "PUBLIC_VERIFICATION_MAX_BATCH_SIZE",
+          "value": "50"
+        },
+        {
+          "name": "PUBLIC_VERIFICATION_DEFAULT_PAGE_SIZE",
+          "value": "20"
+        },
+        {
+          "name": "AUDIT_LOG_ENABLED",
+          "value": "true"
+        },
+        {
+          "name": "AUDIT_LOG_RETENTION_DAYS",
+          "value": "90"
+        },
+        {
+          "name": "AUDIT_LOG_MAX_FILE_SIZE_MB",
+          "value": "100"
+        },
+        {
+          "name": "AUDIT_LOG_INTEGRITY_ALGORITHM",
+          "value": "sha256"
         }
       ],
       "secrets": [

@@ -9,6 +9,89 @@ const path = require('path');
 let db = null;
 let dbPath = null;
 
+// ── Persistence / concurrency controls ───────────────────────────────────────
+// The store is a single in-memory sql.js database flushed to disk. To make it
+// safe for the multi-writer deployment analysis (backlog #52) we serialize all
+// writes through an in-process lock, write atomically (temp file + rename) and
+// keep a bounded set of timestamped backups so durability/failover can be
+// exercised and validated.
+
+const LOCK_TIMEOUT_MS = 5000;
+const BACKUP_DIR_SUFFIX = '.backups';
+const MAX_BACKUPS = 5;
+
+let writeLock = Promise.resolve();
+let lockDepth = 0;
+let migrationHooks = [];
+
+/** Run `fn` while holding the exclusive write lock (serializes writers). */
+async function withWriteLock(fn) {
+  const previous = writeLock;
+  let release;
+  writeLock = new Promise((resolve) => { release = resolve; });
+
+  const acquired = await Promise.race([
+    previous.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), LOCK_TIMEOUT_MS)),
+  ]);
+  if (!acquired) {
+    release();
+    throw new Error('Timed out acquiring database write lock');
+  }
+
+  lockDepth += 1;
+  try {
+    return await fn();
+  } finally {
+    lockDepth -= 1;
+    release();
+  }
+}
+
+/** True when the current call stack holds the write lock. */
+function isLocked() {
+  return lockDepth > 0;
+}
+
+function backupDir() {
+  return dbPath ? `${dbPath}${BACKUP_DIR_SUFFIX}` : null;
+}
+
+/** Atomically persist the in-memory DB to disk (temp file + rename). */
+function flush() {
+  if (!db || !dbPath) return;
+  const data = Buffer.from(db.export());
+  const tmpPath = `${dbPath}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmpPath, data);
+  fs.renameSync(tmpPath, dbPath);
+}
+
+/** Persist a timestamped backup copy and prune old ones. */
+function backup() {
+  if (!db || !dbPath) return null;
+  const dir = backupDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const target = path.join(dir, `backup-${Date.now()}.sqlite`);
+  fs.writeFileSync(target, Buffer.from(db.export()));
+
+  const backups = fs.readdirSync(dir)
+    .filter((f) => f.startsWith('backup-') && f.endsWith('.sqlite'))
+    .sort();
+  while (backups.length > MAX_BACKUPS) {
+    fs.unlinkSync(path.join(dir, backups.shift()));
+  }
+  return target;
+}
+
+/** Register a migration hook: fn(db) => void, run once on init. */
+function registerMigration(fn) {
+  if (typeof fn === 'function') migrationHooks.push(fn);
+}
+
+function runMigrations() {
+  for (const hook of migrationHooks) hook(db);
+}
+
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS events (
     id          TEXT PRIMARY KEY,
@@ -68,6 +151,7 @@ async function initDb(filePath) {
   }
 
   db.run(SCHEMA);
+  runMigrations();
   flush();
   return db;
 }
@@ -76,16 +160,25 @@ async function initDb(filePath) {
  * Upsert a batch of events. Deduplicates by id (PRIMARY KEY conflict = ignore).
  * @param {Array<{id, event_type, ledger, timestamp, contract_id, payload}>} events
  */
-function upsertEvents(events) {
+async function upsertEvents(events) {
   if (!events.length) return;
-  const stmt = db.prepare(
-    'INSERT OR IGNORE INTO events (id, event_type, ledger, timestamp, contract_id, payload) VALUES (?,?,?,?,?,?)'
-  );
-  for (const e of events) {
-    stmt.run([e.id, e.event_type, e.ledger, e.timestamp, e.contract_id, JSON.stringify(e.payload)]);
-  }
-  stmt.free();
-  flush();
+  await withWriteLock(() => {
+    db.run('BEGIN');
+    try {
+      const stmt = db.prepare(
+        'INSERT OR IGNORE INTO events (id, event_type, ledger, timestamp, contract_id, payload) VALUES (?,?,?,?,?,?)'
+      );
+      for (const e of events) {
+        stmt.run([e.id, e.event_type, e.ledger, e.timestamp, e.contract_id, JSON.stringify(e.payload)]);
+      }
+      stmt.free();
+      db.run('COMMIT');
+    } catch (err) {
+      db.run('ROLLBACK');
+      throw err;
+    }
+    flush();
+  });
 }
 
 /**
@@ -123,12 +216,14 @@ function getLatestLedger() {
 
 // ── API key CRUD ──────────────────────────────────────────────────────────────
 
-function insertApiKey({ id, key_hash, label, created_at }) {
-  db.run(
-    'INSERT INTO api_keys (id, key_hash, label, created_at, revoked) VALUES (?,?,?,?,0)',
-    [id, key_hash, label, created_at]
-  );
-  flush();
+async function insertApiKey({ id, key_hash, label, created_at }) {
+  await withWriteLock(() => {
+    db.run(
+      'INSERT INTO api_keys (id, key_hash, label, created_at, revoked) VALUES (?,?,?,?,0)',
+      [id, key_hash, label, created_at]
+    );
+    flush();
+  });
 }
 
 function getApiKeyByHash(key_hash) {
@@ -151,21 +246,47 @@ function listApiKeys() {
   });
 }
 
-function revokeApiKey(id) {
-  db.run('UPDATE api_keys SET revoked = 1 WHERE id = ?', [id]);
-  flush();
+async function revokeApiKey(id) {
+  await withWriteLock(() => {
+    db.run('UPDATE api_keys SET revoked = 1 WHERE id = ?', [id]);
+    flush();
+  });
 }
 
-module.exports = { initDb, upsertEvents, queryEvents, getLatestLedger, insertApiKey, getApiKeyByHash, listApiKeys, revokeApiKey, getConsent, recordConsent, hasConsented, insertIssuerApplication, getIssuerApplication, listIssuerApplications, updateIssuerApplicationStatus };
+module.exports = {
+  initDb,
+  upsertEvents,
+  queryEvents,
+  getLatestLedger,
+  insertApiKey,
+  getApiKeyByHash,
+  listApiKeys,
+  revokeApiKey,
+  getConsent,
+  recordConsent,
+  hasConsented,
+  insertIssuerApplication,
+  getIssuerApplication,
+  listIssuerApplications,
+  updateIssuerApplicationStatus,
+  // persistence / concurrency helpers (backlog #52)
+  withWriteLock,
+  isLocked,
+  flush,
+  backup,
+  registerMigration,
+};
 
 // ── Patient consent ───────────────────────────────────────────────────────────
 
-function recordConsent(wallet) {
-  db.run(
-    'INSERT OR IGNORE INTO patient_consent (wallet, consented_at) VALUES (?, ?)',
-    [wallet, new Date().toISOString()]
-  );
-  flush();
+async function recordConsent(wallet) {
+  await withWriteLock(() => {
+    db.run(
+      'INSERT OR IGNORE INTO patient_consent (wallet, consented_at) VALUES (?, ?)',
+      [wallet, new Date().toISOString()]
+    );
+    flush();
+  });
 }
 
 function getConsent(wallet) {
@@ -183,13 +304,15 @@ function hasConsented(wallet) {
 
 // ── Issuer onboarding applications ───────────────────────────────────────────
 
-function insertIssuerApplication({ id, wallet, name, license_number, country, submitted_at }) {
-  db.run(
-    `INSERT INTO issuer_applications (id, wallet, name, license_number, country, status, submitted_at)
-     VALUES (?,?,?,?,?,'pending',?)`,
-    [id, wallet, name, license_number, country, submitted_at]
-  );
-  flush();
+async function insertIssuerApplication({ id, wallet, name, license_number, country, submitted_at }) {
+  await withWriteLock(() => {
+    db.run(
+      `INSERT INTO issuer_applications (id, wallet, name, license_number, country, status, submitted_at)
+       VALUES (?,?,?,?,?,'pending',?)`,
+      [id, wallet, name, license_number, country, submitted_at]
+    );
+    flush();
+  });
 }
 
 function getIssuerApplication(id) {
@@ -216,10 +339,12 @@ function listIssuerApplications({ status } = {}) {
   });
 }
 
-function updateIssuerApplicationStatus(id, { status, reviewer_note }) {
-  db.run(
-    'UPDATE issuer_applications SET status = ?, reviewed_at = ?, reviewer_note = ? WHERE id = ?',
-    [status, new Date().toISOString(), reviewer_note || null, id]
-  );
-  flush();
+async function updateIssuerApplicationStatus(id, { status, reviewer_note }) {
+  await withWriteLock(() => {
+    db.run(
+      'UPDATE issuer_applications SET status = ?, reviewed_at = ?, reviewer_note = ? WHERE id = ?',
+      [status, new Date().toISOString(), reviewer_note || null, id]
+    );
+    flush();
+  });
 }

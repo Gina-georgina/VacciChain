@@ -25,8 +25,17 @@ const { getHealthStatus, startHealthProbe } = require('./health');
 const requestId = require('./middleware/requestId');
 const { sanitizeInputs } = require('./middleware/sanitize');
 const errorHandler = require('./middleware/errorHandler');
+const auditLog = require('./middleware/auditLog');
 
 const app = express();
+
+// Trust proxy must match the deployed load-balancer topology so that
+// req.ip is derived from X-Forwarded-For only for trusted hops. This
+// prevents spoofed forwarded headers from bypassing rate limits or
+// corrupting audit attribution. Configure via TRUST_PROXY (e.g. "1",
+// "loopback", or a comma-separated list of trusted subnets).
+app.set('trust proxy', config.TRUST_PROXY);
+
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean);
 
 app.use(cors({
@@ -45,9 +54,14 @@ app.use(cors({
 }));
 app.use(securityHeaders);
 app.use(express.json({ limit: config.BODY_LIMIT }));
+// Request ID must be assigned before audit logging so every audit entry
+// can be correlated with the originating request.
 app.use(requestId);
 // Sanitize all string inputs at the API boundary (strips HTML tags, control chars, null bytes)
 app.use(sanitizeInputs);
+// Tamper-evident audit logging for issuer actions (mint, revoke, consent,
+// administrative changes). Records actor, request ID, outcome, timestamp.
+app.use(auditLog);
 
 app.use((req, res, next) => {
   const start = Date.now();

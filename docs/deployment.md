@@ -26,7 +26,10 @@ This guide covers deploying VacciChain to a production environment on AWS ECS Fa
 9. [Verifying a Successful Deployment](#9-verifying-a-successful-deployment)
 10. [Monitoring and Alerting](#10-monitoring-and-alerting)
 11. [CloudWatch Logs](#11-cloudwatch-logs)
-12. [Rollback Procedure](#12-rollback-procedure)
+12. [Persistence Architecture](#12-persistence-architecture)
+13. [Proxy Headers and Client IP Derivation](#13-proxy-headers-and-client-ip-derivation)
+14. [Audit Log Rotation, Retention, and Integrity](#14-audit-log-rotation-retention-and-integrity)
+15. [Rollback Procedure](#15-rollback-procedure)
 
 ---
 
@@ -317,7 +320,13 @@ These are safe to set directly in the ECS task definition (not in Secrets Manage
 | `PORT` | `4000` | Backend port |
 | `ALLOWED_ORIGINS` | `https://app.yourdomain.com` | Your production frontend URL |
 | `AUDIT_LOG_PATH` | `/data/audit.log` | Persistent EFS mount |
+| `AUDIT_LOG_MAX_BYTES` | `104857600` | Rotate the audit log at 100 MiB |
+| `AUDIT_LOG_RETENTION_DAYS` | `90` | Rotated segments older than this are purged |
+| `AUDIT_LOG_HASH_ALGORITHM` | `sha256` | Hash chain algorithm for tamper evidence |
 | `DATABASE_PATH` | `/data/vaccichain.db` | Persistent EFS mount |
+| `DATABASE_BUSY_TIMEOUT_MS` | `5000` | SQLite lock wait before failing a write |
+| `DATABASE_WAL_ENABLED` | `true` | Write-ahead logging for concurrent readers |
+| `TRUST_PROXY` | `1` | Number of trusted proxy hops (ALB only) |
 | `BACKEND_URL` | `http://backend:4000` | Internal service URL |
 | `ANALYTICS_API_KEY` | *(set in Secrets Manager)* | Generate with `openssl rand -hex 32` |
 | `RATE_LIMIT_SEP10` | `10` | Adjust based on expected traffic |
@@ -701,9 +710,129 @@ The ECS task execution role (`ecsTaskExecutionRole`) is granted `logs:CreateLogS
 
 ---
 
-## 12. Rollback Procedure
+## 12. Persistence Architecture
 
-### 11.1 Rolling Back a Service
+### 12.1 Selected Architecture
+
+The event index remains on **SQLite in WAL mode on the shared EFS mount**, with a single writer per database file enforced by the backend's write serialization. This decision was made after a load and failure analysis comparing the current storage with a multi-writer database option (PostgreSQL on RDS).
+
+**Why SQLite was retained:**
+
+- The index is append-heavy with a small, bounded working set; measured write throughput at 2 ECS tasks stays well below the SQLite ceiling.
+- EFS provides durable, shared storage with automatic replication within the region; the database file survives task replacement and AZ failover.
+- Operational simplicity: no additional managed database to patch, monitor, or pay for at current volume.
+
+**Known limits and the trigger to revisit:**
+
+- SQLite serializes writers. If sustained write latency exceeds 50 ms p95 or write contention errors (`SQLITE_BUSY`) appear in logs, the index must move to a multi-writer database.
+- The migration path to PostgreSQL is documented in [`docs/persistence-migration.md`](./persistence-migration.md); the backend's data access layer is abstracted so the swap does not change API behavior.
+
+### 12.2 Locking Behavior
+
+- WAL mode is enabled (`DATABASE_WAL_ENABLED=true`) so readers are never blocked by the writer.
+- Writers acquire the database lock with a bounded wait (`DATABASE_BUSY_TIMEOUT_MS`); on timeout the request fails with a retryable error rather than hanging.
+- Only one backend task performs index writes at a time; additional tasks serve reads. Scaling beyond one writer requires the PostgreSQL migration.
+
+### 12.3 Backup and Restore
+
+```bash
+# Consistent online backup (safe while the service is running)
+sqlite3 /data/vaccichain.db ".backup '/data/backups/vaccichain-$(date +%Y%m%d%H%M%S).db'"
+
+# Verify integrity of a backup before relying on it
+sqlite3 /data/backups/<BACKUP_FILE> "PRAGMA integrity_check;"
+# Expected: ok
+```
+
+Backups are written to `/data/backups` on EFS and copied to S3 on a daily schedule. Restore procedure: stop the backend service, replace `/data/vaccichain.db` with the chosen backup, run `PRAGMA integrity_check`, then restart the service.
+
+### 12.4 Failover
+
+- EFS is mounted in multiple AZs; if a task or AZ fails, ECS reschedules the task and it reattaches to the same database file.
+- Because writes are serialized, a failed writer task does not leave the database in a partially written state — WAL recovery on next open rolls back any incomplete transaction.
+- After any failover, confirm recovery succeeded:
+
+```bash
+aws logs tail /ecs/vaccichain-production/backend --filter-pattern "database" --since 10m
+# Expected: no "database is locked" or "disk I/O error" entries
+```
+
+### 12.5 Migration
+
+Schema migrations run automatically at backend startup and are idempotent. Before deploying a release that includes a migration:
+
+1. Take an online backup (section 12.3) and verify its integrity.
+2. Deploy to staging and confirm the migration completes and the smoke test passes.
+3. Deploy to production; watch logs for migration errors during the first 10 minutes.
+
+If a migration fails, roll back the service to the previous task definition revision (section 15.1) and restore the pre-migration backup.
+
+---
+
+## 13. Proxy Headers and Client IP Derivation
+
+The backend runs behind an Application Load Balancer. Express must trust exactly the proxies in front of it so that client IPs used for rate limiting and audit attribution cannot be spoofed by a caller-supplied `X-Forwarded-For` header.
+
+### 13.1 Trust-Proxy Configuration
+
+- Set `TRUST_PROXY=1` in the production task definition. This trusts exactly one hop — the ALB — and ignores any additional `X-Forwarded-For` entries supplied by the client.
+- Do **not** set `TRUST_PROXY=true` (trust all proxies) in production; that allows clients to forge their address.
+- If a CDN or WAF is added in front of the ALB, increment `TRUST_PROXY` to match the new hop count and update this document.
+
+### 13.2 Verification
+
+```bash
+# Direct request to the ALB: client IP should be the caller's address
+curl -sf https://app.yourdomain.com/health -H "X-Forwarded-For: 203.0.113.9"
+# The spoofed header must be ignored; logs should show the real source IP
+
+# Confirm the derived client IP in the audit log
+aws logs tail /ecs/vaccichain-production/backend --filter-pattern "clientIp" --since 5m
+```
+
+Integration tests in the backend suite cover both direct and proxied requests and assert the derived client identity matches the expected hop count.
+
+---
+
+## 14. Audit Log Rotation, Retention, and Integrity
+
+The backend writes an append-only NDJSON audit log to `AUDIT_LOG_PATH` on the EFS mount. Every mint, revoke, consent, and administrative change records the actor, request ID, action outcome, and timestamp.
+
+### 14.1 Rotation
+
+- The active log rotates when it reaches `AUDIT_LOG_MAX_BYTES`; the rotated segment is renamed with a timestamp suffix (e.g. `audit.log.20250101T000000Z`).
+- Rotation is performed under a lock so concurrent tasks never write to a segment being rotated.
+- A new active log is opened immediately; no audit events are dropped during rotation.
+
+### 14.2 Retention
+
+- Rotated segments older than `AUDIT_LOG_RETENTION_DAYS` are purged by the scheduled cleanup job.
+- Segments are also shipped to CloudWatch Logs and to S3 (with Object Lock) for long-term retention beyond the local window.
+- Retention changes require a documented review; do not shorten retention below the compliance minimum.
+
+### 14.3 Integrity Verification
+
+- Each log entry includes a hash of the previous entry, forming a hash chain. Any modification or deletion of an entry breaks the chain.
+- Verify a segment with the audit verification tool:
+
+```bash
+npm run audit:verify -- /data/audit.log
+# Expected: "chain intact" with the entry count
+```
+
+- Run verification after every rotation and as part of the daily backup job. A broken chain is a security incident — escalate immediately.
+
+### 14.4 Failure Handling
+
+- If the audit log cannot be written, the operation that requires auditing **fails closed**: the mint/revoke/consent/admin action is rejected rather than proceeding unaudited.
+- Write failures are logged to CloudWatch and trigger the `vaccichain-prod-audit-write-failure` alarm.
+- If the EFS mount is unavailable, the backend reports unhealthy on `/health` so ECS replaces the task rather than serving unaudited traffic.
+
+---
+
+## 15. Rollback Procedure
+
+### 15.1 Rolling Back a Service
 
 To revert to the previous image tag:
 
@@ -722,7 +851,7 @@ aws ecs update-service \
   --region us-east-1
 ```
 
-### 11.2 Rolling Back a Contract Deployment
+### 15.2 Rolling Back a Contract Deployment
 
 The Soroban contract supports upgrades via the `upgrade` function (admin-only). To revert:
 
@@ -746,7 +875,7 @@ The Soroban contract supports upgrades via the `upgrade` function (admin-only). 
 
 See [`docs/contract-upgrade.md`](./contract-upgrade.md) for the full upgrade and rollback process.
 
-### 11.3 Rollback Criteria
+### 15.3 Rollback Criteria
 
 Initiate a rollback if any of the following occur within 30 minutes of deployment:
 
@@ -766,6 +895,7 @@ Initiate a rollback if any of the following occur within 30 minutes of deploymen
 - [TLS Setup](./tls-setup.md) — HTTPS and certificate configuration
 - [Mainnet Launch Checklist](./mainnet-launch.md) — Pre-launch sign-off checklist
 - [Contract Upgrade Guide](./contract-upgrade.md) — Upgrading the Soroban contract
+- [Persistence Migration](./persistence-migration.md) — Moving the event index to PostgreSQL
 - [Staging Setup](./staging-setup.md) — Staging environment reference
 - [Stellar Documentation](https://developers.stellar.org/)
 - [AWS ECS Fargate](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html)

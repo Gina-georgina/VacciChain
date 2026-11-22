@@ -130,6 +130,156 @@ describe('GET /verify/public/:wallet', () => {
       // Skipping for now as it requires test infrastructure setup
     });
   });
+
+  describe('Response size and batch limits', () => {
+    const validWallet = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF';
+    const {
+      MAX_PUBLIC_RECORDS,
+      MAX_BATCH_WALLETS,
+    } = require('../src/config/verificationLimits');
+
+    describe('Public record history limit', () => {
+      it('should document the maximum number of records returned', () => {
+        expect(typeof MAX_PUBLIC_RECORDS).toBe('number');
+        expect(MAX_PUBLIC_RECORDS).toBeGreaterThan(0);
+      });
+
+      it('should return at most MAX_PUBLIC_RECORDS records', async () => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}`)
+          .expect((res) => {
+            if (res.status === 200) {
+              expect(Array.isArray(res.body.records)).toBe(true);
+              expect(res.body.records.length).toBeLessThanOrEqual(MAX_PUBLIC_RECORDS);
+            }
+          });
+      });
+
+      it('should accept a limit query param below the maximum', async () => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}?limit=1`)
+          .expect((res) => {
+            expect(res.status).not.toBe(400);
+            if (res.status === 200) {
+              expect(res.body.records.length).toBeLessThanOrEqual(1);
+            }
+          });
+      });
+
+      it('should accept a limit query param exactly at the maximum', async () => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}?limit=${MAX_PUBLIC_RECORDS}`)
+          .expect((res) => {
+            expect(res.status).not.toBe(400);
+            if (res.status === 200) {
+              expect(res.body.records.length).toBeLessThanOrEqual(MAX_PUBLIC_RECORDS);
+            }
+          });
+      });
+
+      it('should reject or truncate a limit query param above the maximum predictably', async () => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}?limit=${MAX_PUBLIC_RECORDS + 1}`)
+          .expect((res) => {
+            // Either a predictable 400 or a truncated 200 response
+            if (res.status === 400) {
+              expect(res.body).toHaveProperty('error');
+            } else {
+              expect(res.status).toBe(200);
+              expect(res.body.records.length).toBeLessThanOrEqual(MAX_PUBLIC_RECORDS);
+            }
+          });
+      });
+
+      it('should reject a non-numeric limit with 400', async () => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}?limit=abc`)
+          .expect(400);
+
+        expect(res.body).toHaveProperty('error');
+      });
+
+      it('should reject a negative limit with 400', async () => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}?limit=-1`)
+          .expect(400);
+
+        expect(res.body).toHaveProperty('error');
+      });
+
+      it('should expose truncation semantics when records exceed the maximum', async () => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}`)
+          .expect((res) => {
+            if (res.status === 200) {
+              // If truncated, the response should signal it explicitly
+              if (res.body.truncated === true) {
+                expect(res.body.records.length).toBe(MAX_PUBLIC_RECORDS);
+              } else {
+                expect(res.body.records.length).toBeLessThanOrEqual(MAX_PUBLIC_RECORDS);
+              }
+            }
+          });
+      });
+    });
+
+    describe('Batch verification limit', () => {
+      const makeWallets = (count) =>
+        Array.from({ length: count }, (_, i) =>
+          `GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNL${String(i).padStart(2, '0')}`
+        );
+
+      it('should document the maximum batch size', () => {
+        expect(typeof MAX_BATCH_WALLETS).toBe('number');
+        expect(MAX_BATCH_WALLETS).toBeGreaterThan(0);
+      });
+
+      it('should accept a batch below the maximum', async () => {
+        const res = await request(app)
+          .post('/v1/verify/public/batch')
+          .send({ wallets: makeWallets(Math.max(1, MAX_BATCH_WALLETS - 1)) })
+          .expect((res) => {
+            expect(res.status).not.toBe(400);
+          });
+      });
+
+      it('should accept a batch exactly at the maximum', async () => {
+        const res = await request(app)
+          .post('/v1/verify/public/batch')
+          .send({ wallets: makeWallets(MAX_BATCH_WALLETS) })
+          .expect((res) => {
+            expect(res.status).not.toBe(400);
+          });
+      });
+
+      it('should reject a batch above the maximum with 400', async () => {
+        const res = await request(app)
+          .post('/v1/verify/public/batch')
+          .send({ wallets: makeWallets(MAX_BATCH_WALLETS + 1) })
+          .expect(400);
+
+        expect(res.body).toHaveProperty('error');
+      });
+
+      it('should reject a non-array wallets payload with 400', async () => {
+        const res = await request(app)
+          .post('/v1/verify/public/batch')
+          .send({ wallets: 'not-an-array' })
+          .expect(400);
+
+        expect(res.body).toHaveProperty('error');
+      });
+
+      it('should reject an empty wallets payload with 400', async () => {
+        const res = await request(app)
+          .post('/v1/verify/public/batch')
+          .send({ wallets: [] })
+          .expect(400);
+
+        expect(res.body).toHaveProperty('error');
+      });
+    });
+  });
 });
 
 describe('GET /verify/:wallet (authenticated)', () => {
