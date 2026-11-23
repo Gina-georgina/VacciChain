@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../hooks/useFreighter';
+import useDocumentTitle from '../hooks/useDocumentTitle';
 
 const s = {
   page:    { maxWidth: 700, width: '100%', margin: '2rem auto', padding: '0 1rem', boxSizing: 'border-box' },
@@ -23,6 +24,7 @@ const s = {
 };
 
 export default function AdminDashboard() {
+  useDocumentTitle('Admin — VacciChain');
   const { publicKey, role, connect, apiFetch } = useAuth();
   const [keys, setKeys]             = useState([]);
   const [label, setLabel]           = useState('');

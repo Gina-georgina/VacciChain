@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../hooks/useFreighter';
 import { useVaccination } from '../hooks/useVaccination';
+import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import ConfirmMintDialog from '../components/ConfirmMintDialog';
 import CopyButton from '../components/CopyButton';
 import RoleBadge from '../components/RoleBadge';
@@ -28,8 +29,10 @@ const EMPTY_FORM = { patient_address: '', vaccine_name: '', date_administered: '
 
 export default function IssuerDashboard() {
   const { t } = useTranslation();
-  const { publicKey, role, connect } = useAuth();
+  const { publicKey, role, connect, networkMismatch, expectedNetwork, walletNetwork } = useAuth();
   const { issueVaccination, checkIssuerStatus, loading } = useVaccination();
+
+  useDocumentTitle('Issue Vaccination — VacciChain');
 
   const [form, setForm] = useState(() => {
     try {
@@ -95,6 +98,7 @@ export default function IssuerDashboard() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (networkMismatch) return;
     const result = await issueVaccination(form);
     if (result) {
       setMintResult(result);
@@ -117,6 +121,12 @@ export default function IssuerDashboard() {
           <RoleBadge role="issuer" />
         </div>
       </div>
+      {networkMismatch && (
+        <div style={styles.warning} role="alert">
+          <strong>Network mismatch.</strong> Your wallet is on {walletNetwork || 'an unknown network'}, but this app is
+          configured for {expectedNetwork}. Switch your wallet network to {expectedNetwork} and reload before signing.
+        </div>
+      )}
       <form style={styles.form} onSubmit={handleSubmit} role="form">
         {[
           { key: 'patient_address', label: 'Patient Stellar Address', placeholder: 'G...' },
@@ -136,7 +146,7 @@ export default function IssuerDashboard() {
             {errors[key] && <p style={styles.fieldError}>{errors[key]}</p>}
           </div>
         ))}
-        <button style={isAuthorized ? styles.btn : styles.btnDisabled} type="submit" disabled={loading || !isAuthorized} aria-disabled={loading || !isAuthorized}>
+        <button style={isAuthorized && !networkMismatch ? styles.btn : styles.btnDisabled} type="submit" disabled={loading || !isAuthorized || networkMismatch} aria-disabled={loading || !isAuthorized || networkMismatch}>
           {loading ? 'Minting…' : 'Issue Vaccination NFT'}
         </button>
       </form>

@@ -1,5 +1,6 @@
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../hooks/useFreighter';
+import { useDocumentTitle } from '../hooks/useDocumentTitle';
 
 const styles = {
   page: { maxWidth: 700, margin: '4rem auto', padding: '0 1rem', textAlign: 'center' },
@@ -12,6 +13,7 @@ const styles = {
 export default function Landing() {
   const { t } = useTranslation();
   const { publicKey, connect, disconnect } = useAuth();
+  useDocumentTitle('VacciChain — Home');
 
   return (
     <div style={styles.page}>

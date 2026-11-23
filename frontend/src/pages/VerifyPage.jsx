@@ -4,6 +4,8 @@ import VerificationBadge from '../components/VerificationBadge';
 import NFTCard from '../components/NFTCard';
 import CopyButton from '../components/CopyButton';
 import { useToast } from '../hooks/useToast';
+import { useDocumentTitle } from '../hooks/useDocumentTitle';
+import { useAnnouncer } from '../hooks/useAnnouncer';
 
 const styles = {
   page: { maxWidth: 600, margin: '2rem auto', padding: '0 1rem' },
@@ -14,6 +16,8 @@ const styles = {
 export default function VerifyPage() {
   const { t } = useTranslation();
   const toast = useToast();
+  const announce = useAnnouncer();
+  useDocumentTitle('Verify Vaccination — VacciChain');
   const [wallet, setWallet] = useState('');
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -28,9 +32,17 @@ export default function VerifyPage() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       setResult(data);
+      announce(
+        data.vaccinated
+          ? `Verification complete. Vaccination status verified with ${data.record_count ?? 0} record(s).`
+          : 'Verification complete. No vaccination records found for this wallet.',
+        'success'
+      );
     } catch (e) {
-      setError(e.message || 'Verification failed.');
-      toast(e.message || 'Verification failed.', 'error');
+      const message = e.message || 'Verification failed.';
+      setError(message);
+      toast(message, 'error');
+      announce(`Verification failed: ${message}`, 'error');
     } finally {
       setLoading(false);
     }

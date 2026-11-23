@@ -1,4 +1,5 @@
 import { createContext, useContext, useState, useCallback } from 'react';
+import { useAnnounce } from './useAnnounce';
 
 const ToastContext = createContext(null);
 
@@ -6,12 +7,17 @@ let _id = 0;
 
 export function ToastProvider({ children }) {
   const [toasts, setToasts] = useState([]);
+  const announce = useAnnounce();
 
-  const toast = useCallback((message, type = 'info') => {
-    const id = ++_id;
-    setToasts((t) => [...t, { id, message, type }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4000);
-  }, []);
+  const toast = useCallback(
+    (message, type = 'info') => {
+      const id = ++_id;
+      setToasts((t) => [...t, { id, message, type }]);
+      announce(message, { priority: type === 'error' ? 'assertive' : 'polite' });
+      setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4000);
+    },
+    [announce]
+  );
 
   return (
     <ToastContext.Provider value={toast}>

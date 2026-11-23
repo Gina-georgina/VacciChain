@@ -78,6 +78,59 @@ All ratios computed using the WCAG relative luminance formula.
 
 ---
 
+## Live-Region Announcements for Async Actions
+
+Async action results (mint, verification, wallet connection, copy) are announced through
+polite/assertive live regions so screen-reader users get feedback **without a focus change**.
+
+### Announcer behavior
+
+- A single app-level announcer component renders two visually hidden regions:
+  - `role="status"` with `aria-live="polite"` — success and informational messages
+    (mint success, verification result, wallet connected, copy success).
+  - `role="alert"` with `aria-live="assertive"` — errors (mint failure, verification
+    failure, wallet connection error, copy failure).
+- Regions are always present in the DOM (never conditionally mounted) so that content
+  changes are reliably picked up by assistive technology.
+- Messages are set via a shared `announce(message, { priority })` helper; the helper
+  writes the text into the appropriate region and clears it after a short timeout.
+- Focus is never moved as part of an announcement. Visible inline status/error text
+  remains in place for sighted users.
+
+### Deduplication rules
+
+- Identical consecutive messages are not re-announced (the helper compares the new
+  message against the last announced message per region and skips duplicates).
+- Repeating an action that produces the same message re-triggers the announcement by
+  first clearing the region (empty string) and then setting the text on the next tick,
+  so the DOM mutation is observable.
+- Messages are keyed per flow (e.g. `mint`, `verify`, `wallet`, `copy`) so an error in
+  one flow does not suppress an identical-looking message in another.
+- Announcements are debounced within a short window (~150 ms) to collapse rapid
+  repeated events (e.g. multiple copy clicks) into a single announcement.
+
+### Manual screen-reader check procedure
+
+Perform with at least one of NVDA (Windows/Firefox), VoiceOver (macOS/Safari), or
+TalkBack (Android/Chrome). For each flow, confirm the message is spoken and that
+keyboard focus does not move.
+
+1. **Mint** — Connect a wallet, submit a valid mint. Confirm a polite success
+   announcement. Submit an invalid/failing mint and confirm an assertive error
+   announcement. Confirm focus stays on the submit button.
+2. **Verification** — Run a verification for a valid and an invalid token. Confirm the
+   result is announced (polite for valid, assertive for failure) and focus stays on the
+   verify control.
+3. **Wallet connection** — Connect and disconnect. Confirm "connected" and
+   "disconnected"/error states are announced without moving focus.
+4. **Copy** — Activate copy on the wallet address. Confirm a single "copied"
+   announcement, and that clicking copy repeatedly does not spam duplicate
+   announcements.
+
+Record the screen reader, browser, and OS used alongside the pass/fail result.
+
+---
+
 ## Notes
 
 - The application uses a single dark theme. There is no light mode; light-mode contrast is not applicable.

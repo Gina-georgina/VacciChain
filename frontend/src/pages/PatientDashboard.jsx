@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { useAuth } from '../hooks/useFreighter';
 import { useVaccination } from '../hooks/useVaccination';
 import { useConsent } from '../hooks/useConsent';
+import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import NFTCard from '../components/NFTCard';
 import RoleBadge from '../components/RoleBadge';
 import NFTCardSkeleton from '../components/NFTCardSkeleton';
@@ -20,10 +21,12 @@ const styles = {
 
 export default function PatientDashboard() {
   const { t } = useTranslation();
-  const { publicKey, connect, disconnect } = useAuth();
+  const { publicKey, connect, disconnect, isNetworkMismatch } = useAuth();
   const { records, loading, error, refetch } = useVaccination(publicKey);
   const { consented, giveConsent, loading: consentLoading } = useConsent();
   const [qrRecord, setQrRecord] = useState(null);
+
+  useDocumentTitle('My Vaccination Records — VacciChain');
 
   const handleDeclineConsent = () => disconnect();
 
@@ -66,6 +69,12 @@ export default function PatientDashboard() {
         <CopyButton text={publicKey} label="wallet address" />
       </p>
 
+      {isNetworkMismatch && (
+        <div role="alert" style={{ background: '#7f1d1d', color: '#fecaca', padding: '0.75rem 1rem', borderRadius: 8, marginBottom: '1.5rem' }}>
+          ⚠️ Your wallet is connected to a different Stellar network than this app. Signing is disabled until you switch networks in Freighter.
+        </div>
+      )}
+
       {loading && <NFTCardSkeleton count={3} />}
       {!loading && error && (
         <div style={{ textAlign: 'center', padding: '2rem 0' }}>
@@ -80,6 +89,7 @@ export default function PatientDashboard() {
           key={r.token_id}
           record={r}
           onShowQR={setQrRecord}
+          disabled={isNetworkMismatch}
         />
       ))}
 

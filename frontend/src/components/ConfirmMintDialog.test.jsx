@@ -79,4 +79,90 @@ describe('ConfirmMintDialog', () => {
     fireEvent.keyDown(overlay, { key: 'Enter', preventDefault });
     expect(preventDefault).not.toHaveBeenCalled(); // Enter is allowed to propagate
   });
+
+  it('disables confirm and blocks submission when wallet network mismatches', () => {
+    render(
+      <ConfirmMintDialog
+        record={mockRecord}
+        onConfirm={mockOnConfirm}
+        onCancel={mockOnCancel}
+        networkMismatch
+        configuredNetwork="TESTNET"
+        walletNetwork="PUBLIC"
+      />
+    );
+
+    const confirmButton = screen.getByRole('button', { name: /Confirm & Mint/i });
+    expect(confirmButton).toBeDisabled();
+
+    fireEvent.click(confirmButton);
+    expect(mockOnConfirm).not.toHaveBeenCalled();
+
+    expect(screen.getByRole('alert')).toHaveTextContent(/network mismatch/i);
+    expect(screen.getByText(/TESTNET/i)).toBeInTheDocument();
+    expect(screen.getByText(/PUBLIC/i)).toBeInTheDocument();
+    expect(screen.getByText(/switch your wallet/i)).toBeInTheDocument();
+  });
+
+  it('announces the mint result through a live region', () => {
+    const { rerender } = render(
+      <ConfirmMintDialog record={mockRecord} onConfirm={mockOnConfirm} onCancel={mockOnCancel} />
+    );
+
+    const liveRegion = screen.getByRole('status');
+    expect(liveRegion).toHaveAttribute('aria-live', 'polite');
+    expect(liveRegion).toHaveTextContent('');
+
+    rerender(
+      <ConfirmMintDialog
+        record={mockRecord}
+        onConfirm={mockOnConfirm}
+        onCancel={mockOnCancel}
+        mintResult={{ status: 'success', message: 'Vaccination minted successfully.' }}
+      />
+    );
+
+    expect(screen.getByRole('status')).toHaveTextContent(/minted successfully/i);
+  });
+
+  it('announces mint errors through an assertive live region', () => {
+    render(
+      <ConfirmMintDialog
+        record={mockRecord}
+        onConfirm={mockOnConfirm}
+        onCancel={mockOnCancel}
+        mintResult={{ status: 'error', message: 'Mint failed. Please try again.' }}
+      />
+    );
+
+    const alertRegion = screen.getByRole('alert');
+    expect(alertRegion).toHaveAttribute('aria-live', 'assertive');
+    expect(alertRegion).toHaveTextContent(/mint failed/i);
+  });
+
+  it('does not duplicate announcements when the same result is re-rendered', () => {
+    const mintResult = { status: 'success', message: 'Vaccination minted successfully.' };
+    const { rerender } = render(
+      <ConfirmMintDialog
+        record={mockRecord}
+        onConfirm={mockOnConfirm}
+        onCancel={mockOnCancel}
+        mintResult={mintResult}
+      />
+    );
+
+    const firstAnnouncement = screen.getByRole('status').textContent;
+
+    rerender(
+      <ConfirmMintDialog
+        record={mockRecord}
+        onConfirm={mockOnConfirm}
+        onCancel={mockOnCancel}
+        mintResult={{ ...mintResult }}
+      />
+    );
+
+    expect(screen.getByRole('status').textContent).toBe(firstAnnouncement);
+    expect(screen.getAllByRole('status')).toHaveLength(1);
+  });
 });

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth } from './useFreighter';
 import { useToast } from './useToast';
+import { useAnnounce } from './useAnnounce';
 
 // Module-level cache: walletAddress -> { records, timestamp }
 export const cache = new Map();
@@ -9,6 +10,7 @@ const CACHE_TTL = 30_000; // 30 seconds
 export function useVaccination(walletAddress) {
   const { apiFetch } = useAuth();
   const toast = useToast();
+  const announce = useAnnounce();
   const [records, setRecords] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -16,8 +18,10 @@ export function useVaccination(walletAddress) {
   // Keep latest apiFetch/toast in refs so effects don't re-run when they change
   const apiFetchRef = useRef(apiFetch);
   const toastRef = useRef(toast);
+  const announceRef = useRef(announce);
   useEffect(() => { apiFetchRef.current = apiFetch; }, [apiFetch]);
   useEffect(() => { toastRef.current = toast; }, [toast]);
+  useEffect(() => { announceRef.current = announce; }, [announce]);
 
   const fetchFromApi = useCallback(async (wallet, signal) => {
     setLoading(true);
@@ -78,9 +82,12 @@ export function useVaccination(walletAddress) {
       if (!res.ok) throw new Error(data.error);
       const explorerUrl = `https://stellar.expert/explorer/testnet/tx/${data.transactionHash}`;
       toastRef.current(`Vaccination NFT minted! Token ID: ${data.tokenId} — View on Explorer: ${explorerUrl}`, 'success');
+      announceRef.current(`Vaccination NFT minted. Token ID: ${data.tokenId}.`, 'success');
       return data;
     } catch (e) {
-      toastRef.current(e.message || 'Failed to issue vaccination.', 'error');
+      const msg = e.message || 'Failed to issue vaccination.';
+      toastRef.current(msg, 'error');
+      announceRef.current(msg, 'error');
       return null;
     } finally {
       setLoading(false);

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import DarkModeToggle from './DarkModeToggle';
+import ExternalLink from './ExternalLink';
 import { useAuth } from '../hooks/useFreighter';
 
 const NAV_LINKS = [
@@ -11,6 +12,13 @@ const NAV_LINKS = [
   { to: '/admin', label: 'Admin' },
   { to: '/apply', label: 'Apply as Issuer' },
   { to: '/analytics', label: 'Analytics' },
+];
+
+const EXTERNAL_LINKS = [
+  {
+    href: 'https://stellar.org',
+    label: 'Stellar network (opens in a new tab)',
+  },
 ];
 
 function truncate(addr) {
@@ -214,6 +222,11 @@ export default function NavBar({ dark, onToggleDark }) {
           >
             {label}
           </Link>
+        ))}
+        {EXTERNAL_LINKS.map(({ href, label }) => (
+          <ExternalLink key={href} href={href} onClick={close}>
+            {label}
+          </ExternalLink>
         ))}
         <DarkModeToggle dark={dark} onToggle={onToggleDark} />
         <WalletIndicator />

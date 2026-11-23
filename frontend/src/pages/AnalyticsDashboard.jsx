@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth } from '../hooks/useFreighter';
+import { useDocumentTitle } from '../hooks/useDocumentTitle';
 
 const ANALYTICS_BASE = import.meta.env.VITE_ANALYTICS_URL || 'http://localhost:8001';
 const REFRESH_INTERVAL = 60_000;
@@ -107,6 +108,7 @@ function AnomalyList({ data }) {
 }
 
 export default function AnalyticsDashboard() {
+  useDocumentTitle('Analytics — VacciChain');
   const { role, apiFetch } = useAuth();
   const [rates, setRates] = useState(null);
   const [issuers, setIssuers] = useState(null);

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useAuth } from '../hooks/useFreighter';
+import { useDocumentTitle } from '../hooks/useDocumentTitle';
 
 const s = {
   page:   { maxWidth: 520, width: '100%', margin: '2rem auto', padding: '0 1rem', boxSizing: 'border-box' },
@@ -12,6 +13,7 @@ const s = {
 };
 
 export default function IssuerOnboarding() {
+  useDocumentTitle('Apply as Issuer — VacciChain');
   const { publicKey, connect, apiFetch } = useAuth();
   const [form, setForm] = useState({ name: '', license_number: '', country: '' });
   const [loading, setLoading] = useState(false);

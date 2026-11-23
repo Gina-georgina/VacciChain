@@ -8,6 +8,7 @@ import IssuerOnboarding from './pages/IssuerOnboarding';
 import AnalyticsDashboard from './pages/AnalyticsDashboard';
 import { AuthProvider } from './hooks/useFreighter';
 import { useDarkMode } from './hooks/useDarkMode';
+import { AnnouncerProvider } from './hooks/useAnnounce';
 import FreighterBanner from './components/FreighterBanner';
 import DemoBanner from './components/DemoBanner';
 import NavBar from './components/NavBar';
@@ -18,21 +19,23 @@ export default function App() {
 
   return (
     <AuthProvider>
-      <SkipToContent />
-      <DemoBanner/>
-      <NavBar dark={dark} onToggleDark={() => setDark(d => !d)} />
-      <FreighterBanner />
-      <main id="main-content" tabIndex={-1} style={{ outline: 'none' }}>
-        <Routes>
-          <Route path="/" element={<Landing />} />
-          <Route path="/patient" element={<PatientDashboard />} />
-          <Route path="/issuer" element={<IssuerDashboard />} />
-          <Route path="/verify" element={<VerifyPage />} />
-          <Route path="/admin" element={<AdminDashboard />} />
-          <Route path="/apply" element={<IssuerOnboarding />} />
-          <Route path="/analytics" element={<AnalyticsDashboard />} />
-        </Routes>
-      </main>
+      <AnnouncerProvider>
+        <SkipToContent />
+        <DemoBanner/>
+        <NavBar dark={dark} onToggleDark={() => setDark(d => !d)} />
+        <FreighterBanner />
+        <main id="main-content" tabIndex={-1} style={{ outline: 'none' }}>
+          <Routes>
+            <Route path="/" element={<Landing />} />
+            <Route path="/patient" element={<PatientDashboard />} />
+            <Route path="/issuer" element={<IssuerDashboard />} />
+            <Route path="/verify" element={<VerifyPage />} />
+            <Route path="/admin" element={<AdminDashboard />} />
+            <Route path="/apply" element={<IssuerOnboarding />} />
+            <Route path="/analytics" element={<AnalyticsDashboard />} />
+          </Routes>
+        </main>
+      </AnnouncerProvider>
     </AuthProvider>
   );
 }
