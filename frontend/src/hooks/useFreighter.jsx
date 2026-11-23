@@ -10,12 +10,62 @@ const AuthContext = createContext(null);
 // Only persist publicKey and role — token is kept in memory only
 const STORAGE_KEY = 'vaccichain_wallet';
 
+// Sanitized, user-facing messages per error category. Never surface raw
+// provider internals or secrets to the UI.
+const WALLET_ERROR_MESSAGES = {
+  missing_extension:
+    'Freighter wallet not found. Install the Freighter browser extension, then reload this page and try again.',
+  rejected:
+    'Connection request was declined. Open Freighter and approve the request, then try again.',
+  locked:
+    'Your Freighter wallet is locked. Unlock Freighter with your password, then try again.',
+  provider_error:
+    'The wallet could not complete the request. Please try again, or reload the page if the problem persists.',
+};
+
+function makeWalletError(category) {
+  return {
+    category,
+    message: WALLET_ERROR_MESSAGES[category] || WALLET_ERROR_MESSAGES.provider_error,
+  };
+}
+
+// Map a raw Freighter/provider error into a typed, sanitized category.
+function classifyWalletError(e) {
+  const raw = String((e && (e.message || e.error || e)) || '').toLowerCase();
+
+  if (
+    raw.includes('not found') ||
+    raw.includes('not installed') ||
+    raw.includes('not available') ||
+    raw.includes('no freighter') ||
+    raw.includes('extension')
+  ) {
+    return makeWalletError('missing_extension');
+  }
+  if (
+    raw.includes('reject') ||
+    raw.includes('denied') ||
+    raw.includes('declin') ||
+    raw.includes('cancel') ||
+    raw.includes('user refused') ||
+    raw.includes('not allowed')
+  ) {
+    return makeWalletError('rejected');
+  }
+  if (raw.includes('lock') || raw.includes('unlock') || raw.includes('password')) {
+    return makeWalletError('locked');
+  }
+  return makeWalletError('provider_error');
+}
+
 export function AuthProvider({ children }) {
   const toast = useToast();
   const [publicKey, setPublicKey] = useState(null);
   const [role, setRole] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [walletError, setWalletError] = useState(null);
   const [freighterInstalled, setFreighterInstalled] = useState(() => typeof window !== 'undefined' && !!window.freighter);
   // Token lives only in memory — never written to localStorage
   const tokenRef = useRef(null);
@@ -41,11 +91,21 @@ export function AuthProvider({ children }) {
   const connect = useCallback(async () => {
     setLoading(true);
     setError(null);
+    setWalletError(null);
     try {
-      const connected = await isConnected();
-      if (!connected) {
+      let connected = false;
+      try {
+        connected = await isConnected();
+      } catch {
+        connected = false;
+      }
+      if (!connected || (typeof window !== 'undefined' && !window.freighter)) {
         setFreighterInstalled(false);
-        throw new Error('Freighter wallet not found. Please install it.');
+        const walletErr = makeWalletError('missing_extension');
+        setWalletError(walletErr);
+        setError(walletErr.message);
+        toast(walletErr.message, 'error');
+        throw new Error(walletErr.message);
       }
       const pk = await getPublicKey();
       const data = await runSep10(pk);
@@ -57,10 +117,11 @@ export function AuthProvider({ children }) {
       toast('Wallet connected.', 'success');
       return data;
     } catch (e) {
-      const msg = e.message || 'Failed to connect wallet.';
-      setError(msg);
-      toast(msg, 'error');
-      throw e;
+      const walletErr = classifyWalletError(e);
+      setWalletError(walletErr);
+      setError(walletErr.message);
+      toast(walletErr.message, 'error');
+      throw new Error(walletErr.message);
     } finally {
       setLoading(false);
     }
@@ -71,6 +132,7 @@ export function AuthProvider({ children }) {
     tokenRef.current = null;
     setRole(null);
     setError(null);
+    setWalletError(null);
     localStorage.removeItem(STORAGE_KEY);
   }, []);
 
@@ -97,26 +159,35 @@ export function AuthProvider({ children }) {
       headers: { ...options.headers, Authorization: `Bearer ${t}` },
     });
 
-    // If no token in memory yet, run SEP-10 to get one
-    if (!tokenRef.current) {
+    const refreshToken = async () => {
       const pk = await getPublicKey();
       const data = await runSep10(pk);
       tokenRef.current = data.token;
       setRole(data.role);
+    };
+
+    try {
+      // If no token in memory yet, run SEP-10 to get one
+      if (!tokenRef.current) {
+        await refreshToken();
+      }
+
+      let res = await doFetch(tokenRef.current);
+
+      if (res.status === 401) {
+        await refreshToken();
+        res = await doFetch(tokenRef.current);
+      }
+
+      return res;
+    } catch (e) {
+      const walletErr = classifyWalletError(e);
+      setWalletError(walletErr);
+      setError(walletErr.message);
+      toast(walletErr.message, 'error');
+      throw new Error(walletErr.message);
     }
-
-    let res = await doFetch(tokenRef.current);
-
-    if (res.status === 401) {
-      const pk = await getPublicKey();
-      const data = await runSep10(pk);
-      tokenRef.current = data.token;
-      setRole(data.role);
-      res = await doFetch(data.token);
-    }
-
-    return res;
-  }, [runSep10]);
+  }, [runSep10, toast]);
 
   const isConnectedState = !!publicKey;
 
@@ -131,6 +202,7 @@ export function AuthProvider({ children }) {
       isConnected: isConnectedState,
       loading,
       error,
+      walletError,
     }}>
       {children}
     </AuthContext.Provider>

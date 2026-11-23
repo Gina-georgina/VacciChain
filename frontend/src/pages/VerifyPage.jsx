@@ -9,7 +9,22 @@ const styles = {
   page: { maxWidth: 600, margin: '2rem auto', padding: '0 1rem' },
   input: { padding: '0.6rem 0.75rem', background: 'var(--input-bg)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: '1rem', width: '100%' },
   btn: { padding: '0.6rem 1.5rem', background: 'var(--btn-primary)', color: '#fff', border: 'none', borderRadius: 8, fontSize: '1rem', marginTop: '0.75rem' },
+  urlBox: { marginTop: '1rem', padding: '0.75rem', background: 'var(--input-bg)', border: '1px solid var(--border)', borderRadius: 8 },
+  urlText: { margin: '0.5rem 0 0', color: 'var(--text)', fontSize: '0.9rem', wordBreak: 'break-all', userSelect: 'all', WebkitUserSelect: 'all', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '0.25rem' },
+  retryBtn: { padding: '0.4rem 1rem', background: 'transparent', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 8, fontSize: '0.9rem', marginTop: '0.5rem', cursor: 'pointer' },
 };
+
+// Only surface messages we control; never leak raw provider/network internals.
+const GENERIC_ERROR = 'Verification failed. Please try again.';
+
+function safeErrorMessage(e) {
+  const msg = e && typeof e.message === 'string' ? e.message : '';
+  // Allow short, human-readable messages that don't look like stack traces or JSON blobs.
+  if (msg && msg.length <= 200 && !/[{}\n]/.test(msg) && !/stack|internal|provider|rpc|fetch/i.test(msg)) {
+    return msg;
+  }
+  return GENERIC_ERROR;
+}
 
 export default function VerifyPage() {
   const { t } = useTranslation();
@@ -18,19 +33,28 @@ export default function VerifyPage() {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [lastAddress, setLastAddress] = useState('');
 
   const verify = async (address) => {
+    const trimmed = address.trim();
     setLoading(true);
     setResult(null);
     setError(null);
+    setLastAddress(trimmed);
     try {
-      const res = await fetch(`/v1/verify/${address.trim()}`);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
+      const res = await fetch(`/v1/verify/${encodeURIComponent(trimmed)}`);
+      let data = null;
+      try {
+        data = await res.json();
+      } catch {
+        data = null;
+      }
+      if (!res.ok) throw new Error((data && data.error) || GENERIC_ERROR);
       setResult(data);
     } catch (e) {
-      setError(e.message || 'Verification failed.');
-      toast(e.message || 'Verification failed.', 'error');
+      const message = safeErrorMessage(e);
+      setError(message);
+      toast(message, 'error');
     } finally {
       setLoading(false);
     }
@@ -54,6 +78,14 @@ export default function VerifyPage() {
     verify(trimmed);
   };
 
+  const handleRetry = () => {
+    if (lastAddress) verify(lastAddress);
+  };
+
+  const verificationUrl = lastAddress
+    ? `${window.location.origin}${window.location.pathname}?wallet=${encodeURIComponent(lastAddress)}`
+    : '';
+
   return (
     <div style={styles.page}>
       <h2 style={{ marginBottom: '1.5rem', color: 'var(--text)' }}>Verify Vaccination Status</h2>
@@ -76,8 +108,32 @@ export default function VerifyPage() {
       </form>
 
       <div aria-live="polite" aria-atomic="true">
-        {error && <p style={{ color: '#f87171', marginTop: '1rem' }} role="alert">Error: {error}</p>}
+        {error && (
+          <div role="alert" style={{ marginTop: '1rem' }}>
+            <p style={{ color: '#f87171', margin: 0 }}>Error: {error}</p>
+            {lastAddress && (
+              <button type="button" style={styles.retryBtn} onClick={handleRetry} disabled={loading}>
+                Retry verification
+              </button>
+            )}
+          </div>
+        )}
       </div>
+
+      {verificationUrl && (
+        <section style={styles.urlBox} aria-labelledby="verify-url-heading">
+          <h3 id="verify-url-heading" style={{ margin: 0, fontSize: '0.95rem', color: 'var(--text)' }}>
+            Verification link (text alternative to QR code)
+          </h3>
+          <p style={{ margin: '0.25rem 0 0', color: '#64748b', fontSize: '0.85rem' }}>
+            If you cannot scan a QR code, select or copy the link below and open it in your browser to verify this wallet.
+          </p>
+          <p style={styles.urlText}>
+            <span>{verificationUrl}</span>
+            <CopyButton text={verificationUrl} label="verification link" />
+          </p>
+        </section>
+      )}
 
       {result && (
         <div style={{ marginTop: '1.5rem' }} aria-live="polite">

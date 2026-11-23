@@ -26,6 +26,23 @@ const today = () => new Date().toISOString().split('T')[0];
 const FORM_KEY = 'issuer_form_draft';
 const EMPTY_FORM = { patient_address: '', vaccine_name: '', date_administered: '' };
 
+const EXPLORER_BASE = {
+  testnet: 'https://stellar.expert/explorer/testnet',
+  mainnet: 'https://stellar.expert/explorer/public',
+};
+
+const TX_HASH_RE = /^[0-9a-fA-F]{64}$/;
+
+const getExplorerUrl = (network, transactionHash) => {
+  if (!transactionHash || !TX_HASH_RE.test(transactionHash)) return null;
+  const base = EXPLORER_BASE[network];
+  if (!base) return null;
+  return `${base}/tx/${transactionHash}`;
+};
+
+const SUPPORT_URL = 'https://github.com/Stellar-Vaccination/Stellar-Vaccination/issues/new';
+=======
+
 export default function IssuerDashboard() {
   const { t } = useTranslation();
   const { publicKey, role, connect } = useAuth();
@@ -43,6 +60,8 @@ export default function IssuerDashboard() {
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(null);
   const [mintResult, setMintResult] = useState(null);
+  const [txState, setTxState] = useState(null); // 'pending' | 'confirmed' | 'failed' | 'expired'
+  const [txError, setTxError] = useState(null);
   const [confirming, setConfirming] = useState(false);
   const [isAuthorized, setIsAuthorized] = useState(null);
 
@@ -95,12 +114,36 @@ export default function IssuerDashboard() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    const result = await issueVaccination(form);
-    if (result) {
-      setMintResult(result);
-      setForm(EMPTY_FORM);
-      sessionStorage.removeItem(FORM_KEY);
+    setTxState('pending');
+    setTxError(null);
+    setMintResult(null);
+    try {
+      const result = await issueVaccination(form);
+      if (result && result.status === 'expired') {
+        setTxState('expired');
+        setTxError(result.error || null);
+      } else if (result && result.status === 'failed') {
+        setTxState('failed');
+        setTxError(result.error || null);
+      } else if (result) {
+        setMintResult(result);
+        setTxState('confirmed');
+        setForm(EMPTY_FORM);
+        sessionStorage.removeItem(FORM_KEY);
+      } else {
+        setTxState('failed');
+        setTxError(t('issuer.lifecycle.unknownError'));
+      }
+    } catch (err) {
+      setTxState('failed');
+      setTxError(err?.message || t('issuer.lifecycle.networkError'));
     }
+  };
+
+  const handleRetry = () => {
+    setTxState(null);
+    setTxError(null);
+    setMintResult(null);
   };
 
   const fields = [
@@ -140,22 +183,64 @@ export default function IssuerDashboard() {
           {loading ? 'Minting…' : 'Issue Vaccination NFT'}
         </button>
       </form>
-      <div aria-live="polite" aria-atomic="true">
-        {mintResult && (
+      <div aria-live="polite" aria-atomic="true" role="status">
+        {txState === 'pending' && (
+          <div style={{ marginTop: '1rem', padding: '0.75rem 1rem', background: '#0f172a', borderRadius: 8, color: '#f59e0b', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <span
+              aria-hidden="true"
+              style={{ display: 'inline-block', width: 14, height: 14, border: '2px solid #f59e0b', borderTopColor: 'transparent', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }}
+            />
+            <span>{t('issuer.lifecycle.pending')}</span>
+          </div>
+        )}
+        {txState === 'confirmed' && mintResult && (
           <div style={{ marginTop: '1rem', padding: '0.75rem 1rem', background: '#0f172a', borderRadius: 8, color: '#4ade80' }}>
-            <p>✅ Vaccination NFT minted!</p>
+            <p>✅ {t('issuer.lifecycle.confirmed')}</p>
             <p style={{ fontSize: '0.85rem', color: '#94a3b8', marginTop: '0.25rem', display: 'flex', alignItems: 'center' }}>
               Token ID: {mintResult.tokenId}
               <CopyButton text={String(mintResult.tokenId)} label="token ID" />
             </p>
-            <a
-              href={`https://stellar.expert/explorer/testnet/tx/${mintResult.transactionHash}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ fontSize: '0.85rem', color: '#0ea5e9' }}
-            >
-              View on Stellar Explorer ↗
-            </a>
+            {(() => {
+              const explorerUrl = getExplorerUrl(mintResult.network, mintResult.transactionHash);
+              return explorerUrl ? (
+                <a
+                  href={explorerUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ fontSize: '0.85rem', color: '#0ea5e9' }}
+                >
+                  {t('issuer.lifecycle.viewExplorer')} ↗
+                </a>
+              ) : null;
+            })()}
+          </div>
+        )}
+        {txState === 'failed' && (
+          <div style={{ marginTop: '1rem', padding: '0.75rem 1rem', background: '#7f1d1d', borderRadius: 8, color: '#fecaca' }}>
+            <p>⚠️ {t('issuer.lifecycle.failed')}</p>
+            {txError && <p style={{ fontSize: '0.85rem', marginTop: '0.25rem' }}>{txError}</p>}
+            <button type="button" style={{ ...styles.btn, marginTop: '0.5rem' }} onClick={handleRetry}>
+              {t('issuer.lifecycle.retry')}
+            </button>
+          </div>
+        )}
+        {txState === 'expired' && (
+          <div style={{ marginTop: '1rem', padding: '0.75rem 1rem', background: '#78350f', borderRadius: 8, color: '#fde68a' }}>
+            <p>⏱️ {t('issuer.lifecycle.expired')}</p>
+            {txError && <p style={{ fontSize: '0.85rem', marginTop: '0.25rem' }}>{txError}</p>}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.5rem' }}>
+              <button type="button" style={styles.btn} onClick={handleRetry}>
+                {t('issuer.lifecycle.retry')}
+              </button>
+              <a
+                href={SUPPORT_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ ...styles.btn, display: 'inline-block', textAlign: 'center', textDecoration: 'none', background: '#334155' }}
+              >
+                {t('issuer.lifecycle.contactSupport')}
+              </a>
+            </div>
           </div>
         )}
       </div>
