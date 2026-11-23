@@ -5,6 +5,7 @@ import { useVaccination } from '../hooks/useVaccination';
 import ConfirmMintDialog from '../components/ConfirmMintDialog';
 import CopyButton from '../components/CopyButton';
 import RoleBadge from '../components/RoleBadge';
+import RoleGuard from '../components/RoleGuard';
 
 const styles = {
   page: { maxWidth: 500, width: '100%', margin: '2rem auto', padding: '0 1rem', boxSizing: 'border-box' },
@@ -28,7 +29,7 @@ const EMPTY_FORM = { patient_address: '', vaccine_name: '', date_administered: '
 
 export default function IssuerDashboard() {
   const { t } = useTranslation();
-  const { publicKey, role, connect } = useAuth();
+  const { publicKey, role } = useAuth();
   const { issueVaccination, checkIssuerStatus, loading } = useVaccination();
 
   const [form, setForm] = useState(() => {
@@ -72,27 +73,6 @@ export default function IssuerDashboard() {
     }
   }, [publicKey, role, checkIssuerStatus]);
 
-  if (!publicKey) {
-    return (
-      <div style={styles.page}>
-        <p style={{ color: '#94a3b8', marginBottom: '1rem' }}>Connect your issuer wallet.</p>
-        <button style={styles.btn} onClick={connect} aria-label="Connect issuer wallet">Connect Wallet</button>
-      </div>
-    );
-  }
-
-  if (role !== 'issuer') {
-    return <div style={styles.page}><p style={{ color: '#f87171' }}>{t('issuer.accessDenied')}</p></div>;
-  }
-
-  if (isAuthorized === null) {
-    return (
-      <div style={styles.page}>
-        <p style={{ color: '#94a3b8' }}>Checking authorization status...</p>
-      </div>
-    );
-  }
-
   const handleSubmit = async (e) => {
     e.preventDefault();
     const result = await issueVaccination(form);
@@ -110,14 +90,24 @@ export default function IssuerDashboard() {
   ];
 
   return (
-    <div style={styles.page}>
-      <div style={{ borderLeft: '4px solid #22c55e', paddingLeft: '0.75rem', marginBottom: '1.5rem' }}>
-        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem' }}>
-          <h2 style={{ color: '#e2e8f0', margin: 0 }}>Issue Vaccination NFT</h2>
-          <RoleBadge role="issuer" />
+    <RoleGuard requiredRole="issuer">
+      <div style={styles.page}>
+        <div style={{ borderLeft: '4px solid #22c55e', paddingLeft: '0.75rem', marginBottom: '1.5rem' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem' }}>
+            <h2 style={{ color: '#e2e8f0', margin: 0 }}>Issue Vaccination NFT</h2>
+            <RoleBadge role="issuer" />
+          </div>
         </div>
-      </div>
-      <form style={styles.form} onSubmit={handleSubmit} role="form">
+        {isAuthorized === null ? (
+          <p style={{ color: '#94a3b8' }}>Checking authorization status...</p>
+        ) : (
+          <>
+            {!isAuthorized && (
+              <div style={styles.warning} role="alert">
+                {t('issuer.notAuthorized', 'This wallet is not authorized to issue vaccinations.')}
+              </div>
+            )}
+            <form style={styles.form} onSubmit={handleSubmit} role="form">
         {[
           { key: 'patient_address', label: 'Patient Stellar Address', placeholder: 'G...' },
           { key: 'vaccine_name', label: 'Vaccine Name', placeholder: 'e.g. COVID-19' },
@@ -136,29 +126,32 @@ export default function IssuerDashboard() {
             {errors[key] && <p style={styles.fieldError}>{errors[key]}</p>}
           </div>
         ))}
-        <button style={isAuthorized ? styles.btn : styles.btnDisabled} type="submit" disabled={loading || !isAuthorized} aria-disabled={loading || !isAuthorized}>
-          {loading ? 'Minting…' : 'Issue Vaccination NFT'}
-        </button>
-      </form>
-      <div aria-live="polite" aria-atomic="true">
-        {mintResult && (
-          <div style={{ marginTop: '1rem', padding: '0.75rem 1rem', background: '#0f172a', borderRadius: 8, color: '#4ade80' }}>
-            <p>✅ Vaccination NFT minted!</p>
-            <p style={{ fontSize: '0.85rem', color: '#94a3b8', marginTop: '0.25rem', display: 'flex', alignItems: 'center' }}>
-              Token ID: {mintResult.tokenId}
-              <CopyButton text={String(mintResult.tokenId)} label="token ID" />
-            </p>
-            <a
-              href={`https://stellar.expert/explorer/testnet/tx/${mintResult.transactionHash}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ fontSize: '0.85rem', color: '#0ea5e9' }}
-            >
-              View on Stellar Explorer ↗
-            </a>
-          </div>
+            <button style={isAuthorized ? styles.btn : styles.btnDisabled} type="submit" disabled={loading || !isAuthorized} aria-disabled={loading || !isAuthorized}>
+              {loading ? 'Minting…' : 'Issue Vaccination NFT'}
+            </button>
+            </form>
+          </>
         )}
+        <div aria-live="polite" aria-atomic="true">
+          {mintResult && (
+            <div style={{ marginTop: '1rem', padding: '0.75rem 1rem', background: '#0f172a', borderRadius: 8, color: '#4ade80' }}>
+              <p>✅ Vaccination NFT minted!</p>
+              <p style={{ fontSize: '0.85rem', color: '#94a3b8', marginTop: '0.25rem', display: 'flex', alignItems: 'center' }}>
+                Token ID: {mintResult.tokenId}
+                <CopyButton text={String(mintResult.tokenId)} label="token ID" />
+              </p>
+              <a
+                href={`https://stellar.expert/explorer/testnet/tx/${mintResult.transactionHash}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ fontSize: '0.85rem', color: '#0ea5e9' }}
+              >
+                View on Stellar Explorer ↗
+              </a>
+            </div>
+          )}
+        </div>
       </div>
-    </div>
+    </RoleGuard>
   );
 }

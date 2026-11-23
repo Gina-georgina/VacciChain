@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth } from '../hooks/useFreighter';
+import { ANALYTICS_BASE_URL } from '../config';
 
-const ANALYTICS_BASE = import.meta.env.VITE_ANALYTICS_URL || 'http://localhost:8001';
 const REFRESH_INTERVAL = 60_000;
 
 const s = {
@@ -121,9 +121,9 @@ export default function AnalyticsDashboard() {
     setError(null);
     try {
       const [ratesRes, issuersRes, anomaliesRes] = await Promise.all([
-        fetch(`${ANALYTICS_BASE}/analytics/rates`),
-        fetch(`${ANALYTICS_BASE}/analytics/issuers`),
-        fetch(`${ANALYTICS_BASE}/analytics/anomalies`),
+        fetch(`${ANALYTICS_BASE_URL}/analytics/rates`),
+        fetch(`${ANALYTICS_BASE_URL}/analytics/issuers`),
+        fetch(`${ANALYTICS_BASE_URL}/analytics/anomalies`),
       ]);
 
       const [ratesData, issuersData, anomaliesData] = await Promise.all([

@@ -5,6 +5,7 @@ import {
   signTransaction,
 } from '@stellar/freighter-api';
 import { useToast } from './useToast';
+import { apiUrl } from '../config';
 
 const AuthContext = createContext(null);
 // Only persist publicKey and role — token is kept in memory only
@@ -17,18 +18,23 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [freighterInstalled, setFreighterInstalled] = useState(() => typeof window !== 'undefined' && !!window.freighter);
+  // True while restoring persisted identity on mount; route guards can render a loading state
+  const [restoring, setRestoring] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return !!localStorage.getItem(STORAGE_KEY);
+  });
   // Token lives only in memory — never written to localStorage
   const tokenRef = useRef(null);
 
   const runSep10 = useCallback(async (pk) => {
-    const challengeRes = await fetch('/v1/auth/sep10', {
+    const challengeRes = await fetch(apiUrl('/v1/auth/sep10'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ public_key: pk }),
     });
     const { transaction, nonce } = await challengeRes.json();
     const signedXDR = await signTransaction(transaction, { network: 'TESTNET' });
-    const verifyRes = await fetch('/v1/auth/verify', {
+    const verifyRes = await fetch(apiUrl('/v1/auth/verify'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ transaction: signedXDR, nonce }),
@@ -77,7 +83,10 @@ export function AuthProvider({ children }) {
   // On mount: restore publicKey/role from localStorage, but require a fresh SEP-10 for the token
   useEffect(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
-    if (!saved) return;
+    if (!saved) {
+      setRestoring(false);
+      return;
+    }
     const { publicKey: savedKey, role: savedRole } = JSON.parse(saved);
     isConnected().then((connected) => {
       if (!connected) {
@@ -88,7 +97,8 @@ export function AuthProvider({ children }) {
       // Restore identity so UI shows as connected; token will be fetched on first apiFetch call
       setPublicKey(savedKey);
       setRole(savedRole);
-    }).catch(() => localStorage.removeItem(STORAGE_KEY));
+    }).catch(() => localStorage.removeItem(STORAGE_KEY))
+      .finally(() => setRestoring(false));
   }, []);
 
   const apiFetch = useCallback(async (url, options = {}) => {
@@ -119,6 +129,8 @@ export function AuthProvider({ children }) {
   }, [runSep10]);
 
   const isConnectedState = !!publicKey;
+  // Role is considered loading while restoring persisted identity or while a SEP-10 flow is in flight
+  const roleLoading = restoring || loading;
 
   return (
     <AuthContext.Provider value={{
@@ -130,6 +142,7 @@ export function AuthProvider({ children }) {
       apiFetch,
       isConnected: isConnectedState,
       loading,
+      roleLoading,
       error,
     }}>
       {children}

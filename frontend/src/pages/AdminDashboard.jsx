@@ -23,7 +23,7 @@ const s = {
 };
 
 export default function AdminDashboard() {
-  const { publicKey, role, connect, apiFetch } = useAuth();
+  const { publicKey, role, apiFetch } = useAuth();
   const [keys, setKeys]             = useState([]);
   const [label, setLabel]           = useState('');
   const [newKey, setNewKey]         = useState(null);
@@ -43,24 +43,13 @@ export default function AdminDashboard() {
   }, [apiFetch]);
 
   useEffect(() => {
+    // Disconnected, loading, and denied states are owned by the route-level
+    // RoleGuard; only fetch once the authenticated role is confirmed.
     if (publicKey && role === 'issuer') {
       fetchKeys();
       fetchApplications();
     }
   }, [publicKey, role, fetchKeys, fetchApplications]);
-
-  if (!publicKey) {
-    return (
-      <div style={s.page}>
-        <p style={{ color: '#94a3b8', marginBottom: '1rem' }}>Connect your admin wallet to manage API keys.</p>
-        <button style={s.btn} onClick={connect}>Connect Wallet</button>
-      </div>
-    );
-  }
-
-  if (role !== 'issuer') {
-    return <div style={s.page}><p style={{ color: '#f87171' }}>Access denied: admin role required.</p></div>;
-  }
 
   const handleCreate = async (e) => {
     e.preventDefault();

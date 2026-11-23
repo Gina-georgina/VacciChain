@@ -8,6 +8,7 @@ import IssuerOnboarding from './pages/IssuerOnboarding';
 import AnalyticsDashboard from './pages/AnalyticsDashboard';
 import { AuthProvider } from './hooks/useFreighter';
 import { useDarkMode } from './hooks/useDarkMode';
+import RoleGuard from './components/RoleGuard';
 import FreighterBanner from './components/FreighterBanner';
 import DemoBanner from './components/DemoBanner';
 import NavBar from './components/NavBar';
@@ -26,11 +27,32 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Landing />} />
           <Route path="/patient" element={<PatientDashboard />} />
-          <Route path="/issuer" element={<IssuerDashboard />} />
+          <Route
+            path="/issuer"
+            element={
+              <RoleGuard allowedRoles={['issuer']}>
+                <IssuerDashboard />
+              </RoleGuard>
+            }
+          />
           <Route path="/verify" element={<VerifyPage />} />
-          <Route path="/admin" element={<AdminDashboard />} />
+          <Route
+            path="/admin"
+            element={
+              <RoleGuard allowedRoles={['admin']}>
+                <AdminDashboard />
+              </RoleGuard>
+            }
+          />
           <Route path="/apply" element={<IssuerOnboarding />} />
-          <Route path="/analytics" element={<AnalyticsDashboard />} />
+          <Route
+            path="/analytics"
+            element={
+              <RoleGuard allowedRoles={['issuer']}>
+                <AnalyticsDashboard />
+              </RoleGuard>
+            }
+          />
         </Routes>
       </main>
     </AuthProvider>
