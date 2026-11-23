@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../hooks/useFreighter';
 import { useVaccination } from '../hooks/useVaccination';
@@ -25,7 +25,29 @@ export default function PatientDashboard() {
   const { consented, giveConsent, loading: consentLoading } = useConsent();
   const [qrRecord, setQrRecord] = useState(null);
 
-  const handleDeclineConsent = () => disconnect();
+  // Clear wallet-specific UI state whenever the active account changes or the
+  // wallet disconnects, so the prior account's data is never shown.
+  useEffect(() => {
+    setQrRecord(null);
+  }, [publicKey]);
+
+  const handleDeclineConsent = () => {
+    setQrRecord(null);
+    disconnect();
+  };
+
+  const handleRetry = () => {
+    // Retry only refetches data; safe form state (e.g. open QR modal) is kept.
+    refetch();
+  };
+
+  // Treat a pending request as loading even if stale records exist, so a
+  // stalled request is never mistaken for empty data.
+  const isInitialLoading = loading && records.length === 0;
+  const isRefreshing = loading && records.length > 0;
+  const hasError = !loading && Boolean(error);
+  const isEmpty = !loading && !error && records.length === 0;
+  const isPartial = !loading && !error && records.length > 0;
 
   if (!publicKey) {
     return (
@@ -66,22 +88,42 @@ export default function PatientDashboard() {
         <CopyButton text={publicKey} label="wallet address" />
       </p>
 
-      {loading && <NFTCardSkeleton count={3} />}
-      {!loading && error && (
-        <div style={{ textAlign: 'center', padding: '2rem 0' }}>
-          <p style={{ color: '#f87171', marginBottom: '0.75rem' }}>⚠️ {error}</p>
-          <button style={styles.btn} onClick={refetch}>Retry</button>
+      {isInitialLoading && (
+        <div role="status" aria-live="polite" aria-busy="true">
+          <span style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>
+            Loading records…
+          </span>
+          <NFTCardSkeleton count={3} />
         </div>
       )}
-      {!loading && !error && records.length === 0 && <EmptyState />}
 
-      {records.map((r) => (
-        <NFTCard
-          key={r.token_id}
-          record={r}
-          onShowQR={setQrRecord}
-        />
-      ))}
+      {hasError && (
+        <div role="alert" style={{ textAlign: 'center', padding: '2rem 0' }}>
+          <p style={{ color: '#f87171', marginBottom: '0.75rem' }}>⚠️ {error}</p>
+          <button style={styles.btn} onClick={handleRetry}>Retry</button>
+        </div>
+      )}
+
+      {isEmpty && <EmptyState />}
+
+      {isRefreshing && (
+        <p role="status" aria-live="polite" style={{ color: '#94a3b8', fontSize: '0.85rem', marginBottom: '0.75rem' }}>
+          Refreshing records…
+        </p>
+      )}
+
+      {isPartial && (
+        <>
+          {isRefreshing && <NFTCardSkeleton count={1} />}
+          {records.map((r) => (
+            <NFTCard
+              key={r.token_id}
+              record={r}
+              onShowQR={setQrRecord}
+            />
+          ))}
+        </>
+      )}
 
       {qrRecord && (
         <QRCodeModal

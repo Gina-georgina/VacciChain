@@ -158,5 +158,120 @@ describe('IssuerDashboard', () => {
         });
       });
     });
+
+    it('should clear in-memory fields and persisted draft after successful issuance', async () => {
+      mockIssueVaccination.mockResolvedValue(true);
+
+      render(<IssuerDashboard />);
+
+      const addressInput = screen.getByLabelText('Patient Stellar Address');
+      const vaccineInput = screen.getByLabelText('Vaccine Name');
+      const dateInput = screen.getByLabelText('Date Administered');
+
+      fireEvent.change(addressInput, { target: { value: 'G12345678901234567890123456789012345678901234567890123456' } });
+      fireEvent.change(vaccineInput, { target: { value: 'COVID-19' } });
+      fireEvent.change(dateInput, { target: { value: '2024-01-15' } });
+
+      fireEvent.click(screen.getByRole('button', { name: /Issue Vaccination NFT/i }));
+
+      await waitFor(() => {
+        expect(mockIssueVaccination).toHaveBeenCalled();
+      });
+
+      await waitFor(() => {
+        expect(addressInput).toHaveValue('');
+        expect(vaccineInput).toHaveValue('');
+        expect(dateInput).toHaveValue('');
+      });
+
+      const persisted = Object.keys(sessionStorage)
+        .filter((key) => key.toLowerCase().includes('draft'))
+        .map((key) => sessionStorage.getItem(key))
+        .join(' ');
+      expect(persisted).not.toContain('G12345678901234567890123456789012345678901234567890123456');
+      expect(persisted).not.toContain('COVID-19');
+    });
+
+    it('should preserve user-entered values when issuance fails', async () => {
+      mockIssueVaccination.mockRejectedValue(new Error('Network error'));
+
+      render(<IssuerDashboard />);
+
+      const addressInput = screen.getByLabelText('Patient Stellar Address');
+      const vaccineInput = screen.getByLabelText('Vaccine Name');
+      const dateInput = screen.getByLabelText('Date Administered');
+
+      fireEvent.change(addressInput, { target: { value: 'G12345678901234567890123456789012345678901234567890123456' } });
+      fireEvent.change(vaccineInput, { target: { value: 'COVID-19' } });
+      fireEvent.change(dateInput, { target: { value: '2024-01-15' } });
+
+      fireEvent.click(screen.getByRole('button', { name: /Issue Vaccination NFT/i }));
+
+      await waitFor(() => {
+        expect(mockIssueVaccination).toHaveBeenCalled();
+      });
+
+      expect(addressInput).toHaveValue('G12345678901234567890123456789012345678901234567890123456');
+      expect(vaccineInput).toHaveValue('COVID-19');
+      expect(dateInput).toHaveValue('2024-01-15');
+    });
+
+    it('should not persist patient-sensitive data in drafts', async () => {
+      render(<IssuerDashboard />);
+
+      const addressInput = screen.getByLabelText('Patient Stellar Address');
+      const vaccineInput = screen.getByLabelText('Vaccine Name');
+
+      fireEvent.change(addressInput, { target: { value: 'G12345678901234567890123456789012345678901234567890123456' } });
+      fireEvent.change(vaccineInput, { target: { value: 'COVID-19' } });
+
+      const persisted = Object.keys(sessionStorage)
+        .filter((key) => key.toLowerCase().includes('draft'))
+        .map((key) => sessionStorage.getItem(key))
+        .join(' ');
+      expect(persisted).not.toContain('G12345678901234567890123456789012345678901234567890123456');
+    });
+
+    it('should show loading state while checking issuer status', () => {
+      useVaccination.mockReturnValue({
+        issueVaccination: mockIssueVaccination,
+        checkIssuerStatus: jest.fn(() => new Promise(() => {})),
+        loading: false
+      });
+
+      render(<IssuerDashboard />);
+
+      expect(screen.getByText(/Checking issuer status/i)).toBeInTheDocument();
+    });
+
+    it('should show error state with retry when issuer status check fails', async () => {
+      const checkIssuerStatus = jest.fn().mockRejectedValue(new Error('Network error'));
+      useVaccination.mockReturnValue({ issueVaccination: mockIssueVaccination, checkIssuerStatus, loading: false });
+
+      render(<IssuerDashboard />);
+
+      expect(await screen.findByText(/Unable to verify issuer status/i)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Retry/i })).toBeInTheDocument();
+    });
+
+    it('should preserve form state when retrying a failed status check', async () => {
+      const checkIssuerStatus = jest.fn().mockRejectedValue(new Error('Network error'));
+      useVaccination.mockReturnValue({ issueVaccination: mockIssueVaccination, checkIssuerStatus, loading: false });
+
+      render(<IssuerDashboard />);
+
+      const vaccineInput = screen.getByLabelText('Vaccine Name');
+      fireEvent.change(vaccineInput, { target: { value: 'COVID-19' } });
+
+      const retryButton = await screen.findByRole('button', { name: /Retry/i });
+      checkIssuerStatus.mockResolvedValue(true);
+      fireEvent.click(retryButton);
+
+      await waitFor(() => {
+        expect(checkIssuerStatus).toHaveBeenCalledTimes(2);
+      });
+
+      expect(screen.getByLabelText('Vaccine Name')).toHaveValue('COVID-19');
+    });
   });
 });

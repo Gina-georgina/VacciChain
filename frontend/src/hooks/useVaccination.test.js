@@ -117,4 +117,72 @@ describe('useVaccination', () => {
     renderHook(() => useVaccination(null));
     expect(mockApiFetch).not.toHaveBeenCalled();
   });
+
+  it('resets records to loading and aborts in-flight request on account change', async () => {
+    const WALLET_B = 'GZZZZZ9876543210';
+    const RECORDS_B = [{ token_id: '2', vaccine_name: 'Flu', date_administered: '2024-02-01', issuer: 'GISSUER' }];
+
+    let firstSignal;
+    mockApiFetch.mockImplementationOnce((_url, opts) => {
+      firstSignal = opts.signal;
+      return new Promise(() => {}); // never resolves
+    });
+
+    const { result, rerender } = renderHook(({ wallet }) => useVaccination(wallet), {
+      initialProps: { wallet: WALLET },
+    });
+
+    await act(async () => {});
+    expect(firstSignal).toBeDefined();
+    expect(firstSignal.aborted).toBe(false);
+
+    // Switch to a different account; the new fetch resolves with account B data
+    mockApiFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ data: RECORDS_B }),
+    });
+
+    rerender({ wallet: WALLET_B });
+
+    // Prior account's in-flight request must be aborted
+    expect(firstSignal.aborted).toBe(true);
+
+    // While loading, prior account's records must not be shown
+    expect(result.current.loading).toBe(true);
+    expect(result.current.records).toEqual([]);
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(mockApiFetch).toHaveBeenLastCalledWith(
+      `/v1/vaccination/${WALLET_B}`,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
+    expect(result.current.records).toEqual(RECORDS_B);
+  });
+
+  it('clears cached records on disconnect', async () => {
+    const { result, rerender } = renderHook(({ wallet }) => useVaccination(wallet), {
+      initialProps: { wallet: WALLET },
+    });
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.records).toEqual(RECORDS);
+    expect(cache.size).toBeGreaterThan(0);
+
+    // Disconnect: wallet becomes null
+    rerender({ wallet: null });
+
+    expect(result.current.records).toEqual([]);
+    expect(result.current.error).toBeNull();
+    expect(result.current.loading).toBe(false);
+    expect(cache.size).toBe(0);
+
+    // Reconnecting to the same wallet must fetch again (cache was cleared)
+    mockApiFetch.mockClear();
+    rerender({ wallet: WALLET });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+    expect(result.current.records).toEqual(RECORDS);
+  });
 });

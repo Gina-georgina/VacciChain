@@ -18,13 +18,16 @@ export default function VerifyPage() {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [lastAddress, setLastAddress] = useState('');
 
   const verify = async (address) => {
+    const trimmed = address.trim();
+    setLastAddress(trimmed);
     setLoading(true);
     setResult(null);
     setError(null);
     try {
-      const res = await fetch(`/v1/verify/${address.trim()}`);
+      const res = await fetch(`/v1/verify/${trimmed}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       setResult(data);
@@ -35,6 +38,11 @@ export default function VerifyPage() {
       setLoading(false);
     }
   };
+
+  const handleRetry = () => {
+    if (lastAddress) verify(lastAddress);
+  };
+=======
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -76,19 +84,47 @@ export default function VerifyPage() {
       </form>
 
       <div aria-live="polite" aria-atomic="true">
-        {error && <p style={{ color: '#f87171', marginTop: '1rem' }} role="alert">Error: {error}</p>}
+        {loading && (
+          <p style={{ color: 'var(--text)', marginTop: '1rem' }} role="status">
+            Checking vaccination status…
+          </p>
+        )}
+        {error && (
+          <div style={{ marginTop: '1rem' }} role="alert">
+            <p style={{ color: '#f87171' }}>Error: {error}</p>
+            <button
+              type="button"
+              style={styles.btn}
+              onClick={handleRetry}
+              disabled={loading || !lastAddress}
+            >
+              Retry
+            </button>
+          </div>
+        )}
       </div>
 
-      {result && (
+      {!loading && !error && result && (
         <div style={{ marginTop: '1.5rem' }} aria-live="polite">
           <VerificationBadge vaccinated={result.vaccinated} recordCount={result.record_count} />
           <p style={{ color: '#64748b', fontSize: '0.85rem', marginTop: '1rem', wordBreak: 'break-all', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '0.25rem' }}>
             Wallet: {wallet}
             <CopyButton text={wallet} label="wallet address" />
           </p>
-          <div style={{ marginTop: '1rem' }}>
-            {result.records?.map((r) => <NFTCard key={r.token_id} record={r} />)}
-          </div>
+          {result.records && result.records.length > 0 ? (
+            <div style={{ marginTop: '1rem' }}>
+              {result.records.map((r) => <NFTCard key={r.token_id} record={r} />)}
+            </div>
+          ) : (
+            <p style={{ color: '#64748b', marginTop: '1rem' }} role="status">
+              No vaccination records found for this wallet.
+            </p>
+          )}
+          {result.partial && (
+            <p style={{ color: '#fbbf24', marginTop: '1rem' }} role="status">
+              Some records could not be loaded. Results may be incomplete.
+            </p>
+          )}
         </div>
       )}
     </div>

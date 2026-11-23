@@ -14,20 +14,50 @@ const card = {
   marginBottom: '1rem',
 };
 
-export default function NFTCardSkeleton({ count = 3 }) {
+export default function NFTCardSkeleton({
+  count = 3,
+  label = 'Loading…',
+  ariaLabel,
+  role = 'status',
+}) {
+  const safeCount = Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
+  const accessibleLabel = ariaLabel || label;
+
   return (
     <>
       <style>{`@keyframes vacciPulse{0%,100%{opacity:.4}50%{opacity:1}}`}</style>
-      {Array.from({ length: count }).map((_, i) => (
-        <div key={i} style={card}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 10 }}>
-            <div style={bar('55%', 16)} />
-            <div style={bar(40)} />
+      <div
+        role={role}
+        aria-busy="true"
+        aria-live="polite"
+        aria-label={accessibleLabel}
+      >
+        <span
+          style={{
+            position: 'absolute',
+            width: 1,
+            height: 1,
+            padding: 0,
+            margin: -1,
+            overflow: 'hidden',
+            clip: 'rect(0, 0, 0, 0)',
+            whiteSpace: 'nowrap',
+            border: 0,
+          }}
+        >
+          {accessibleLabel}
+        </span>
+        {Array.from({ length: safeCount }).map((_, i) => (
+          <div key={i} style={card} aria-hidden="true">
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 10 }}>
+              <div style={bar('55%', 16)} />
+              <div style={bar(40)} />
+            </div>
+            <div style={bar('40%', 13, 6)} />
+            <div style={bar('60%', 12)} />
           </div>
-          <div style={bar('40%', 13, 6)} />
-          <div style={bar('60%', 12)} />
-        </div>
-      ))}
+        ))}
+      </div>
     </>
   );
 }

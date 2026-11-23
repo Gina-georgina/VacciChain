@@ -1,10 +1,11 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../hooks/useFreighter';
 import { useVaccination } from '../hooks/useVaccination';
 import ConfirmMintDialog from '../components/ConfirmMintDialog';
 import CopyButton from '../components/CopyButton';
 import RoleBadge from '../components/RoleBadge';
+import AsyncState from '../components/AsyncState';
 
 const styles = {
   page: { maxWidth: 500, width: '100%', margin: '2rem auto', padding: '0 1rem', boxSizing: 'border-box' },
@@ -26,25 +27,57 @@ const today = () => new Date().toISOString().split('T')[0];
 const FORM_KEY = 'issuer_form_draft';
 const EMPTY_FORM = { patient_address: '', vaccine_name: '', date_administered: '' };
 
+// Only non-sensitive fields are persisted. Patient-identifying data
+// (patient_address) is intentionally excluded from the draft schema.
+const DRAFT_FIELDS = ['vaccine_name', 'date_administered'];
+
+const readDraft = () => {
+  try {
+    const saved = sessionStorage.getItem(FORM_KEY);
+    if (!saved) return EMPTY_FORM;
+    const parsed = JSON.parse(saved);
+    const draft = { ...EMPTY_FORM };
+    for (const key of DRAFT_FIELDS) {
+      if (typeof parsed?.[key] === 'string') draft[key] = parsed[key];
+    }
+    return draft;
+  } catch {
+    return EMPTY_FORM;
+  }
+};
+
+const writeDraft = (form) => {
+  try {
+    const draft = {};
+    for (const key of DRAFT_FIELDS) draft[key] = form[key] ?? '';
+    sessionStorage.setItem(FORM_KEY, JSON.stringify(draft));
+  } catch {
+    // Persistence is best-effort; ignore storage failures.
+  }
+};
+
+const clearDraft = () => {
+  try {
+    sessionStorage.removeItem(FORM_KEY);
+  } catch {
+    // ignore storage failures
+  }
+};
+
 export default function IssuerDashboard() {
   const { t } = useTranslation();
   const { publicKey, role, connect } = useAuth();
   const { issueVaccination, checkIssuerStatus, loading } = useVaccination();
 
-  const [form, setForm] = useState(() => {
-    try {
-      const saved = sessionStorage.getItem(FORM_KEY);
-      return saved ? JSON.parse(saved) : EMPTY_FORM;
-    } catch {
-      return EMPTY_FORM;
-    }
-  });
+  const [form, setForm] = useState(readDraft);
   const [touched, setTouched] = useState({});
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(null);
   const [mintResult, setMintResult] = useState(null);
   const [confirming, setConfirming] = useState(false);
   const [isAuthorized, setIsAuthorized] = useState(null);
+  const [authStatus, setAuthStatus] = useState('idle');
+  const [authError, setAuthError] = useState(null);
 
   const validate = (f) => {
     const errors = {};
@@ -63,14 +96,43 @@ export default function IssuerDashboard() {
   const isValid = Object.keys(errors).length === 0;
 
   useEffect(() => {
-    sessionStorage.setItem(FORM_KEY, JSON.stringify(form));
+    writeDraft(form);
   }, [form]);
+
+  const loadAuthorization = useCallback(async () => {
+    setAuthStatus('loading');
+    setAuthError(null);
+    setIsAuthorized(null);
+    try {
+      const authorized = await checkIssuerStatus();
+      setIsAuthorized(Boolean(authorized));
+      setAuthStatus('success');
+    } catch (err) {
+      setIsAuthorized(null);
+      setAuthError(err?.message || t('issuer.authCheckFailed', 'Unable to verify issuer authorization.'));
+      setAuthStatus('error');
+    }
+  }, [checkIssuerStatus, t]);
+
+  // Reset all wallet-scoped state whenever the active account changes or
+  // disconnects, so the prior account's data is never shown.
+  useEffect(() => {
+    setForm(readDraft());
+    setTouched({});
+    setError(null);
+    setSuccess(null);
+    setMintResult(null);
+    setConfirming(false);
+    setIsAuthorized(null);
+    setAuthError(null);
+    setAuthStatus('idle');
+  }, [publicKey]);
 
   useEffect(() => {
     if (publicKey && role === 'issuer') {
-      checkIssuerStatus().then(setIsAuthorized);
+      loadAuthorization();
     }
-  }, [publicKey, role, checkIssuerStatus]);
+  }, [publicKey, role, loadAuthorization]);
 
   if (!publicKey) {
     return (
@@ -85,21 +147,41 @@ export default function IssuerDashboard() {
     return <div style={styles.page}><p style={{ color: '#f87171' }}>{t('issuer.accessDenied')}</p></div>;
   }
 
-  if (isAuthorized === null) {
+  if (authStatus === 'loading' || authStatus === 'idle') {
     return (
       <div style={styles.page}>
-        <p style={{ color: '#94a3b8' }}>Checking authorization status...</p>
+        <AsyncState status="loading" message="Checking authorization status..." />
+      </div>
+    );
+  }
+
+  if (authStatus === 'error') {
+    return (
+      <div style={styles.page}>
+        <AsyncState
+          status="error"
+          message={authError || t('issuer.authCheckFailed', 'Unable to verify issuer authorization.')}
+          onRetry={loadAuthorization}
+        />
       </div>
     );
   }
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    setError(null);
+    setSuccess(null);
     const result = await issueVaccination(form);
     if (result) {
       setMintResult(result);
+      setSuccess(true);
+      // Successful issuance clears both in-memory fields and the persisted draft.
       setForm(EMPTY_FORM);
-      sessionStorage.removeItem(FORM_KEY);
+      setTouched({});
+      clearDraft();
+    } else {
+      // Failed issuance preserves user-entered values and the draft.
+      setError(t('issuer.issueFailed', 'Issuance failed. Your entries have been preserved.'));
     }
   };
 
@@ -141,6 +223,19 @@ export default function IssuerDashboard() {
         </button>
       </form>
       <div aria-live="polite" aria-atomic="true">
+        {error && (
+          <div style={{ marginTop: '1rem', padding: '0.75rem 1rem', background: '#7f1d1d', borderRadius: 8, color: '#fecaca' }}>
+            <p>{error}</p>
+            <button
+              type="button"
+              style={{ ...styles.btn, marginTop: '0.5rem' }}
+              onClick={handleSubmit}
+              disabled={loading || !isAuthorized}
+            >
+              {t('common.retry', 'Retry')}
+            </button>
+          </div>
+        )}
         {mintResult && (
           <div style={{ marginTop: '1rem', padding: '0.75rem 1rem', background: '#0f172a', borderRadius: 8, color: '#4ade80' }}>
             <p>✅ Vaccination NFT minted!</p>

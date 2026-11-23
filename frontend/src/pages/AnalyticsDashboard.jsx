@@ -13,6 +13,9 @@ const s = {
   sectionTitle: { color: '#94a3b8', fontSize: '0.85rem', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '1rem' },
   error: { color: '#f87171', padding: '0.75rem', background: '#1e293b', borderRadius: 8, marginBottom: '1rem' },
   loading: { color: '#64748b', textAlign: 'center', padding: '2rem 0' },
+  sectionError: { color: '#f87171', padding: '0.75rem', background: '#1e293b', borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap' },
+  partialNote: { color: '#fcd34d', fontSize: '0.8rem', marginBottom: '0.75rem' },
+  retryBtn: { background: '#0ea5e9', color: '#0f172a', border: 'none', borderRadius: 6, padding: '0.4rem 0.9rem', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer' },
   table: { width: '100%', borderCollapse: 'collapse', fontSize: '0.9rem' },
   th: { textAlign: 'left', color: '#64748b', fontWeight: 500, padding: '0.5rem 0.75rem', borderBottom: '1px solid #1e293b' },
   td: { padding: '0.6rem 0.75rem', color: '#e2e8f0', borderBottom: '1px solid #1e293b' },
@@ -106,42 +109,48 @@ function AnomalyList({ data }) {
   );
 }
 
+const SECTIONS = [
+  { key: 'rates', path: '/analytics/rates', field: 'rates' },
+  { key: 'issuers', path: '/analytics/issuers', field: 'issuers' },
+  { key: 'anomalies', path: '/analytics/anomalies', field: 'anomalies' },
+];
+
+const initialSectionState = () => ({
+  rates: { status: 'loading', data: null, error: null },
+  issuers: { status: 'loading', data: null, error: null },
+  anomalies: { status: 'loading', data: null, error: null },
+});
+
 export default function AnalyticsDashboard() {
-  const { role, apiFetch } = useAuth();
-  const [rates, setRates] = useState(null);
-  const [issuers, setIssuers] = useState(null);
-  const [anomalies, setAnomalies] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+  const { role } = useAuth();
+  const [sections, setSections] = useState(initialSectionState);
   const [lastRefresh, setLastRefresh] = useState(null);
   const timerRef = useRef(null);
 
-  const fetchAll = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [ratesRes, issuersRes, anomaliesRes] = await Promise.all([
-        fetch(`${ANALYTICS_BASE}/analytics/rates`),
-        fetch(`${ANALYTICS_BASE}/analytics/issuers`),
-        fetch(`${ANALYTICS_BASE}/analytics/anomalies`),
-      ]);
-
-      const [ratesData, issuersData, anomaliesData] = await Promise.all([
-        ratesRes.json(),
-        issuersRes.json(),
-        anomaliesRes.json(),
-      ]);
-
-      setRates(ratesData.rates ?? ratesData);
-      setIssuers(issuersData.issuers ?? issuersData);
-      setAnomalies(anomaliesData.anomalies ?? anomaliesData);
-      setLastRefresh(new Date());
-    } catch (e) {
-      setError('Failed to load analytics data. Is the analytics service running?');
-    } finally {
-      setLoading(false);
-    }
+  const setSection = useCallback((key, patch) => {
+    setSections((prev) => ({ ...prev, [key]: { ...prev[key], ...patch } }));
   }, []);
+
+  const fetchSection = useCallback(async (section) => {
+    setSection(section.key, { status: 'loading', error: null });
+    try {
+      const res = await fetch(`${ANALYTICS_BASE}${section.path}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const data = json[section.field] ?? json;
+      setSection(section.key, { status: 'success', data, error: null });
+    } catch (e) {
+      setSection(section.key, {
+        status: 'error',
+        error: 'Failed to load analytics data. Is the analytics service running?',
+      });
+    }
+  }, [setSection]);
+
+  const fetchAll = useCallback(async () => {
+    await Promise.all(SECTIONS.map((section) => fetchSection(section)));
+    setLastRefresh(new Date());
+  }, [fetchSection]);
 
   useEffect(() => {
     fetchAll();
@@ -157,6 +166,35 @@ export default function AnalyticsDashboard() {
     );
   }
 
+  const sectionEntries = SECTIONS.map((section) => ({ ...section, state: sections[section.key] }));
+  const failedCount = sectionEntries.filter((e) => e.state.status === 'error').length;
+  const isPartial = failedCount > 0 && failedCount < sectionEntries.length;
+  const allFailed = failedCount === sectionEntries.length;
+
+  const renderSection = (section, title, id, renderData) => {
+    const { status, data, error } = section.state;
+    return (
+      <section style={s.section} aria-labelledby={id}>
+        <h3 id={id} style={s.sectionTitle}>{title}</h3>
+        {status === 'loading' && data == null && <p style={s.loading}>Loading…</p>}
+        {status === 'error' && (
+          <div style={s.sectionError} role="alert">
+            <span>⚠️ {error}</span>
+            <button
+              type="button"
+              style={s.retryBtn}
+              onClick={() => fetchSection(section)}
+              aria-label={`Retry loading ${title}`}
+            >
+              Retry
+            </button>
+          </div>
+        )}
+        {status !== 'error' && data != null && renderData(data)}
+      </section>
+    );
+  };
+
   return (
     <div style={s.page}>
       <div style={s.header}>
@@ -166,25 +204,24 @@ export default function AnalyticsDashboard() {
         </span>
       </div>
 
-      {error && <p style={s.error} role="alert">⚠️ {error}</p>}
+      {isPartial && (
+        <p style={s.partialNote} role="status">
+          Some analytics data could not be loaded. Showing available sections.
+        </p>
+      )}
 
-      {/* Vaccination Rates */}
-      <section style={s.section} aria-labelledby="rates-title">
-        <h3 id="rates-title" style={s.sectionTitle}>Vaccination Rates by Vaccine Type</h3>
-        {loading && !rates ? <p style={s.loading}>Loading…</p> : <BarChart data={rates} />}
-      </section>
+      {allFailed && (
+        <div style={s.error} role="alert">
+          <span>⚠️ Failed to load analytics data. Is the analytics service running?</span>
+          <button type="button" style={s.retryBtn} onClick={fetchAll} aria-label="Retry loading all analytics data">
+            Retry all
+          </button>
+        </div>
+      )}
 
-      {/* Issuer Activity */}
-      <section style={s.section} aria-labelledby="issuers-title">
-        <h3 id="issuers-title" style={s.sectionTitle}>Issuer Activity</h3>
-        {loading && !issuers ? <p style={s.loading}>Loading…</p> : <IssuerTable data={issuers} />}
-      </section>
-
-      {/* Anomaly Flags */}
-      <section style={s.section} aria-labelledby="anomalies-title">
-        <h3 id="anomalies-title" style={s.sectionTitle}>Anomaly Flags</h3>
-        {loading && !anomalies ? <p style={s.loading}>Loading…</p> : <AnomalyList data={anomalies} />}
-      </section>
+      {renderSection(sectionEntries[0], 'Vaccination Rates by Vaccine Type', 'rates-title', (data) => <BarChart data={data} />)}
+      {renderSection(sectionEntries[1], 'Issuer Activity', 'issuers-title', (data) => <IssuerTable data={data} />)}
+      {renderSection(sectionEntries[2], 'Anomaly Flags', 'anomalies-title', (data) => <AnomalyList data={data} />)}
     </div>
   );
 }

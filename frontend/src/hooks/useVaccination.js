@@ -7,17 +7,23 @@ export const cache = new Map();
 const CACHE_TTL = 30_000; // 30 seconds
 
 export function useVaccination(walletAddress) {
-  const { apiFetch } = useAuth();
+  const { apiFetch, walletAddress: activeAccount } = useAuth();
   const toast = useToast();
   const [records, setRecords] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const abortRef = useRef(null);
+  // Track the account the current records belong to so we never show stale data
+  const recordsAccountRef = useRef(null);
   // Keep latest apiFetch/toast in refs so effects don't re-run when they change
   const apiFetchRef = useRef(apiFetch);
   const toastRef = useRef(toast);
   useEffect(() => { apiFetchRef.current = apiFetch; }, [apiFetch]);
   useEffect(() => { toastRef.current = toast; }, [toast]);
+
+  // Resolve the account to use: prefer the explicit argument, fall back to the
+  // active account from auth so the hook stays in sync with wallet changes.
+  const account = walletAddress || activeAccount || null;
 
   const fetchFromApi = useCallback(async (wallet, signal) => {
     setLoading(true);
@@ -42,29 +48,57 @@ export function useVaccination(walletAddress) {
   }, []); // stable — uses refs internally
 
   useEffect(() => {
-    if (!walletAddress) return;
+    // Abort any in-flight request from the previous account
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
 
-    const cached = cache.get(walletAddress);
+    // Clear cached private records for the previous account on switch/disconnect
+    const previous = recordsAccountRef.current;
+    if (previous && previous !== account) {
+      cache.delete(previous);
+    }
+
+    // Disconnect: wipe all wallet-specific state
+    if (!account) {
+      recordsAccountRef.current = null;
+      setRecords([]);
+      setError(null);
+      setLoading(false);
+      return;
+    }
+
+    // Account change: reset to a clean loading state before fetching so the
+    // prior account's records are never briefly shown.
+    if (previous !== account) {
+      recordsAccountRef.current = account;
+      setRecords([]);
+      setError(null);
+    }
+
+    const cached = cache.get(account);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
       setRecords(cached.records);
+      setLoading(false);
       return;
     }
 
     const controller = new AbortController();
     abortRef.current = controller;
-    fetchFromApi(walletAddress, controller.signal);
+    fetchFromApi(account, controller.signal);
 
     return () => { controller.abort(); };
-  }, [walletAddress, fetchFromApi]);
+  }, [account, fetchFromApi]);
 
   const refetch = useCallback(() => {
-    if (!walletAddress) return;
-    cache.delete(walletAddress);
+    if (!account) return;
+    cache.delete(account);
     if (abortRef.current) abortRef.current.abort();
     const controller = new AbortController();
     abortRef.current = controller;
-    return fetchFromApi(walletAddress, controller.signal);
-  }, [walletAddress, fetchFromApi]);
+    return fetchFromApi(account, controller.signal);
+  }, [account, fetchFromApi]);
 
   const issueVaccination = useCallback(async (payload) => {
     setLoading(true);

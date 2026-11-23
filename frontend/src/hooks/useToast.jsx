@@ -7,9 +7,10 @@ let _id = 0;
 export function ToastProvider({ children }) {
   const [toasts, setToasts] = useState([]);
 
-  const toast = useCallback((message, type = 'info') => {
+  const toast = useCallback((message, type = 'info', options = {}) => {
     const id = ++_id;
-    setToasts((t) => [...t, { id, message, type }]);
+    const action = options && options.action ? options.action : null;
+    setToasts((t) => [...t, { id, message, type, action }]);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4000);
   }, []);
 
@@ -59,6 +60,30 @@ function ToastList({ toasts, onDismiss }) {
         >
           <Icon type={t.type} />
           <span style={{ flex: 1 }}>{t.message}</span>
+          {t.action && typeof t.action.onClick === 'function' ? (
+            <button
+              onClick={() => {
+                try {
+                  t.action.onClick();
+                } finally {
+                  onDismiss(t.id);
+                }
+              }}
+              style={{
+                background: 'rgba(255,255,255,0.18)',
+                border: '1px solid rgba(255,255,255,0.5)',
+                color: '#fff',
+                cursor: 'pointer',
+                fontSize: '0.85rem',
+                fontWeight: 600,
+                padding: '0.2rem 0.5rem',
+                borderRadius: 6,
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {t.action.label || 'Retry'}
+            </button>
+          ) : null}
           <button
             onClick={() => onDismiss(t.id)}
             aria-label="Dismiss"
