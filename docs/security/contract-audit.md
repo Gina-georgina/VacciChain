@@ -25,9 +25,21 @@ All items must be ✅ before sending the contract to an external auditor.
 - [ ] Issuer storage key inconsistency fixed (F-02, F-03 in pre-audit notes)
 - [ ] Token ID scheme finalized — deterministic hash or counter, not both
 - [ ] `batch_verify` and record-limit panics replaced with `ContractError` returns
-- [ ] Persistent storage TTL policy implemented (`extend_ttl` on all persistent writes)
+- [x] Persistent storage TTL policy implemented (`extend_ttl` on all persistent writes)
+- [x] Storage lifecycle and TTL extension assumptions documented (see `docs/security/storage-lifecycle.md`)
+- [x] Storage sizing model covering expected patient and issuer volumes, with Soroban rent
+      implications, documented (see `docs/security/storage-lifecycle.md`)
+- [x] Retention/compaction and indexing approach approved without violating audit requirements
+      (see `docs/security/storage-lifecycle.md`)
+- [x] Resource baselines measured for mint, verify, revoke, and batch operations
+- [x] CI regression gate enforces documented CPU/memory thresholds and publishes comparisons
+      (see `docs/security/resource-baselines.md`)
+- [x] Migration tests added for each supported storage schema change, with fixture-based
+      prior-state coverage
+- [x] Unsupported upgrade paths fail safely with a documented recovery plan
 - [ ] All existing tests pass
-- [ ] Test coverage added for issuer round-trip, batch oversized input, record limit error
+- [ ] Test coverage added for issuer round-trip, batch oversized input, record limit error,
+      expired/missing storage entries, and authorization fail-closed behavior
 - [ ] Tests prove unauthorized issuance is rejected and public verification omits prohibited fields
 - [ ] Consent/allowlist state transitions documented for absent, granted, revoked, and changed consent
 - [ ] `contract-summary.md` reviewed and up to date
@@ -65,6 +77,8 @@ Supporting documentation provided to auditor:
 - `docs/security/threat-model.md` — full system threat model
 - `docs/security/toolchain-policy.md` — supported toolchain versions and upgrade review procedure
 - `docs/contracts/consent-allowlist.md` — consent and allowlist semantics at the contract/API boundary
+- `docs/security/storage-lifecycle.md` — storage sizing, TTL policy, retention/compaction plan
+- `docs/security/resource-baselines.md` — CPU/memory baselines and CI regression thresholds
 
 ### Audit Objectives
 
@@ -76,14 +90,19 @@ Supporting documentation provided to auditor:
 6. Verify that duplicate detection and per-patient record limits are correctly enforced.
 7. Verify that storage key design is consistent and free of collision risks.
 8. Verify that all error paths return structured `ContractError` codes (no panics).
-9. Verify that persistent storage TTL is managed correctly to prevent record eviction.
+9. Verify that persistent storage TTL is managed correctly to prevent record eviction, and that
+   expired or missing entries fail closed rather than granting authorization.
 10. Verify that on-chain events are emitted correctly and completely for all state changes.
-11. Identify any Soroban-specific vulnerabilities (host function misuse, auth model gaps).
-12. Verify that consent and allowlist semantics are enforced correctly for issuance and
+11. Verify that storage schema migrations cannot misread, drop, or lock existing on-chain records,
+    and that unsupported upgrade paths fail safely.
+12. Verify that the storage sizing model and retention/compaction approach preserve audit
+    requirements for long-lived vaccination histories and issuer records.
+13. Verify that consent and allowlist semantics are enforced correctly for issuance and
     verification across all consent states (absent, granted, revoked, changed), and that
     unauthorized issuance is rejected.
-13. Verify that public verification paths do not reveal prohibited fields, and that no
+14. Verify that public verification paths do not reveal prohibited fields, and that no
     documentation or API behavior implies that public-chain data is private.
+15. Identify any Soroban-specific vulnerabilities (host function misuse, auth model gaps).
 
 ### Out of Scope
 

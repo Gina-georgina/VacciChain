@@ -5,6 +5,7 @@ const {
   recordConsent,
   revokeConsent,
   hasConsented,
+  transaction,
 } = require('../indexer/db');
 const validate = require('../middleware/validate');
 const { recordConsentSchema } = require('./schemas/consent.schemas');
@@ -137,23 +138,44 @@ router.get('/consent/:wallet', (req, res) => {
  *   absent  -> granted
  *   revoked -> changed (re-grant)
  *   granted/changed -> no-op (idempotent)
+ *
+ * The existence check and the insert are performed inside a single explicit
+ * transaction so that concurrent requests for the same wallet cannot both
+ * observe "no consent" and race to insert. The transaction is rolled back on
+ * any partial failure.
  */
 router.post('/consent', authMiddleware, validate(recordConsentSchema), (req, res) => {
   const { publicKey } = req.user;
-  const existing = getConsent(publicKey);
-  const current = deriveConsentState(existing);
 
-  if (current.state === CONSENT_STATES.GRANTED || current.state === CONSENT_STATES.CHANGED) {
+  let existing = null;
+  let wasRevoked = false;
+  let alreadyConsented = false;
+
+  try {
+    transaction((tx) => {
+      existing = getConsent(publicKey, tx);
+      const current = deriveConsentState(existing);
+
+      if (current.state === CONSENT_STATES.GRANTED || current.state === CONSENT_STATES.CHANGED) {
+        alreadyConsented = true;
+        return;
+      }
+
+      // absent -> granted, or revoked -> changed (re-grant).
+      wasRevoked = current.state === CONSENT_STATES.REVOKED;
+      recordConsent(publicKey, { regrant: wasRevoked, tx });
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: 'Failed to record consent' });
+  }
+
+  if (alreadyConsented) {
     return res.json({
       success: true,
       ...buildConsentResponse(publicKey, existing),
       already_consented: true,
     });
   }
-
-  // absent -> granted, or revoked -> changed (re-grant).
-  const wasRevoked = current.state === CONSENT_STATES.REVOKED;
-  recordConsent(publicKey, { regrant: wasRevoked });
 
   const updated = getConsent(publicKey);
   const status = wasRevoked ? 200 : 201;
