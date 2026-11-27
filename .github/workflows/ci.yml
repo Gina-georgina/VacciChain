@@ -48,6 +48,29 @@ jobs:
           FUZZ_SEED: "0x5eed85"
         run: cargo test --features fuzz --test fuzz_smoke -- --nocapture
 
+      - name: Run storage lifecycle, migration, and resource baseline tests
+        working-directory: contracts
+        run: |
+          cargo test --test storage_lifecycle -- --nocapture
+          cargo test --test migration -- --nocapture
+          cargo test --test resource_baseline -- --nocapture
+
+      - name: Compare resource baselines against thresholds
+        working-directory: contracts
+        run: |
+          cargo test --test resource_baseline -- --nocapture | tee resource-baseline-report.txt
+          if grep -q "RESOURCE_REGRESSION" resource-baseline-report.txt; then
+            echo "Material resource regression detected; see resource-baseline-report.txt"
+            exit 1
+          fi
+
+      - name: Upload resource baseline comparison
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-resource-baseline
+          path: contracts/resource-baseline-report.txt
+
       - name: Run contract tests with coverage
         working-directory: contracts
         run: |
