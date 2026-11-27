@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../hooks/useFreighter';
+import useDocumentTitle from '../hooks/useDocumentTitle';
 import { pageContainerNarrow } from '../layout.js';
 
 const s = {

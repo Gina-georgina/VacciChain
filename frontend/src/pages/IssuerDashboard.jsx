@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../hooks/useFreighter';
 import { useVaccination } from '../hooks/useVaccination';
+import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import ConfirmMintDialog from '../components/ConfirmMintDialog';
 import CopyButton from '../components/CopyButton';
 import RoleBadge from '../components/RoleBadge';
@@ -68,8 +69,10 @@ const clearDraft = () => {
 
 export default function IssuerDashboard() {
   const { t } = useTranslation();
-  const { publicKey, role, connect } = useAuth();
+  const { publicKey, role, connect, networkMismatch, expectedNetwork, walletNetwork } = useAuth();
   const { issueVaccination, checkIssuerStatus, loading } = useVaccination();
+
+  useDocumentTitle('Issue Vaccination — VacciChain');
 
   const [form, setForm] = useState(() => {
     try {

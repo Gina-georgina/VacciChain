@@ -37,6 +37,7 @@ function safeErrorMessage(e, fallback) {
 export function useVaccination(walletAddress) {
   const { apiFetch, walletAddress: activeAccount } = useAuth();
   const toast = useToast();
+  const announce = useAnnounce();
   const [records, setRecords] = useState([]);
   const [page, setPage] = useState(1);
   const [pagination, setPagination] = useState({ total: 0, limit: PAGE_SIZE });
@@ -48,8 +49,10 @@ export function useVaccination(walletAddress) {
   // Keep latest apiFetch/toast in refs so effects don't re-run when they change
   const apiFetchRef = useRef(apiFetch);
   const toastRef = useRef(toast);
+  const announceRef = useRef(announce);
   useEffect(() => { apiFetchRef.current = apiFetch; }, [apiFetch]);
   useEffect(() => { toastRef.current = toast; }, [toast]);
+  useEffect(() => { announceRef.current = announce; }, [announce]);
 
   const fetchFromApi = useCallback(async (url, signal) => {
     setLoading(true);
@@ -125,10 +128,13 @@ export function useVaccination(walletAddress) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       const explorerUrl = `https://stellar.expert/explorer/testnet/tx/${data.transactionHash}`;
-      toastRef.current(`Vaccination NFT minted! View on Explorer: ${explorerUrl}`, 'success');
+      toastRef.current(`Vaccination NFT minted! Token ID: ${data.tokenId} — View on Explorer: ${explorerUrl}`, 'success');
+      announceRef.current(`Vaccination NFT minted. Token ID: ${data.tokenId}.`, 'success');
       return data;
     } catch (e) {
-      toastRef.current(safeErrorMessage(e, 'Failed to issue vaccination.'), 'error');
+      const msg = safeErrorMessage(e, 'Failed to issue vaccination.');
+      toastRef.current(msg, 'error');
+      announceRef.current(msg, 'error');
       return null;
     } finally {
       setLoading(false);

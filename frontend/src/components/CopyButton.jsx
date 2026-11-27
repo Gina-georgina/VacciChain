@@ -1,32 +1,41 @@
 import { useState, useCallback } from 'react';
+import { useAnnounce } from '../hooks/useAnnounce';
 
 /**
  * A small copy-to-clipboard button with a brief 'Copied!' tooltip.
  * Accessible via keyboard (focusable, responds to Enter/Space).
+ * Success and failure are also announced via a polite live region.
  */
 export default function CopyButton({ text, label }) {
   const [copied, setCopied] = useState(false);
+  const announce = useAnnounce();
 
   const handleCopy = useCallback(async (e) => {
     e.stopPropagation();
     try {
       await navigator.clipboard.writeText(text);
       setCopied(true);
+      announce(label ? `${label} copied to clipboard` : 'Copied to clipboard');
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      // fallback for older browsers
-      const el = document.createElement('textarea');
-      el.value = text;
-      el.style.position = 'fixed';
-      el.style.opacity = '0';
-      document.body.appendChild(el);
-      el.select();
-      document.execCommand('copy');
-      document.body.removeChild(el);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      try {
+        // fallback for older browsers
+        const el = document.createElement('textarea');
+        el.value = text;
+        el.style.position = 'fixed';
+        el.style.opacity = '0';
+        document.body.appendChild(el);
+        el.select();
+        document.execCommand('copy');
+        document.body.removeChild(el);
+        setCopied(true);
+        announce(label ? `${label} copied to clipboard` : 'Copied to clipboard');
+        setTimeout(() => setCopied(false), 1500);
+      } catch {
+        announce('Copy failed. Please copy manually.', { assertive: true });
+      }
     }
-  }, [text]);
+  }, [text, label, announce]);
 
   const handleKeyDown = useCallback((e) => {
     if (e.key === 'Enter' || e.key === ' ') {

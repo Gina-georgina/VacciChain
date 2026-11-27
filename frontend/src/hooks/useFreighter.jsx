@@ -3,6 +3,7 @@ import {
   isConnected,
   getPublicKey,
   signTransaction,
+  getNetwork,
 } from '@stellar/freighter-api';
 import { useToast } from './useToast';
 import { apiUrl } from '../config';
@@ -26,8 +27,20 @@ function clearPrivateCaches() {
   });
 }
 
+// Network the app is configured to talk to. Must match the wallet's network
+// before any transaction is signed.
+const CONFIGURED_NETWORK = (
+  (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_STELLAR_NETWORK) ||
+  'TESTNET'
+).toUpperCase();
+
+const NETWORK_MISMATCH_MESSAGE =
+  `Your wallet is connected to a different Stellar network than this app (expected ${CONFIGURED_NETWORK}). ` +
+  'Open Freighter, switch to the correct network, then retry. No transaction was signed.';
+
 export function AuthProvider({ children }) {
   const toast = useToast();
+  const announce = useAnnounce();
   const [publicKey, setPublicKey] = useState(null);
   const [role, setRole] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -67,6 +80,31 @@ export function AuthProvider({ children }) {
     setWalletChangeCounter((c) => c + 1);
   }, [abortInFlight]);
 
+  const isNetworkMismatch = !!walletNetwork && walletNetwork.toUpperCase() !== CONFIGURED_NETWORK;
+
+  // Read the wallet's current network; returns the normalized value (or null).
+  const refreshNetwork = useCallback(async () => {
+    try {
+      const net = await getNetwork();
+      const value = typeof net === 'string' ? net : net && net.network;
+      const normalized = value ? String(value).toUpperCase() : null;
+      setWalletNetwork(normalized);
+      return normalized;
+    } catch {
+      setWalletNetwork(null);
+      return null;
+    }
+  }, []);
+
+  // Throws when the wallet network does not match the configured network.
+  const assertNetworkMatch = useCallback(async () => {
+    const current = await refreshNetwork();
+    if (current && current !== CONFIGURED_NETWORK) {
+      throw new Error(NETWORK_MISMATCH_MESSAGE);
+    }
+    return current;
+  }, [refreshNetwork]);
+
   const runSep10 = useCallback(async (pk) => {
     const challengeRes = await fetch(apiUrl('/v1/auth/sep10'), {
       method: 'POST',
@@ -83,7 +121,7 @@ export function AuthProvider({ children }) {
     const data = await verifyRes.json();
     if (!verifyRes.ok) throw new Error(data.error);
     return data;
-  }, []);
+  }, [assertNetworkMatch]);
 
   const connect = useCallback(async () => {
     setLoading(true);
@@ -95,6 +133,7 @@ export function AuthProvider({ children }) {
         throw new Error('Freighter wallet not found. Please install it.');
       }
       const pk = await getPublicKey();
+      await refreshNetwork();
       const data = await runSep10(pk);
       setPublicKey(pk);
       activeKeyRef.current = pk;
@@ -104,16 +143,18 @@ export function AuthProvider({ children }) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ publicKey: pk, role: data.role }));
       setWalletChangeCounter((c) => c + 1);
       toast('Wallet connected.', 'success');
+      announce('Wallet connected.');
       return data;
     } catch (e) {
       const msg = e.message || 'Failed to connect wallet.';
       setError(msg);
       toast(msg, 'error');
+      announce(`Wallet connection failed. ${msg}`, { assertive: true });
       throw e;
     } finally {
       setLoading(false);
     }
-  }, [runSep10, toast]);
+  }, [runSep10, toast, announce, refreshNetwork]);
 
   const disconnect = useCallback(() => {
     clearWalletState();

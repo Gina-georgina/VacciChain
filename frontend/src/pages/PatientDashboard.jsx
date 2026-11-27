@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { useAuth } from '../hooks/useFreighter';
 import { useVaccination } from '../hooks/useVaccination';
 import { useConsent } from '../hooks/useConsent';
+import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import NFTCard from '../components/NFTCard';
 import RoleBadge from '../components/RoleBadge';
 import NFTCardSkeleton from '../components/NFTCardSkeleton';
@@ -110,6 +111,7 @@ export default function PatientDashboard() {
           record={r}
           patientWallet={publicKey}
           onShowQR={setQrRecord}
+          disabled={isNetworkMismatch}
         />
       ))}
 

@@ -72,6 +72,7 @@ export default function VerifyPage() {
       const message = sanitizeMessage(e.message);
       setError(message);
       toast(message, 'error');
+      announce(`Verification failed: ${message}`, 'error');
     } finally {
       if (requestId === requestIdRef.current) setLoading(false);
     }

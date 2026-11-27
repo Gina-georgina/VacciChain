@@ -5,6 +5,7 @@ import { AuthProvider, useAuth } from './useFreighter';
 jest.mock('@stellar/freighter-api', () => ({
   isConnected: jest.fn(),
   getPublicKey: jest.fn(),
+  getNetwork: jest.fn(),
   signTransaction: jest.fn(),
   onAccountChange: jest.fn(),
   onDisconnect: jest.fn(),
@@ -41,6 +42,7 @@ beforeEach(() => {
 
   isConnected.mockResolvedValue(true);
   getPublicKey.mockResolvedValue(WALLET);
+  getNetwork.mockResolvedValue(CONFIGURED_NETWORK);
   signTransaction.mockResolvedValue('signed-xdr');
 
   accountChangeListener = undefined;

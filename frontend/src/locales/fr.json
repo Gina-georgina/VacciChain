@@ -1,6 +1,29 @@
 {
   "accessibility": {
-    "skipToContent": "Aller au contenu principal"
+    "skipToContent": "Aller au contenu principal",
+    "announce": {
+      "walletConnected": "Portefeuille connecté : {{address}}",
+      "walletDisconnected": "Portefeuille déconnecté",
+      "walletError": "Échec de la connexion du portefeuille : {{message}}",
+      "mintSuccess": "NFT de vaccination émis. ID du jeton : {{tokenId}}",
+      "mintError": "Échec de l'émission : {{message}}",
+      "verifySuccess": "Vérification terminée : {{count}} dossier trouvé",
+      "verifySuccess_other": "Vérification terminée : {{count}} dossiers trouvés",
+      "verifyError": "Échec de la vérification : {{message}}",
+      "copySuccess": "Copié dans le presse-papiers",
+      "copyError": "Échec de la copie dans le presse-papiers"
+    }
+  },
+  "network": {
+    "configured": "Réseau configuré : {{network}}",
+    "walletNetwork": "Réseau du portefeuille : {{network}}",
+    "mismatchTitle": "Réseau du portefeuille incorrect",
+    "mismatch": "Votre portefeuille est sur {{walletNetwork}}, mais cette application nécessite {{expectedNetwork}}. La soumission de transactions est bloquée.",
+    "recovery": "Ouvrez Freighter, passez au réseau {{expectedNetwork}}, puis reconnectez votre portefeuille.",
+    "blocked": "Impossible de signer : le réseau du portefeuille ne correspond pas au réseau configuré."
+  },
+  "links": {
+    "opensInNewTab": "(s'ouvre dans un nouvel onglet)"
   },
   "asyncState": {
     "loading": "Chargement…",
@@ -116,7 +139,7 @@
     "tokenId": "ID du jeton",
     "issuerAddress": "Adresse de l'émetteur",
     "txHash": "Hash de transaction",
-    "viewExplorer": "Voir sur Stellar Explorer ↗",
+    "viewExplorer": "Voir sur Stellar Explorer (s'ouvre dans un nouvel onglet)",
     "noTxHash": "Hash de transaction non disponible pour ce dossier."
   },
   "format": {
