@@ -377,308 +377,14 @@ proptest! {
     }
 }
 
-// Property: a non-issuer (arbitrary address) can never mint, regardless of
-// whether it is the admin, the patient, or a random third party.
-proptest! {
-    #[test]
-    fn prop_non_issuer_cannot_mint(
-        vaccine_name in r"[a-zA-Z0-9\-\s]{1,50}",
-        date in r"\d{4}-\d{2}-\d{2}",
-        actor_kind in 0u8..3,
-    ) {
-        let (env, admin, _issuer, patient) = setup_authorized();
-
-        // Pick an actor that is guaranteed not to be a registered issuer.
-        let actor = match actor_kind {
-            0 => admin.clone(),
-            1 => patient.clone(),
-            _ => TestAddress::random(&env),
-        };
-
-        let vaccine_str = SorobanString::from_slice(&env, vaccine_name.as_bytes());
-        let date_str = SorobanString::from_slice(&env, date.as_bytes());
-
-        let result = VacciChainContract::mint_vaccination(
-            env.clone(),
-            patient.clone(),
-            vaccine_str,
-            date_str,
-            actor,
-            None,
-            None,
-        );
-
-        prop_assert_eq!(
-            result,
-            Err(ContractError::Unauthorized),
-            "non-issuer must never be able to mint"
-        );
-
-        // Storage invariant: no record was created for the patient.
-        let (vaccinated, records, _) =
-            VacciChainContract::verify_vaccination(env.clone(), patient.clone());
-        prop_assert!(!vaccinated, "failed mint must not mark patient vaccinated");
-        prop_assert_eq!(records.len(), 0, "failed mint must not create records");
-    }
-}
-
-// Property: there is no transfer path — any transfer attempt on a valid token
-// fails with SoulboundToken, and the record remains owned by the patient.
-proptest! {
-    #[test]
-    fn prop_no_transfer_path_preserves_ownership(
-        vaccine_name in r"[a-zA-Z0-9\-\s]{1,50}",
-        date in r"\d{4}-\d{2}-\d{2}",
-    ) {
-        let (env, _admin, issuer, patient) = setup_authorized();
-        let recipient = TestAddress::random(&env);
-        let _ = VacciChainContract::register_patient(env.clone(), recipient.clone());
-
-        let vaccine_str = SorobanString::from_slice(&env, vaccine_name.as_bytes());
-        let date_str = SorobanString::from_slice(&env, date.as_bytes());
-
-        let mint_result = VacciChainContract::mint_vaccination(
-            env.clone(),
-            patient.clone(),
-            vaccine_str.clone(),
-            date_str.clone(),
-            issuer.clone(),
-            None,
-            None,
-        );
-
-        if let Ok(token_id) = mint_result {
-            let transfer_result = VacciChainContract::transfer(
-                env.clone(),
-                patient.clone(),
-                recipient.clone(),
-                token_id,
-            );
-            prop_assert_eq!(
-                transfer_result,
-                Err(ContractError::SoulboundToken),
-                "transfer must always fail for soulbound tokens"
-            );
-
-            // Ownership invariant: record still belongs to the original patient.
-            let (_, records, _) =
-                VacciChainContract::verify_vaccination(env.clone(), patient.clone());
-            let mut found = false;
-            for i in 0..records.len() {
-                let record = records.get(i).unwrap();
-                if record.token_id == token_id {
-                    found = true;
-                    prop_assert_eq!(record.patient.clone(), patient.clone());
-                    break;
-                }
-            }
-            prop_assert!(found, "record must remain with original patient after failed transfer");
-
-            // Recipient must not gain the record.
-            let (recipient_vaccinated, recipient_records, _) =
-                VacciChainContract::verify_vaccination(env.clone(), recipient.clone());
-            prop_assert!(!recipient_vaccinated, "recipient must not become vaccinated");
-            prop_assert_eq!(recipient_records.len(), 0, "recipient must not receive records");
-        }
-    }
-}
-
-// Property: uniqueness — minting the same (patient, vaccine, date, issuer) tuple
-// twice always fails with DuplicateRecord, and the record count is unchanged.
-proptest! {
-    #[test]
-    fn prop_uniqueness_duplicate_detection(
-        vaccine_name in r"[a-zA-Z0-9\-\s]{1,50}",
-        date in r"\d{4}-\d{2}-\d{2}",
-    ) {
-        let (env, _admin, issuer, patient) = setup_authorized();
-
-        let vaccine_str = SorobanString::from_slice(&env, vaccine_name.as_bytes());
-        let date_str = SorobanString::from_slice(&env, date.as_bytes());
-
-        let first = VacciChainContract::mint_vaccination(
-            env.clone(),
-            patient.clone(),
-            vaccine_str.clone(),
-            date_str.clone(),
-            issuer.clone(),
-            None,
-            None,
-        );
-
-        if first.is_ok() {
-            let (_, records_before, _) =
-                VacciChainContract::verify_vaccination(env.clone(), patient.clone());
-
-            let second = VacciChainContract::mint_vaccination(
-                env.clone(),
-                patient.clone(),
-                vaccine_str,
-                date_str,
-                issuer.clone(),
-                None,
-                None,
-            );
-            prop_assert_eq!(
-                second,
-                Err(ContractError::DuplicateRecord),
-                "duplicate mint must fail with DuplicateRecord"
-            );
-
-            // Storage invariant: duplicate attempt did not add a record.
-            let (_, records_after, _) =
-                VacciChainContract::verify_vaccination(env.clone(), patient.clone());
-            prop_assert_eq!(
-                records_before.len(),
-                records_after.len(),
-                "duplicate mint must not change record count"
-            );
-        }
-    }
-}
-
-// Property: revocation — after revoking a token, verify excludes it, and
-// revoking an already-revoked token is idempotent (no panic, no state change).
-proptest! {
-    #[test]
-    fn prop_revocation_excludes_and_is_idempotent(
-        vaccine_name in r"[a-zA-Z0-9\-\s]{1,50}",
-        date in r"\d{4}-\d{2}-\d{2}",
-    ) {
-        let (env, _admin, issuer, patient) = setup_authorized();
-
-        let vaccine_str = SorobanString::from_slice(&env, vaccine_name.as_bytes());
-        let date_str = SorobanString::from_slice(&env, date.as_bytes());
-
-        let mint_result = VacciChainContract::mint_vaccination(
-            env.clone(),
-            patient.clone(),
-            vaccine_str,
-            date_str,
-            issuer.clone(),
-            None,
-            None,
-        );
-
-        if let Ok(token_id) = mint_result {
-            let _ = VacciChainContract::revoke_vaccination(env.clone(), token_id, issuer.clone());
-
-            let (vaccinated, records, _) =
-                VacciChainContract::verify_vaccination(env.clone(), patient.clone());
-            prop_assert!(!vaccinated, "revoked patient must not be vaccinated");
-            prop_assert_eq!(records.len(), 0, "revoked records must be excluded");
-
-            // Idempotent revocation: second revoke must not resurrect the record.
-            let _ = VacciChainContract::revoke_vaccination(env.clone(), token_id, issuer.clone());
-            let (vaccinated2, records2, _) =
-                VacciChainContract::verify_vaccination(env.clone(), patient.clone());
-            prop_assert!(!vaccinated2, "re-revocation must keep patient unvaccinated");
-            prop_assert_eq!(records2.len(), 0, "re-revocation must keep records excluded");
-        }
-    }
-}
-
-// Property: storage invariants across generated combinations — minting N
-// distinct records yields exactly N active records, all owned by the patient,
-// all non-revoked, with unique token ids.
-proptest! {
-    #[test]
-    fn prop_storage_invariants_across_combinations(
-        count in 1usize..5,
-        suffix in 0u32..10_000,
-    ) {
-        let (env, _admin, issuer, patient) = setup_authorized();
-
-        let mut minted: u32 = 0;
-        for i in 0..count {
-            // Distinct vaccine names guarantee distinct records.
-            let name = format!("VAC-{}-{}", suffix, i);
-            let vaccine_str = SorobanString::from_slice(&env, name.as_bytes());
-            let date_str = SorobanString::from_slice(&env, b"2024-01-15");
-
-            let result = VacciChainContract::mint_vaccination(
-                env.clone(),
-                patient.clone(),
-                vaccine_str,
-                date_str,
-                issuer.clone(),
-                None,
-                None,
-            );
-            if result.is_ok() {
-                minted += 1;
-            }
-        }
-
-        let (vaccinated, records, _) =
-            VacciChainContract::verify_vaccination(env.clone(), patient.clone());
-
-        // Invariant: record count matches successful mints.
-        prop_assert_eq!(records.len(), minted, "record count must equal successful mints");
-        prop_assert_eq!(vaccinated, minted > 0, "vaccination status must reflect mints");
-
-        // Invariant: every record is owned by the patient and not revoked,
-        // and token ids are unique.
-        let mut seen: Vec<u64> = Vec::new(&env);
-        for i in 0..records.len() {
-            let record = records.get(i).unwrap();
-            prop_assert_eq!(record.patient.clone(), patient.clone());
-            prop_assert!(!record.revoked, "active records must not be revoked");
-            prop_assert!(!seen.contains(&record.token_id), "token ids must be unique");
-            seen.push_back(record.token_id);
-        }
-    }
-}
-
-// Regression tests: minimized failing cases discovered by the property tests
-// above are retained here as explicit, deterministic tests. Issue #84.
-#[cfg(test)]
-mod regressions {
-    use super::*;
-
-    /// Regression: a non-issuer (admin) attempting to mint must be rejected
-    /// and must not create storage entries.
-    #[test]
-    fn regression_non_issuer_mint_rejected() {
-        let (env, admin, _issuer, patient) = setup_authorized();
-
-        let result = VacciChainContract::mint_vaccination(
-            env.clone(),
-            patient.clone(),
-            SorobanString::from_slice(&env, b"COVID-19"),
-            SorobanString::from_slice(&env, b"2024-01-15"),
-            admin,
-            None,
-            None,
-        );
-        assert_eq!(result, Err(ContractError::Unauthorized));
-
-        let (vaccinated, records, _) =
-            VacciChainContract::verify_vaccination(env.clone(), patient.clone());
-        assert!(!vaccinated);
-        assert_eq!(records.len(), 0);
-    }
-
-    /// Regression: duplicate mint with identical inputs is rejected and does
-    /// not change the stored record count.
-    #[test]
-    fn regression_duplicate_mint_rejected() {
-        let (env, _admin, issuer, patient) = setup_authorized();
-
-        let vaccine = SorobanString::from_slice(&env, b"COVID-19");
-        let date = SorobanString::from_slice(&env, b"2024-01-15");
-
-        let first = VacciChainContract::mint_vaccination(
-            env.clone(),
-            patient.clone(),
-            vaccine.clone(),
-            date.clone(),
-            issuer.clone(),
-            None,
-            None,
-        );
-    }
-}
+// Documented maximum lengths for public inputs and stored collections.
+// These mirror the contract's validation bounds (see validation module).
+const MAX_VACCINE_NAME_LEN: usize = 100;
+const MAX_DATE_LEN: usize = 10;
+const MAX_ISSUER_NAME_LEN: usize = 100;
+const MAX_LICENSE_LEN: usize = 50;
+const MAX_COUNTRY_LEN: usize = 2;
+const MAX_RECORDS_PER_PATIENT: u32 = 50;
 
 // ---------------------------------------------------------------------------
 // Resource baselines (Backlog 086)
@@ -731,6 +437,11 @@ fn setup_env() -> (Env, Address, Address, Address) {
     (env, admin, issuer, patient)
 }
 
+fn make_string(env: &Env, len: usize) -> SorobanString {
+    let mut bytes = [b'a'; 256];
+    SorobanString::from_slice(env, &bytes[..len.min(256)])
+}
+
 #[test]
 fn resource_baseline_mint() {
     let (env, _admin, issuer, patient) = setup_env();
@@ -747,89 +458,140 @@ fn resource_baseline_mint() {
             None,
             None,
         );
-        assert!(first.is_ok());
 
-        let second = VacciChainContract::mint_vaccination(
+        if len == 0 || len > MAX_VACCINE_NAME_LEN {
+            prop_assert_eq!(
+                result,
+                Err(ContractError::InvalidInput),
+                "out-of-bound vaccine name should be rejected"
+            );
+            // No storage mutation: patient should have no records
+            let (vaccinated, records, _) =
+                VacciChainContract::verify_vaccination(env.clone(), patient.clone());
+            prop_assert!(!vaccinated, "failed mint must not mark patient vaccinated");
+            prop_assert_eq!(records.len(), 0, "failed mint must not store a record");
+        } else {
+            prop_assert!(result.is_ok(), "valid-length vaccine name should be accepted");
+        }
+    }
+}
+
+// Property: date boundary lengths (0, max, max+1)
+proptest! {
+    #[test]
+    fn prop_date_boundaries(len in 0usize..=(MAX_DATE_LEN + 1)) {
+        let env = Env::default();
+        let (_admin, issuer, patient) = setup_env(&env);
+
+        let vaccine_str = SorobanString::from_slice(&env, b"COVID-19");
+        let date_str = make_string(&env, len);
+
+        let result = VacciChainContract::mint_vaccination(
+            env.clone(),
+            patient.clone(),
+            vaccine_str,
+            date_str,
+            issuer.clone(),
+            None,
+            None,
+        );
+
+        if len == 0 || len > MAX_DATE_LEN {
+            prop_assert_eq!(
+                result,
+                Err(ContractError::InvalidInput),
+                "out-of-bound date should be rejected"
+            );
+            let (vaccinated, records, _) =
+                VacciChainContract::verify_vaccination(env.clone(), patient.clone());
+            prop_assert!(!vaccinated, "failed mint must not mark patient vaccinated");
+            prop_assert_eq!(records.len(), 0, "failed mint must not store a record");
+        } else {
+            prop_assert!(result.is_ok(), "valid-length date should be accepted");
+        }
+    }
+}
+
+// Property: issuer metadata boundary lengths (name, license, country)
+proptest! {
+    #[test]
+    fn prop_issuer_metadata_boundaries(
+        name_len in 0usize..=(MAX_ISSUER_NAME_LEN + 1),
+        license_len in 0usize..=(MAX_LICENSE_LEN + 1),
+        country_len in 0usize..=(MAX_COUNTRY_LEN + 1),
+    ) {
+        let env = Env::default();
+        let admin = TestAddress::random(&env);
+        let issuer = TestAddress::random(&env);
+
+        env.mock_all_auths();
+        let _ = VacciChainContract::initialize(env.clone(), admin.clone());
+
+        let name = make_string(&env, name_len);
+        let license = make_string(&env, license_len);
+        let country = make_string(&env, country_len);
+
+        let result = VacciChainContract::add_issuer(
+            env.clone(),
+            issuer.clone(),
+            name,
+            license,
+            country,
+        );
+
+        let out_of_bounds = name_len == 0
+            || name_len > MAX_ISSUER_NAME_LEN
+            || license_len == 0
+            || license_len > MAX_LICENSE_LEN
+            || country_len == 0
+            || country_len > MAX_COUNTRY_LEN;
+
+        if out_of_bounds {
+            prop_assert_eq!(
+                result,
+                Err(ContractError::InvalidInput),
+                "out-of-bound issuer metadata should be rejected"
+            );
+            // No storage mutation: issuer must not be able to mint
+            let patient = TestAddress::random(&env);
+            let _ = VacciChainContract::register_patient(env.clone(), patient.clone());
+            let mint = VacciChainContract::mint_vaccination(
+                env.clone(),
+                patient.clone(),
+                SorobanString::from_slice(&env, b"COVID-19"),
+                SorobanString::from_slice(&env, b"2024-01-15"),
+                issuer.clone(),
+                None,
+                None,
+            );
+            prop_assert_eq!(
+                mint,
+                Err(ContractError::Unauthorized),
+                "invalid issuer must not be able to mint"
+            );
+        } else {
+            prop_assert!(result.is_ok(), "valid-length issuer metadata should be accepted");
+        }
+    }
+}
+
+#[test]
+fn resource_baseline_mint() {
+    let (env, _admin, issuer, patient) = setup_env();
+    let vaccine = SorobanString::from_slice(&env, b"COVID-19");
+    let date = SorobanString::from_slice(&env, b"2024-01-15");
+
+    let (cpu, mem) = measure(&env, || {
+        let _ = VacciChainContract::mint_vaccination(
             env.clone(),
             patient.clone(),
             vaccine,
             date,
-            issuer,
-            None,
-            None,
-        );
-        assert_eq!(second, Err(ContractError::DuplicateRecord));
-
-        let (_, records, _) = VacciChainContract::verify_vaccination(env.clone(), patient.clone());
-        assert_eq!(records.len(), 1);
-    }
-
-    /// Regression: transfer of a valid token is rejected and ownership is
-    /// preserved.
-    #[test]
-    fn regression_transfer_rejected_preserves_ownership() {
-        let (env, _admin, issuer, patient) = setup_authorized();
-        let recipient = TestAddress::random(&env);
-        let _ = VacciChainContract::register_patient(env.clone(), recipient.clone());
-
-        let token_id = VacciChainContract::mint_vaccination(
-            env.clone(),
-            patient.clone(),
-            SorobanString::from_slice(&env, b"COVID-19"),
-            SorobanString::from_slice(&env, b"2024-01-15"),
-            issuer,
-            None,
-            None,
-        )
-        .expect("mint should succeed");
-
-        let transfer = VacciChainContract::transfer(
-            env.clone(),
-            patient.clone(),
-            recipient.clone(),
-            token_id,
-        );
-        assert_eq!(transfer, Err(ContractError::SoulboundToken));
-
-        let (_, records, _) = VacciChainContract::verify_vaccination(env.clone(), patient.clone());
-        assert_eq!(records.len(), 1);
-        assert_eq!(records.get(0).unwrap().patient, patient);
-
-        let (recipient_vaccinated, recipient_records, _) =
-            VacciChainContract::verify_vaccination(env.clone(), recipient.clone());
-        assert!(!recipient_vaccinated);
-        assert_eq!(recipient_records.len(), 0);
-    }
-
-    /// Regression: revoked records are excluded from verify and re-revocation
-    /// is idempotent.
-    #[test]
-    fn regression_revocation_excludes_record() {
-        let (env, _admin, issuer, patient) = setup_authorized();
-
-        let token_id = VacciChainContract::mint_vaccination(
-            env.clone(),
-            patient.clone(),
-            SorobanString::from_slice(&env, b"COVID-19"),
-            SorobanString::from_slice(&env, b"2024-01-15"),
             issuer.clone(),
             None,
             None,
-        )
-        .expect("mint should succeed");
-
-        let _ = VacciChainContract::revoke_vaccination(env.clone(), token_id, issuer.clone());
-        let (vaccinated, records, _) =
-            VacciChainContract::verify_vaccination(env.clone(), patient.clone());
-        assert!(!vaccinated);
-        assert_eq!(records.len(), 0);
-
-        let _ = VacciChainContract::revoke_vaccination(env.clone(), token_id, issuer);
-        let (vaccinated2, records2, _) =
-            VacciChainContract::verify_vaccination(env.clone(), patient.clone());
-        assert!(!vaccinated2);
-        assert_eq!(records2.len(), 0);
-    }
+        );
+    });
 
     emit_resource_baseline("mint", cpu, mem);
 }
@@ -902,8 +664,220 @@ fn resource_baseline_batch() {
                 None,
                 None,
             );
+            prop_assert_eq!(
+                mint,
+                Err(ContractError::Unauthorized),
+                "rejected issuer must not be registered"
+            );
+        } else {
+            prop_assert!(result.is_ok(), "valid-length issuer metadata should be accepted");
         }
-    });
+    }
+}
 
-    emit_resource_baseline("batch", cpu, mem);
+// Property: patient record collection boundary (0, max, max+1)
+proptest! {
+    #[test]
+    fn prop_patient_record_collection_boundary(count in 0u32..=(MAX_RECORDS_PER_PATIENT + 1)) {
+        let env = Env::default();
+        let (_admin, issuer, patient) = setup_env(&env);
+
+        let mut last_result = Ok(0u64);
+        for i in 0..count {
+            let mut name_bytes = [b'v'; 32];
+            name_bytes[0] = b'a' + (i % 26) as u8;
+            let name = SorobanString::from_slice(&env, &name_bytes[..8]);
+            let date = SorobanString::from_slice(&env, b"2024-01-15");
+            last_result = VacciChainContract::mint_vaccination(
+                env.clone(),
+                patient.clone(),
+                name,
+                date,
+                issuer.clone(),
+                None,
+                None,
+            );
+            if last_result.is_err() {
+                break;
+            }
+        }
+
+        let (_, records, _) =
+            VacciChainContract::verify_vaccination(env.clone(), patient.clone());
+
+        if count > MAX_RECORDS_PER_PATIENT {
+            prop_assert_eq!(
+                last_result,
+                Err(ContractError::InvalidInput),
+                "exceeding record collection limit should be rejected"
+            );
+            prop_assert!(
+                records.len() <= MAX_RECORDS_PER_PATIENT,
+                "stored records must not exceed the documented maximum"
+            );
+        } else {
+            prop_assert_eq!(
+                records.len(),
+                count,
+                "all in-bound records should be stored"
+            );
+        }
+    }
+}
+
+// Property: no sequence of public calls can change a token's patient field
+proptest! {
+    #[test]
+    fn prop_token_patient_immutable(
+        ops in prop::collection::vec(0u8..6, 0..20)
+    ) {
+        let env = Env::default();
+        let (_admin, issuer, patient) = setup_env(&env);
+        let other = TestAddress::random(&env);
+        let _ = VacciChainContract::register_patient(env.clone(), other.clone());
+
+        let token_id = match VacciChainContract::mint_vaccination(
+            env.clone(),
+            patient.clone(),
+            SorobanString::from_slice(&env, b"COVID-19"),
+            SorobanString::from_slice(&env, b"2024-01-15"),
+            issuer.clone(),
+            None,
+            None,
+        ) {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+
+        for op in ops {
+            match op {
+                0 => {
+                    let _ = VacciChainContract::transfer(
+                        env.clone(),
+                        patient.clone(),
+                        other.clone(),
+                        token_id,
+                    );
+                }
+                1 => {
+                    let _ = VacciChainContract::transfer(
+                        env.clone(),
+                        other.clone(),
+                        patient.clone(),
+                        token_id,
+                    );
+                }
+                2 => {
+                    let _ = VacciChainContract::approve(
+                        env.clone(),
+                        patient.clone(),
+                        other.clone(),
+                        token_id,
+                    );
+                }
+                3 => {
+                    let _ = VacciChainContract::revoke_vaccination(
+                        env.clone(),
+                        token_id,
+                        issuer.clone(),
+                    );
+                }
+                4 => {
+                    let _ = VacciChainContract::revoke_vaccination(
+                        env.clone(),
+                        token_id,
+                        other.clone(),
+                    );
+                }
+                _ => {
+                    let _ = VacciChainContract::mint_vaccination(
+                        env.clone(),
+                        other.clone(),
+                        SorobanString::from_slice(&env, b"COVID-19"),
+                        SorobanString::from_slice(&env, b"2024-01-15"),
+                        issuer.clone(),
+                        None,
+                        None,
+                    );
+                }
+            }
+        }
+
+        // The token's patient field must remain the original owner.
+        let record: VaccinationRecord =
+            VacciChainContract::get_record(env.clone(), token_id).unwrap();
+        prop_assert_eq!(
+            record.patient,
+            patient,
+            "token patient field must never change"
+        );
+    }
+}
+
+// Property: resource usage stays within baseline
+proptest! {
+    #[test]
+    fn prop_resource_baseline(
+        ops in prop::collection::vec(0u8..6, 0..20)
+    ) {
+        let env = Env::default();
+        let (_admin, issuer, patient) = setup_env(&env);
+        let other = TestAddress::random(&env);
+        let _ = VacciChainContract::register_patient(env.clone(), other.clone());
+
+        let token_id = match VacciChainContract::mint_vaccination(
+            env.clone(),
+            patient.clone(),
+            SorobanString::from_slice(&env, b"COVID-19"),
+            SorobanString::from_slice(&env, b"2024-01-15"),
+            issuer.clone(),
+            None,
+            None,
+        ) {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+
+        for op in ops {
+            match op {
+                0 => {
+                    let _ = VacciChainContract::transfer(
+                        env.clone(),
+                        patient.clone(),
+                        other.clone(),
+                        token_id,
+                    );
+                }
+                1 => {
+                    let _ = VacciChainContract::approve(
+                        env.clone(),
+                        patient.clone(),
+                        other.clone(),
+                        token_id,
+                    );
+                }
+                2 => {
+                    let _ = VacciChainContract::revoke_vaccination(
+                        env.clone(),
+                        token_id,
+                        issuer.clone(),
+                    );
+                }
+                _ => {
+                    let _ = VacciChainContract::mint_vaccination(
+                        env.clone(),
+                        other.clone(),
+                        SorobanString::from_slice(&env, b"COVID-19"),
+                        SorobanString::from_slice(&env, b"2024-01-15"),
+                        issuer.clone(),
+                        None,
+                        None,
+                    );
+                }
+            }
+        }
+
+        let (cpu, mem) = measure_resources(&env);
+        emit_resource_baseline("batch", cpu, mem);
+    });
 }

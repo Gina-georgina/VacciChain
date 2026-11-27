@@ -36,4 +36,63 @@ describe('validateEnv', () => {
     expect(exitSpy).not.toHaveBeenCalled();
     exitSpy.mockRestore();
   });
+
+  describe('trusted proxy configuration', () => {
+    it('accepts a boolean TRUST_PROXY value', () => {
+      expect(() => validateEnv({ ...valid, TRUST_PROXY: 'true' })).not.toThrow();
+      expect(() => validateEnv({ ...valid, TRUST_PROXY: 'false' })).not.toThrow();
+    });
+
+    it('accepts a hop count TRUST_PROXY value', () => {
+      expect(() => validateEnv({ ...valid, TRUST_PROXY: '1' })).not.toThrow();
+    });
+
+    it('accepts a comma-separated list of trusted proxy addresses', () => {
+      expect(() =>
+        validateEnv({ ...valid, TRUST_PROXY: '10.0.0.1, 192.168.1.0/24' })
+      ).not.toThrow();
+    });
+
+    it('throws when TRUST_PROXY is set to an invalid value', () => {
+      expect(() => validateEnv({ ...valid, TRUST_PROXY: 'yes-please' })).toThrow('TRUST_PROXY');
+    });
+  });
+
+  describe('rate limit configuration', () => {
+    it('accepts positive integer limits for onboarding and batch verification', () => {
+      expect(() =>
+        validateEnv({
+          ...valid,
+          RATE_LIMIT_ONBOARDING: '10',
+          RATE_LIMIT_BATCH_VERIFY: '5',
+        })
+      ).not.toThrow();
+    });
+
+    it('throws when RATE_LIMIT_ONBOARDING is not a positive integer', () => {
+      expect(() => validateEnv({ ...valid, RATE_LIMIT_ONBOARDING: '0' })).toThrow(
+        'RATE_LIMIT_ONBOARDING'
+      );
+      expect(() => validateEnv({ ...valid, RATE_LIMIT_ONBOARDING: 'abc' })).toThrow(
+        'RATE_LIMIT_ONBOARDING'
+      );
+    });
+
+    it('throws when RATE_LIMIT_BATCH_VERIFY is not a positive integer', () => {
+      expect(() => validateEnv({ ...valid, RATE_LIMIT_BATCH_VERIFY: '-1' })).toThrow(
+        'RATE_LIMIT_BATCH_VERIFY'
+      );
+    });
+
+    it('accepts supported RATE_LIMIT_STORE values', () => {
+      expect(() => validateEnv({ ...valid, RATE_LIMIT_STORE: 'memory' })).not.toThrow();
+      expect(() => validateEnv({ ...valid, RATE_LIMIT_STORE: 'redis' })).not.toThrow();
+    });
+
+    it('throws when RATE_LIMIT_STORE is set to an unsupported value', () => {
+      expect(() => validateEnv({ ...valid, RATE_LIMIT_STORE: 'sqlite' })).toThrow(
+        'RATE_LIMIT_STORE'
+      );
+    });
+  });
 });

@@ -78,9 +78,17 @@ describe('GET /verify/public/:wallet', () => {
   });
 
   describe('Rate limiting', () => {
+    const validWallet = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF';
+    const rateLimit = require('../src/middleware/rateLimit');
+
+    beforeEach(() => {
+      // Reset limiter state so each test starts from a clean budget.
+      if (typeof rateLimit.reset === 'function') {
+        rateLimit.reset();
+      }
+    });
+
     it('should be rate limited to 60 requests per minute per IP', async () => {
-      const validWallet = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF';
-      
       // Make multiple requests to test rate limiting
       // Note: This test may not work in all environments due to rate limiter configuration
       const res = await request(app)
@@ -92,6 +100,88 @@ describe('GET /verify/public/:wallet', () => {
             expect(res.body.error).toContain('Too many requests');
           }
         });
+    });
+
+    it('should document RateLimit and Retry-After headers on responses', async () => {
+      const res = await request(app).get(`/v1/verify/public/${validWallet}`);
+
+      // Standard RateLimit headers (draft-ietf-httpapi-ratelimit-headers).
+      expect(res.headers).toHaveProperty('ratelimit-limit');
+      expect(res.headers).toHaveProperty('ratelimit-remaining');
+      expect(res.headers).toHaveProperty('ratelimit-reset');
+      expect(Number(res.headers['ratelimit-limit'])).toBeGreaterThan(0);
+      expect(Number(res.headers['ratelimit-remaining'])).toBeGreaterThanOrEqual(0);
+    });
+
+    it('should return 429 with retry metadata on burst requests', async () => {
+      const limit = Number(
+        (await request(app).get(`/v1/verify/public/${validWallet}`)).headers[
+          'ratelimit-limit'
+        ]
+      );
+
+      let limited;
+      // Burst well past the configured window budget.
+      for (let i = 0; i < limit + 5; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        const res = await request(app).get(`/v1/verify/public/${validWallet}`);
+        if (res.status === 429) {
+          limited = res;
+          break;
+        }
+      }
+
+      expect(limited).toBeDefined();
+      expect(limited.status).toBe(429);
+      expect(limited.body).toHaveProperty('error');
+      expect(limited.body.error).toContain('Too many requests');
+      // Documented retry metadata.
+      expect(limited.headers).toHaveProperty('retry-after');
+      expect(Number(limited.headers['retry-after'])).toBeGreaterThan(0);
+      expect(limited.body).toHaveProperty('retryAfter');
+      expect(Number(limited.body.retryAfter)).toBeGreaterThan(0);
+      expect(limited.headers['ratelimit-remaining']).toBe('0');
+    });
+
+    it('should not trust spoofed X-Forwarded-For headers from untrusted clients', async () => {
+      const limit = Number(
+        (await request(app).get(`/v1/verify/public/${validWallet}`)).headers[
+          'ratelimit-limit'
+        ]
+      );
+
+      let limited;
+      // Rotate spoofed forwarding headers; if they were trusted, each request
+      // would appear to come from a new client and never hit the limit.
+      for (let i = 0; i < limit + 5; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}`)
+          .set('X-Forwarded-For', `203.0.113.${i % 250}`)
+          .set('X-Real-IP', `198.51.100.${i % 250}`);
+        if (res.status === 429) {
+          limited = res;
+          break;
+        }
+      }
+
+      expect(limited).toBeDefined();
+      expect(limited.status).toBe(429);
+    });
+
+    it('should key limits on the trusted client identity behind a proxy', async () => {
+      // When the app is configured to trust a proxy, the forwarded client
+      // identity should be used, so distinct clients get distinct budgets.
+      const resA = await request(app)
+        .get(`/v1/verify/public/${validWallet}`)
+        .set('X-Forwarded-For', '203.0.113.10');
+      const resB = await request(app)
+        .get(`/v1/verify/public/${validWallet}`)
+        .set('X-Forwarded-For', '203.0.113.11');
+
+      // Both requests should be accounted for independently.
+      expect(resA.headers).toHaveProperty('ratelimit-remaining');
+      expect(resB.headers).toHaveProperty('ratelimit-remaining');
     });
   });
 
@@ -128,6 +218,156 @@ describe('GET /verify/public/:wallet', () => {
     it('should return 500 on contract error', async () => {
       // This test would require mocking the contract call to fail
       // Skipping for now as it requires test infrastructure setup
+    });
+  });
+
+  describe('Response size and batch limits', () => {
+    const validWallet = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF';
+    const {
+      MAX_PUBLIC_RECORDS,
+      MAX_BATCH_WALLETS,
+    } = require('../src/config/verificationLimits');
+
+    describe('Public record history limit', () => {
+      it('should document the maximum number of records returned', () => {
+        expect(typeof MAX_PUBLIC_RECORDS).toBe('number');
+        expect(MAX_PUBLIC_RECORDS).toBeGreaterThan(0);
+      });
+
+      it('should return at most MAX_PUBLIC_RECORDS records', async () => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}`)
+          .expect((res) => {
+            if (res.status === 200) {
+              expect(Array.isArray(res.body.records)).toBe(true);
+              expect(res.body.records.length).toBeLessThanOrEqual(MAX_PUBLIC_RECORDS);
+            }
+          });
+      });
+
+      it('should accept a limit query param below the maximum', async () => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}?limit=1`)
+          .expect((res) => {
+            expect(res.status).not.toBe(400);
+            if (res.status === 200) {
+              expect(res.body.records.length).toBeLessThanOrEqual(1);
+            }
+          });
+      });
+
+      it('should accept a limit query param exactly at the maximum', async () => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}?limit=${MAX_PUBLIC_RECORDS}`)
+          .expect((res) => {
+            expect(res.status).not.toBe(400);
+            if (res.status === 200) {
+              expect(res.body.records.length).toBeLessThanOrEqual(MAX_PUBLIC_RECORDS);
+            }
+          });
+      });
+
+      it('should reject or truncate a limit query param above the maximum predictably', async () => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}?limit=${MAX_PUBLIC_RECORDS + 1}`)
+          .expect((res) => {
+            // Either a predictable 400 or a truncated 200 response
+            if (res.status === 400) {
+              expect(res.body).toHaveProperty('error');
+            } else {
+              expect(res.status).toBe(200);
+              expect(res.body.records.length).toBeLessThanOrEqual(MAX_PUBLIC_RECORDS);
+            }
+          });
+      });
+
+      it('should reject a non-numeric limit with 400', async () => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}?limit=abc`)
+          .expect(400);
+
+        expect(res.body).toHaveProperty('error');
+      });
+
+      it('should reject a negative limit with 400', async () => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}?limit=-1`)
+          .expect(400);
+
+        expect(res.body).toHaveProperty('error');
+      });
+
+      it('should expose truncation semantics when records exceed the maximum', async () => {
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}`)
+          .expect((res) => {
+            if (res.status === 200) {
+              // If truncated, the response should signal it explicitly
+              if (res.body.truncated === true) {
+                expect(res.body.records.length).toBe(MAX_PUBLIC_RECORDS);
+              } else {
+                expect(res.body.records.length).toBeLessThanOrEqual(MAX_PUBLIC_RECORDS);
+              }
+            }
+          });
+      });
+    });
+
+    describe('Batch verification limit', () => {
+      const makeWallets = (count) =>
+        Array.from({ length: count }, (_, i) =>
+          `GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNL${String(i).padStart(2, '0')}`
+        );
+
+      it('should document the maximum batch size', () => {
+        expect(typeof MAX_BATCH_WALLETS).toBe('number');
+        expect(MAX_BATCH_WALLETS).toBeGreaterThan(0);
+      });
+
+      it('should accept a batch below the maximum', async () => {
+        const res = await request(app)
+          .post('/v1/verify/public/batch')
+          .send({ wallets: makeWallets(Math.max(1, MAX_BATCH_WALLETS - 1)) })
+          .expect((res) => {
+            expect(res.status).not.toBe(400);
+          });
+      });
+
+      it('should accept a batch exactly at the maximum', async () => {
+        const res = await request(app)
+          .post('/v1/verify/public/batch')
+          .send({ wallets: makeWallets(MAX_BATCH_WALLETS) })
+          .expect((res) => {
+            expect(res.status).not.toBe(400);
+          });
+      });
+
+      it('should reject a batch above the maximum with 400', async () => {
+        const res = await request(app)
+          .post('/v1/verify/public/batch')
+          .send({ wallets: makeWallets(MAX_BATCH_WALLETS + 1) })
+          .expect(400);
+
+        expect(res.body).toHaveProperty('error');
+      });
+
+      it('should reject a non-array wallets payload with 400', async () => {
+        const res = await request(app)
+          .post('/v1/verify/public/batch')
+          .send({ wallets: 'not-an-array' })
+          .expect(400);
+
+        expect(res.body).toHaveProperty('error');
+      });
+
+      it('should reject an empty wallets payload with 400', async () => {
+        const res = await request(app)
+          .post('/v1/verify/public/batch')
+          .send({ wallets: [] })
+          .expect(400);
+
+        expect(res.body).toHaveProperty('error');
+      });
     });
   });
 });

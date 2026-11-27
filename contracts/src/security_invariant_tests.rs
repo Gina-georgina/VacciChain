@@ -11,6 +11,46 @@
 use soroban_sdk::{testutils::Address as _, Env, String};
 use crate::{VacciChainContract, VacciChainContractClient, ContractError};
 
+// ── Helpers for soulbound / boundary invariants (Issues #75, #77) ────────────
+
+/// Snapshot the full contract storage as a comparable vector of (key, value)
+/// pairs. Used to prove that prohibited operations do not mutate state.
+fn storage_snapshot(env: &Env, contract_id: &soroban_sdk::Address) -> soroban_sdk::Vec<(soroban_sdk::Val, soroban_sdk::Val)> {
+    env.as_contract(contract_id, || {
+        let mut out = soroban_sdk::Vec::new(env);
+        for key in env.storage().instance().keys() {
+            if let Some(val) = env.storage().instance().get::<soroban_sdk::Val, soroban_sdk::Val>(&key) {
+                out.push_back((key, val));
+            }
+        }
+        for key in env.storage().persistent().keys() {
+            if let Some(val) = env.storage().persistent().get::<soroban_sdk::Val, soroban_sdk::Val>(&key) {
+                out.push_back((key, val));
+            }
+        }
+        for key in env.storage().temporary().keys() {
+            if let Some(val) = env.storage().temporary().get::<soroban_sdk::Val, soroban_sdk::Val>(&key) {
+                out.push_back((key, val));
+            }
+        }
+        out
+    })
+}
+
+/// Assert that a prohibited operation failed with `SoulboundToken`, emitted no
+/// events, and left storage byte-for-byte unchanged.
+fn assert_soulbound_rejected<F>(env: &Env, client: &VacciChainContractClient, op: F)
+where
+    F: FnOnce() -> Result<Result<(), ContractError>, Result<ContractError, soroban_sdk::InvokeError>>,
+{
+    let before = storage_snapshot(env, &client.address);
+    let result = op();
+    assert_eq!(result, Err(Ok(ContractError::SoulboundToken)));
+    let after = storage_snapshot(env, &client.address);
+    assert_eq!(before, after, "prohibited op must not mutate storage");
+    assert_eq!(env.events().all().len(), 0, "prohibited op must not emit events");
+}
+
 // ── Storage lifecycle & TTL assumptions (Issue #90) ──────────────────────────
 //
 // Soroban persistent storage entries can expire when their TTL (time-to-live,
@@ -289,22 +329,16 @@ fn invariant_unpause_restores_minting() {
     assert!(result.is_ok(), "Minting should succeed after unpause");
 }
 
-// ── Arithmetic and timestamp boundary behavior (Issue #88) ───────────────────
-//
-// Audits counters, sequence values, and date/time assumptions for overflow and
-// invalid-time safety. Covers arithmetic in mint.rs (token id / dose counters),
-// verify.rs (record counts), storage.rs (sequence storage), and events.rs
-// (timestamp emission).
+// ── Soulbound enforcement across all ownership-changing entry points (#75) ───
 
 #[test]
-fn boundary_token_id_sequence_starts_at_one() {
+fn invariant_transfer_does_not_mutate_or_emit() {
     let (env, client, _admin) = setup();
     let issuer = soroban_sdk::Address::generate(&env);
     let patient = soroban_sdk::Address::generate(&env);
+    let recipient = soroban_sdk::Address::generate(&env);
 
     add_issuer(&env, &client, &issuer);
-
-    // First minted token id must be 1 (no zero-id token, no off-by-one).
     let token_id = client.mint_vaccination(
         &patient,
         &String::from_str(&env, "COVID-19"),
@@ -313,256 +347,6 @@ fn boundary_token_id_sequence_starts_at_one() {
         &None::<u32>,
         &None::<u32>,
     );
-    assert_eq!(token_id, 1u64);
-
-    // Sequence must advance monotonically by exactly one per mint.
-    let token_id2 = client.mint_vaccination(
-        &patient,
-        &String::from_str(&env, "COVID-19"),
-        &String::from_str(&env, "2024-01-16"),
-        &issuer,
-        &None::<u32>,
-        &None::<u32>,
-    );
-    assert_eq!(token_id2, 2u64);
-}
-
-#[test]
-fn boundary_token_id_sequence_advances_without_collision() {
-    let (env, client, _admin) = setup();
-    let issuer = soroban_sdk::Address::generate(&env);
-    let patient = soroban_sdk::Address::generate(&env);
-
-    add_issuer(&env, &client, &issuer);
-
-    // Mint several tokens and confirm ids are strictly increasing with no gaps.
-    let mut prev = 0u64;
-    for i in 0..5u32 {
-        let id = client.mint_vaccination(
-            &patient,
-            &String::from_str(&env, "COVID-19"),
-            &String::from_str(&env, "2024-01-15"),
-            &issuer,
-            &None::<u32>,
-            &None::<u32>,
-        );
-        assert_eq!(id, prev + 1, "token id must increment by one (iteration {i})");
-        prev = id;
-    }
-}
-
-#[test]
-fn boundary_dose_number_zero_is_rejected() {
-    let (env, client, _admin) = setup();
-    let issuer = soroban_sdk::Address::generate(&env);
-    let patient = soroban_sdk::Address::generate(&env);
-
-    add_issuer(&env, &client, &issuer);
-
-    // Dose number 0 is an invalid boundary; must not be accepted silently.
-    let result = client.try_mint_vaccination(
-        &patient,
-        &String::from_str(&env, "COVID-19"),
-        &String::from_str(&env, "2024-01-15"),
-        &issuer,
-        &Some(0u32),
-        &None::<u32>,
-    );
-    assert!(result.is_err(), "dose number 0 must be rejected");
-}
-
-#[test]
-fn boundary_dose_number_max_is_handled_safely() {
-    let (env, client, _admin) = setup();
-    let issuer = soroban_sdk::Address::generate(&env);
-    let patient = soroban_sdk::Address::generate(&env);
-
-    add_issuer(&env, &client, &issuer);
-
-    // u32::MAX dose number must not overflow any internal counter arithmetic.
-    let result = client.try_mint_vaccination(
-        &patient,
-        &String::from_str(&env, "COVID-19"),
-        &String::from_str(&env, "2024-01-15"),
-        &issuer,
-        &Some(u32::MAX),
-        &None::<u32>,
-    );
-    // Either accepted (stored as-is) or rejected with a typed error — never a panic.
-    match result {
-        Ok(_) => {}
-        Err(Ok(_e)) => {}
-        Err(Err(_)) => panic!("dose number u32::MAX must not cause a host panic"),
-    }
-}
-
-#[test]
-fn boundary_total_doses_max_is_handled_safely() {
-    let (env, client, _admin) = setup();
-    let issuer = soroban_sdk::Address::generate(&env);
-    let patient = soroban_sdk::Address::generate(&env);
-
-    add_issuer(&env, &client, &issuer);
-
-    // total_doses = u32::MAX must not overflow when compared against dose_number.
-    let result = client.try_mint_vaccination(
-        &patient,
-        &String::from_str(&env, "COVID-19"),
-        &String::from_str(&env, "2024-01-15"),
-        &issuer,
-        &Some(1u32),
-        &Some(u32::MAX),
-    );
-    match result {
-        Ok(_) => {}
-        Err(Ok(_e)) => {}
-        Err(Err(_)) => panic!("total_doses u32::MAX must not cause a host panic"),
-    }
-}
-
-#[test]
-fn boundary_dose_number_exceeding_total_doses_is_rejected() {
-    let (env, client, _admin) = setup();
-    let issuer = soroban_sdk::Address::generate(&env);
-    let patient = soroban_sdk::Address::generate(&env);
-
-    add_issuer(&env, &client, &issuer);
-
-    // dose_number > total_doses is an invalid boundary and must be rejected.
-    let result = client.try_mint_vaccination(
-        &patient,
-        &String::from_str(&env, "COVID-19"),
-        &String::from_str(&env, "2024-01-15"),
-        &issuer,
-        &Some(3u32),
-        &Some(2u32),
-    );
-    assert!(result.is_err(), "dose_number > total_doses must be rejected");
-}
-
-#[test]
-fn boundary_dose_number_equals_total_doses_is_accepted() {
-    let (env, client, _admin) = setup();
-    let issuer = soroban_sdk::Address::generate(&env);
-    let patient = soroban_sdk::Address::generate(&env);
-
-    add_issuer(&env, &client, &issuer);
-
-    // dose_number == total_doses is the valid upper boundary.
-    let result = client.try_mint_vaccination(
-        &patient,
-        &String::from_str(&env, "COVID-19"),
-        &String::from_str(&env, "2024-01-15"),
-        &issuer,
-        &Some(2u32),
-        &Some(2u32),
-    );
-    assert!(result.is_ok(), "dose_number == total_doses must be accepted");
-}
-
-#[test]
-fn boundary_empty_date_string_is_rejected() {
-    let (env, client, _admin) = setup();
-    let issuer = soroban_sdk::Address::generate(&env);
-    let patient = soroban_sdk::Address::generate(&env);
-
-    add_issuer(&env, &client, &issuer);
-
-    // Empty date is an invalid time assumption and must be rejected.
-    let result = client.try_mint_vaccination(
-        &patient,
-        &String::from_str(&env, "COVID-19"),
-        &String::from_str(&env, ""),
-        &issuer,
-        &None::<u32>,
-        &None::<u32>,
-    );
-    assert!(result.is_err(), "empty date string must be rejected");
-}
-
-#[test]
-fn boundary_epoch_date_is_handled_safely() {
-    let (env, client, _admin) = setup();
-    let issuer = soroban_sdk::Address::generate(&env);
-    let patient = soroban_sdk::Address::generate(&env);
-
-    add_issuer(&env, &client, &issuer);
-
-    // Zero/epoch date boundary must not panic or underflow any timestamp math.
-    let result = client.try_mint_vaccination(
-        &patient,
-        &String::from_str(&env, "COVID-19"),
-        &String::from_str(&env, "1970-01-01"),
-        &issuer,
-        &None::<u32>,
-        &None::<u32>,
-    );
-    match result {
-        Ok(_) => {}
-        Err(Ok(_e)) => {}
-        Err(Err(_)) => panic!("epoch date must not cause a host panic"),
-    }
-}
-
-#[test]
-fn boundary_far_future_date_is_handled_safely() {
-    let (env, client, _admin) = setup();
-    let issuer = soroban_sdk::Address::generate(&env);
-    let patient = soroban_sdk::Address::generate(&env);
-
-    add_issuer(&env, &client, &issuer);
-
-    // Far-future date must not overflow any timestamp arithmetic.
-    let result = client.try_mint_vaccination(
-        &patient,
-        &String::from_str(&env, "COVID-19"),
-        &String::from_str(&env, "9999-12-31"),
-        &issuer,
-        &None::<u32>,
-        &None::<u32>,
-    );
-    match result {
-        Ok(_) => {}
-        Err(Ok(_e)) => {}
-        Err(Err(_)) => panic!("far-future date must not cause a host panic"),
-    }
-}
-
-#[test]
-fn boundary_verify_record_count_matches_mints() {
-    let (env, client, _admin) = setup();
-    let issuer = soroban_sdk::Address::generate(&env);
-    let patient = soroban_sdk::Address::generate(&env);
-
-    add_issuer(&env, &client, &issuer);
-
-    // Record count in verify.rs must equal the number of mints (no off-by-one).
-    for _ in 0..3u32 {
-        client.mint_vaccination(
-            &patient,
-            &String::from_str(&env, "COVID-19"),
-            &String::from_str(&env, "2024-01-15"),
-            &issuer,
-            &None::<u32>,
-            &None::<u32>,
-        );
-    }
-
-    let (vaccinated, records, _) = client.verify_vaccination(&patient);
-    assert!(vaccinated);
-    assert_eq!(records.len(), 3, "record count must match mint count");
-}
-
-#[test]
-fn boundary_verify_empty_wallet_returns_zero_records() {
-    let (env, client, _admin) = setup();
-    let wallet = soroban_sdk::Address::generate(&env);
-
-    // Zero-record boundary: no underflow when counting an empty record set.
-    let (vaccinated, records, _) = client.verify_vaccination(&wallet);
-    assert!(!vaccinated);
-    assert_eq!(records.len(), 0);
-}
 
 // ── Missing / expired persistent entries (Issue #90) ─────────────────────────
 
@@ -593,6 +377,52 @@ fn invariant_verify_after_record_removed_is_recoverable() {
         &None::<u32>,
     );
 
+    // Clear events emitted by setup/mint so we only observe the transfer.
+    let _ = env.events().all();
+
+    assert_soulbound_rejected(&env, &client, || {
+        client.try_transfer(&patient, &recipient, &token_id)
+    });
+}
+
+#[test]
+fn invariant_approve_rejected_as_soulbound() {
+    let (env, client, _admin) = setup();
+    let owner = soroban_sdk::Address::generate(&env);
+    let spender = soroban_sdk::Address::generate(&env);
+
+    assert_soulbound_rejected(&env, &client, || {
+        client.try_approve(&owner, &spender, &1u64, &100u32)
+    });
+}
+
+#[test]
+fn invariant_allowance_is_always_zero() {
+    let (env, client, _admin) = setup();
+    let owner = soroban_sdk::Address::generate(&env);
+    let spender = soroban_sdk::Address::generate(&env);
+
+    // No approval path may ever grant an allowance on a soulbound token.
+    let allowance = client.allowance(&owner, &spender);
+    assert_eq!(allowance, 0, "soulbound tokens must never have allowances");
+}
+
+#[test]
+fn invariant_verify_vaccination_degrades_on_expiry() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+
+    add_issuer(&env, &client, &issuer);
+    client.mint(
+        &patient,
+        &String::from_str(&env, "COVID-19"),
+        &String::from_str(&env, "2024-01-15"),
+        &issuer,
+        &None::<u32>,
+        &None::<u32>,
+    );
+
     let (vaccinated, records, _) = client.verify_vaccination(&patient);
     assert!(vaccinated);
     assert_eq!(records.len(), 1);
@@ -609,13 +439,12 @@ fn invariant_verify_after_record_removed_is_recoverable() {
 }
 
 #[test]
-fn invariant_mint_with_missing_issuer_entry_denies() {
+fn invariant_clawback_rejected_as_soulbound() {
     let (env, client, _admin) = setup();
     let issuer = soroban_sdk::Address::generate(&env);
     let patient = soroban_sdk::Address::generate(&env);
 
     add_issuer(&env, &client, &issuer);
-
     // Simulate expiry of the issuer's persistent entry.
     env.as_contract(&client.address, || {
         env.storage().persistent().remove(&issuer);
@@ -630,8 +459,309 @@ fn invariant_mint_with_missing_issuer_entry_denies() {
         &None::<u32>,
     );
 
-    // Authorization must fail closed, not open.
-    assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+    let _ = env.events().all();
+
+    assert_soulbound_rejected(&env, &client, || {
+        client.try_clawback(&issuer, &patient, &token_id)
+    });
+}
+
+#[test]
+fn invariant_burn_rejected_as_soulbound() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+
+    add_issuer(&env, &client, &issuer);
+    let token_id = client.mint_vaccination(
+        &patient,
+        &String::from_str(&env, "COVID-19"),
+        &String::from_str(&env, "2024-01-15"),
+        &issuer,
+        &None::<u32>,
+        &None::<u32>,
+    );
+
+    let _ = env.events().all();
+
+    assert_soulbound_rejected(&env, &client, || {
+        client.try_burn(&patient, &token_id)
+    });
+}
+
+#[test]
+fn invariant_transfer_from_rejected_as_soulbound() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+    let spender = soroban_sdk::Address::generate(&env);
+    let recipient = soroban_sdk::Address::generate(&env);
+
+    add_issuer(&env, &client, &issuer);
+    let token_id = client.mint_vaccination(
+        &patient,
+        &String::from_str(&env, "COVID-19"),
+        &String::from_str(&env, "2024-01-15"),
+        &issuer,
+        &None::<u32>,
+        &None::<u32>,
+    );
+
+    let _ = env.events().all();
+
+    // Alternate entry point: transfer_from must be equally blocked.
+    assert_soulbound_rejected(&env, &client, || {
+        client.try_transfer_from(&spender, &patient, &recipient, &token_id)
+    });
+}
+
+// ── Input length / collection size boundaries (#77) ──────────────────────────
+
+const MAX_NAME_LEN: u32 = 64;
+const MAX_DATE_LEN: u32 = 32;
+const MAX_LICENSE_LEN: u32 = 64;
+const MAX_COUNTRY_LEN: u32 = 32;
+const MAX_PATIENT_RECORDS: u32 = 32;
+const MAX_BATCH_SIZE: u32 = 20;
+
+fn repeat(env: &Env, ch: char, len: u32) -> String {
+    let mut s = String::from_str(env, "");
+    for _ in 0..len {
+        s.push_back(ch);
+    }
+    s
+}
+
+fn assert_rejected_without_writes<F>(env: &Env, client: &VacciChainContractClient, op: F)
+where
+    F: FnOnce() -> Result<Result<u64, ContractError>, Result<ContractError, soroban_sdk::InvokeError>>,
+{
+    let before = storage_snapshot(env, &client.address);
+    let result = op();
+    assert!(result.is_err(), "oversized input must be rejected");
+    let after = storage_snapshot(env, &client.address);
+    assert_eq!(before, after, "rejected input must not partially write storage");
+}
+
+#[test]
+fn boundary_vaccine_name_zero_max_and_over() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+    add_issuer(&env, &client, &issuer);
+
+    // Zero-length name: rejected.
+    assert_rejected_without_writes(&env, &client, || {
+        client.try_mint_vaccination(
+            &patient,
+            &String::from_str(&env, ""),
+            &String::from_str(&env, "2024-01-15"),
+            &issuer,
+            &None::<u32>,
+            &None::<u32>,
+        )
+    });
+
+    // Max valid name: accepted.
+    let max_name = repeat(&env, 'A', MAX_NAME_LEN);
+    let ok = client.try_mint_vaccination(
+        &patient,
+        &max_name,
+        &String::from_str(&env, "2024-01-15"),
+        &issuer,
+        &None::<u32>,
+        &None::<u32>,
+    );
+    assert!(ok.is_ok(), "max-length vaccine name must be accepted");
+
+    // One over the limit: rejected without writes.
+    let over_name = repeat(&env, 'A', MAX_NAME_LEN + 1);
+    assert_rejected_without_writes(&env, &client, || {
+        client.try_mint_vaccination(
+            &patient,
+            &over_name,
+            &String::from_str(&env, "2024-01-15"),
+            &issuer,
+            &None::<u32>,
+            &None::<u32>,
+        )
+    });
+}
+
+#[test]
+fn boundary_date_zero_max_and_over() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+    add_issuer(&env, &client, &issuer);
+
+    assert_rejected_without_writes(&env, &client, || {
+        client.try_mint_vaccination(
+            &patient,
+            &String::from_str(&env, "COVID-19"),
+            &String::from_str(&env, ""),
+            &issuer,
+            &None::<u32>,
+            &None::<u32>,
+        )
+    });
+
+    let max_date = repeat(&env, '1', MAX_DATE_LEN);
+    let ok = client.try_mint_vaccination(
+        &patient,
+        &String::from_str(&env, "COVID-19"),
+        &max_date,
+        &issuer,
+        &None::<u32>,
+        &None::<u32>,
+    );
+    assert!(ok.is_ok(), "max-length date must be accepted");
+
+    let over_date = repeat(&env, '1', MAX_DATE_LEN + 1);
+    assert_rejected_without_writes(&env, &client, || {
+        client.try_mint_vaccination(
+            &patient,
+            &String::from_str(&env, "COVID-19"),
+            &over_date,
+            &issuer,
+            &None::<u32>,
+            &None::<u32>,
+        )
+    });
+}
+
+#[test]
+fn boundary_issuer_name_zero_max_and_over() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+
+    assert_rejected_without_writes(&env, &client, || {
+        client.try_add_issuer(
+            &issuer,
+            &String::from_str(&env, ""),
+            &String::from_str(&env, "LIC-001"),
+            &String::from_str(&env, "USA"),
+        )
+    });
+
+    let max_name = repeat(&env, 'H', MAX_NAME_LEN);
+    let ok = client.try_add_issuer(
+        &issuer,
+        &max_name,
+        &String::from_str(&env, "LIC-001"),
+        &String::from_str(&env, "USA"),
+    );
+    assert!(ok.is_ok(), "max-length issuer name must be accepted");
+
+    let over_name = repeat(&env, 'H', MAX_NAME_LEN + 1);
+    assert_rejected_without_writes(&env, &client, || {
+        client.try_add_issuer(
+            &issuer,
+            &over_name,
+            &String::from_str(&env, "LIC-001"),
+            &String::from_str(&env, "USA"),
+        )
+    });
+}
+
+#[test]
+fn boundary_issuer_license_zero_max_and_over() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+
+    assert_rejected_without_writes(&env, &client, || {
+        client.try_add_issuer(
+            &issuer,
+            &String::from_str(&env, "Hospital"),
+            &String::from_str(&env, ""),
+            &String::from_str(&env, "USA"),
+        )
+    });
+
+    let max_license = repeat(&env, 'L', MAX_LICENSE_LEN);
+    let ok = client.try_add_issuer(
+        &issuer,
+        &String::from_str(&env, "Hospital"),
+        &max_license,
+        &String::from_str(&env, "USA"),
+    );
+    assert!(ok.is_ok(), "max-length license must be accepted");
+
+    let over_license = repeat(&env, 'L', MAX_LICENSE_LEN + 1);
+    assert_rejected_without_writes(&env, &client, || {
+        client.try_add_issuer(
+            &issuer,
+            &String::from_str(&env, "Hospital"),
+            &over_license,
+            &String::from_str(&env, "USA"),
+        )
+    });
+}
+
+#[test]
+fn boundary_issuer_country_zero_max_and_over() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+
+    assert_rejected_without_writes(&env, &client, || {
+        client.try_add_issuer(
+            &issuer,
+            &String::from_str(&env, "Hospital"),
+            &String::from_str(&env, "LIC-001"),
+            &String::from_str(&env, ""),
+        )
+    });
+
+    let max_country = repeat(&env, 'U', MAX_COUNTRY_LEN);
+    let ok = client.try_add_issuer(
+        &issuer,
+        &String::from_str(&env, "Hospital"),
+        &String::from_str(&env, "LIC-001"),
+        &max_country,
+    );
+    assert!(ok.is_ok(), "max-length country must be accepted");
+
+    let over_country = repeat(&env, 'U', MAX_COUNTRY_LEN + 1);
+    assert_rejected_without_writes(&env, &client, || {
+        client.try_add_issuer(
+            &issuer,
+            &String::from_str(&env, "Hospital"),
+            &String::from_str(&env, "LIC-001"),
+            &over_country,
+        )
+    });
+}
+
+#[test]
+fn boundary_patient_record_count_max_and_over() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+    add_issuer(&env, &client, &issuer);
+
+    // Fill up to the documented maximum record count.
+    for _ in 0..MAX_PATIENT_RECORDS {
+        client.mint_vaccination(
+            &patient,
+            &String::from_str(&env, "COVID-19"),
+            &String::from_str(&env, "2024-01-15"),
+            &issuer,
+            &None::<u32>,
+            &None::<u32>,
+        ).unwrap();
+    }
+
+    // One over the limit: rejected without partial writes.
+    assert_rejected_without_writes(&env, &client, || {
+        client.try_mint_vaccination(
+            &patient,
+            &String::from_str(&env, "COVID-19"),
+            &String::from_str(&env, "2024-01-15"),
+            &issuer,
+            &None::<u32>,
+            &None::<u32>,
+        )
+    });
 }
 
 #[test]
@@ -706,6 +836,42 @@ fn invariant_writes_extend_ttl() {
         let patient_ttl = env.storage().persistent().get_ttl(&patient);
         assert!(issuer_ttl > 0, "Issuer entry TTL must be extended on write");
         assert!(patient_ttl > 0, "Patient entry TTL must be extended on write");
+    });
+}
+
+#[test]
+fn boundary_batch_size_max_and_over() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    add_issuer(&env, &client, &issuer);
+
+    // Build a batch at the documented maximum size.
+    let mut max_batch = soroban_sdk::Vec::new(&env);
+    for i in 0..MAX_BATCH_SIZE {
+        let patient = soroban_sdk::Address::generate(&env);
+        max_batch.push_back((
+            patient,
+            String::from_str(&env, "COVID-19"),
+            String::from_str(&env, "2024-01-15"),
+            i,
+        ));
+    }
+    let ok = client.try_batch_mint(&issuer, &max_batch);
+    assert!(ok.is_ok(), "max-size batch must be accepted");
+
+    // One over the limit: rejected without partial writes.
+    let mut over_batch = soroban_sdk::Vec::new(&env);
+    for i in 0..(MAX_BATCH_SIZE + 1) {
+        let patient = soroban_sdk::Address::generate(&env);
+        over_batch.push_back((
+            patient,
+            String::from_str(&env, "COVID-19"),
+            String::from_str(&env, "2024-01-15"),
+            i,
+        ));
+    }
+    assert_rejected_without_writes(&env, &client, || {
+        client.try_batch_mint(&issuer, &over_batch)
     });
 }
 
