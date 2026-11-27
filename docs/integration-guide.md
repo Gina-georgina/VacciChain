@@ -247,7 +247,26 @@ def authenticate(keypair: Keypair) -> str:
 
 ## 3. Error Reference
 
-All errors return JSON with an `error` string field.
+All errors return JSON with an `error` string field. The `error` string is a **stable, machine-readable code** — integrators may branch on it. Human-readable detail, when present, is returned in a separate `message` field and may change without notice; never parse `message`.
+
+### 3.1 Contract error codes
+
+Contract-level failures are mapped by the backend to stable API responses. The mapping below is part of the public contract: a given contract error code always produces the same HTTP status and `error` code.
+
+| Contract error code | HTTP status | `error` code | Cause | Action |
+|---------------------|-------------|--------------|-------|--------|
+| `Unauthorized` | `403` | `unauthorized` | Caller is not the issuer/owner authorized for this operation | Authenticate as the correct issuer |
+| `ConsentRequired` | `403` | `consent_required` | Patient has not granted consent for this operation | Request consent from the patient |
+| `ConsentRevoked` | `403` | `consent_revoked` | Patient revoked consent; operation no longer permitted | Stop issuing/reading; re-request consent |
+| `NotAllowlisted` | `403` | `not_allowlisted` | Issuer is not on the patient's allowlist | Patient must allowlist the issuer |
+| `AlreadyIssued` | `409` | `already_issued` | A record for this vaccine/date already exists | Treat as idempotent success or surface to user |
+| `NotFound` | `404` | `not_found` | Referenced record or token does not exist | Verify the identifier |
+| `InvalidArgument` | `400` | `invalid_argument` | Contract argument failed validation | Fix the request payload |
+| `NotInitialized` | `503` | `contract_not_initialized` | Contract not yet initialized on this network | Retry later; contact support if persistent |
+
+> **Compatibility note:** new contract error codes may be added in future versions. Unknown codes are mapped to `500` with `error: "contract_error"` and the raw code in `contract_error_code`. Treat any unrecognized `error` value as a generic failure rather than crashing.
+
+### 3.2 API-level errors
 
 | Status | Error message | Cause | Action |
 |--------|--------------|-------|--------|
@@ -258,6 +277,7 @@ All errors return JSON with an `error` string field.
 | `401` | `Challenge transaction has expired` | More than 5 minutes elapsed since challenge was issued | Restart from Step 1 |
 | `401` | `Client signature missing or invalid` | Transaction was not signed with the correct private key | Re-sign with the matching keypair |
 | `401` | `Invalid server signature` | Transaction was tampered with | Do not modify the XDR before signing |
+| `403` | `unauthorized` / `consent_required` / `consent_revoked` / `not_allowlisted` | See §3.1 | See §3.1 |
 | `429` | `Too many requests` | Rate limit exceeded (10 req/min for `/auth/sep10`, 60 req/min for `/verify`) | Back off and retry after `retryAfter` seconds |
 | `503` | `contract unavailable` | Contract or RPC could not be reached; status is unknown | Retry with backoff; treat as unverified, never as valid |
 | `500` | `<message>` | Unexpected server or contract error | Log and retry; contact support if persistent |
@@ -327,100 +347,36 @@ Each entry carries the same four-state `status` as the single-wallet endpoint. E
 
 ---
 
-## 5. Verifier API Keys
+## 5. Consent and Allowlist Semantics
 
-Third-party verifiers (schools, employers, border agencies) that need programmatic access to verification endpoints use **verifier API keys** instead of SEP-10 JWTs. Keys are managed by the VacciChain admin team and are designed to be individually scoped, rotated, and revoked.
+Issuance and verification are gated by two independent controls: the patient's **allowlist** (which issuers may issue to them) and the patient's **consent** (whether a given issuer may act on their records). Both are enforced at the contract level and surfaced by the API.
 
-### 5.1 Provisioning
+### 5.1 Consent states
 
-Request a key through your VacciChain account manager or by emailing `integrations@vaccichain.io` with:
+| Consent state | Issuance by issuer | Authenticated read | Public `/verify/:wallet` |
+|---------------|--------------------|--------------------|--------------------------|
+| **Absent** (never granted) | Rejected — `403 consent_required` | Rejected — `403 consent_required` | Returns `vaccinated: false` (no records) |
+| **Granted** | Allowed | Allowed | Returns status with permitted fields only |
+| **Revoked** | Rejected — `403 consent_revoked` | Rejected — `403 consent_revoked` | Returns `vaccinated: false` (no records) |
+| **Changed** (re-granted after revoke) | Allowed under the new grant | Allowed under the new grant | Returns status with permitted fields only |
 
-- Your organization name and a technical contact.
-- The scopes you need (see below).
-- The environments you will call (`sandbox`, `production`).
+State transitions:
 
-You will receive the key **once**, at creation time, in the form:
+- `absent → granted` when the patient grants consent to an issuer.
+- `granted → revoked` when the patient revokes consent; any in-flight issuance is rejected.
+- `revoked → granted` when the patient re-grants; the new grant supersedes the old one.
 
-```
-vc_live_<key_id>_<secret>
-```
+### 5.2 Allowlist semantics
 
-**Store it in a secrets manager.** VacciChain only stores a salted hash of the secret portion; the plaintext key cannot be retrieved again. If you lose it, you must rotate (see 5.3).
+- An issuer not on the patient's allowlist receives `403 not_allowlisted` on issuance.
+- Allowlisting is a prerequisite for consent: consent can only be granted to an allowlisted issuer.
+- Removing an issuer from the allowlist behaves like revocation for future operations; previously issued records remain on-chain.
 
-### 5.2 Scopes
+### 5.3 What public verification reveals
 
-Each key carries an explicit set of scopes. A request made with a key that lacks the required scope is rejected with `403`.
+Public verification is **not** a privacy guarantee for on-chain data. Records are soulbound and publicly readable on the Stellar ledger. The `/verify/:wallet` endpoint deliberately **omits prohibited fields** — it never returns patient identity data, consent state, allowlist membership, or issuer-private metadata. It returns only the fields documented in §1 (`wallet`, `vaccinated`, `record_count`, and permitted record fields).
 
-| Scope | Grants access to |
-|-------|------------------|
-| `verify:read` | `GET /verify/:wallet` |
-| `batch:verify` | `POST /batch/verify` |
-| `records:read` | `GET /vaccination/:wallet` (authenticated record detail) |
-
-Keys are scoped per environment; a `sandbox` key cannot be used against `production`. Request the minimum scopes your integration needs — do not request `records:read` unless you actually display record details.
-
-### 5.3 Rotation
-
-Rotate keys on a schedule (we recommend every 90 days) and immediately if a key may have been exposed.
-
-1. Request a new key with the **same scopes** as the existing one.
-2. Deploy the new key to your systems and confirm traffic succeeds.
-3. Revoke the old key (see 5.4).
-
-Both keys are valid during the overlap window, so rotation requires no downtime. The overlap window is capped at **7 days**; after that the old key is revoked automatically.
-
-### 5.4 Revocation
-
-Revoke a key via the admin API or by contacting support:
-
-```
-DELETE /admin/verifier-keys/:key_id
-Authorization: Bearer <admin token>
-```
-
-Revocation takes effect immediately. Requests using a revoked key receive `401` with `error: "API key revoked"`. Revocation is permanent — a revoked key cannot be re-enabled; issue a new one instead.
-
-### 5.5 Audit
-
-Every key lifecycle event (creation, scope change, rotation, revocation) is recorded in an audit log with the actor, timestamp, and affected `key_id`. Key usage is also logged per request (key id, endpoint, status, timestamp) so you can detect unexpected traffic. Contact support to obtain an audit export for your organization.
-
-### 5.6 Handling `401` and `403` for keys
-
-| Status | Error message | Cause | Action |
-|--------|--------------|-------|--------|
-| `401` | `API key required` | No `X-API-Key` header sent | Add the header |
-| `401` | `API key revoked` | Key was revoked | Stop using it; issue a new key |
-| `401` | `API key expired` | Key passed its rotation deadline | Rotate to a new key |
-| `403` | `Insufficient scope` | Key lacks the scope for this endpoint | Request the scope or use a different key |
-
-Send the key in the `X-API-Key` header:
-
-```js
-const res = await fetch("https://api.vaccichain.io/verify/GABCDEF...", {
-  headers: { "X-API-Key": process.env.VACCICHAIN_API_KEY },
-});
-if (res.status === 401 || res.status === 403) {
-  // Do not retry blindly — the key is revoked, expired, or out of scope.
-  throw new Error(`Verifier key rejected: ${(await res.json()).error}`);
-}
-```
-
-```python
-import os, httpx
-
-def verify_with_key(wallet: str) -> dict:
-    r = httpx.get(
-        f"https://api.vaccichain.io/verify/{wallet}",
-        headers={"X-API-Key": os.environ["VACCICHAIN_API_KEY"]},
-    )
-    if r.status_code in (401, 403):
-        # Do not retry blindly — the key is revoked, expired, or out of scope.
-        raise RuntimeError(f"Verifier key rejected: {r.json()['error']}")
-    r.raise_for_status()
-    return r.json()
-```
-
-Do **not** retry `401`/`403` responses in a loop; they indicate a configuration problem that requires operator action.
+Integrators must not assume that the absence of a field in the API response means the underlying data is private on-chain.
 
 ---
 
@@ -430,6 +386,7 @@ Do **not** retry `401`/`403` responses in a loop; they indicate a configuration 
 - **Results are not medical determinations.** VacciChain reports what is recorded on-chain. It does not assess immunity, medical fitness, or suitability for any purpose. Your organization is responsible for how a result is interpreted and used.
 - **Never collapse a failure into a positive result.** An RPC error, timeout, `503`, or `status: "unavailable"` means the status is unknown. Treat it as unverified and retry; do not display it as valid.
 - Always verify the wallet address belongs to the person presenting it through your own identity verification process. VacciChain confirms the record exists on-chain; it does not confirm identity.
+- Public-chain data is **not private**: on-chain records are readable by anyone. The API omits prohibited fields, but do not treat on-chain data as confidential.
 - JWTs are scoped by role (`patient` or `issuer`) and expire after 1 hour.
 - SEP-10 nonces are single-use. A replayed challenge will be rejected with `401`.
 - Verifier API keys are stored only as salted hashes; treat the plaintext key like a password and never commit it to source control.

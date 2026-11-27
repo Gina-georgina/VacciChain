@@ -1,3 +1,4 @@
+const path = require('path');
 const swaggerJsdoc = require('swagger-jsdoc');
 
 const options = {
@@ -32,11 +33,35 @@ const options = {
         },
       },
       schemas: {
+        // Standard error shape (#42) — see docs/api-errors.md.
         Error: {
           type: 'object',
+          required: ['error', 'code'],
           properties: {
             error: {
               type: 'string',
+              description: 'Safe, human-readable message. Always generic for 5xx.',
+            },
+            code: {
+              type: 'string',
+              description: 'Stable machine-readable code clients should branch on.',
+              enum: [
+                'VALIDATION_FAILED',
+                'UNAUTHENTICATED',
+                'TOKEN_INVALID',
+                'FORBIDDEN',
+                'NOT_FOUND',
+                'RATE_LIMITED',
+                'RPC_ERROR',
+                'INTERNAL_ERROR',
+              ],
+            },
+            requestId: {
+              type: 'string',
+              description: 'Correlates the response with server logs (also sent as X-Request-ID).',
+            },
+            details: {
+              description: 'Optional field-level validation details (4xx only).',
             },
           },
         },
@@ -48,7 +73,12 @@ const options = {
             },
             date_administered: {
               type: 'string',
-              format: 'date-time',
+              format: 'date',
+              description:
+                'Date-only field in ISO 8601 calendar format (YYYY-MM-DD), e.g. "2023-02-28". ' +
+                'Represents the local calendar date of administration and is never shifted by time zone. ' +
+                'Ambiguous values (timestamps, partial dates, non-ISO formats, or invalid calendar dates such as "2023-02-30") are rejected.',
+              example: '2023-02-28',
             },
             issuer: {
               type: 'string',
@@ -56,13 +86,18 @@ const options = {
             timestamp: {
               type: 'string',
               format: 'date-time',
+              description:
+                'Timestamp field in ISO 8601 format (YYYY-MM-DDTHH:mm:ss[.sss]Z or with an explicit numeric offset). ' +
+                'Values are normalized to UTC for storage and indexing; offsets are converted, not truncated. ' +
+                'Ambiguous values (date-only strings, missing time zone designators, or non-ISO formats) are rejected.',
+              example: '2023-02-28T23:30:00.000Z',
             },
           },
         },
       },
     },
   },
-  apis: ['./src/routes/*.js'],
+  apis: [path.join(__dirname, 'routes', '*.js'), path.join(__dirname, 'routes', 'docs', '*.js')],
 };
 
 const specs = swaggerJsdoc(options);

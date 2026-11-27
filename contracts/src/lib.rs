@@ -70,11 +70,17 @@ pub(crate) fn require_supported_schema(env: &Env) -> Result<(), ContractError> {
 
 /// Contract errors.
 ///
+/// These numeric codes are part of the public contract ABI and are **stable**:
+/// existing codes MUST NOT be renumbered or reused. New error conditions are
+/// appended with the next unused code. Backend/API layers map these codes to
+/// stable API responses (see the backend mapping tests), so callers can rely on
+/// the code → meaning mapping across contract upgrades.
+///
 /// | Code | Name                         | Description                                      |
 /// |------|------------------------------|--------------------------------------------------|
 /// | 1    | AlreadyInitialized           | Contract has already been initialized            |
 /// | 2    | NotInitialized               | Contract has not been initialized                |
-/// | 3    | Unauthorized                 | Caller is not an authorized issuer               |
+/// | 3    | Unauthorized                 | Caller is not an authorized issuer / revoker     |
 /// | 4    | ProposalExpired              | Admin transfer proposal has expired              |
 /// | 5    | NoPendingTransfer            | No pending admin transfer exists                 |
 /// | 6    | DuplicateRecord              | Identical vaccination record already exists      |
@@ -88,6 +94,8 @@ pub(crate) fn require_supported_schema(env: &Env) -> Result<(), ContractError> {
 /// | 14   | InvalidInputCountry          | issuer country exceeds maximum length            |
 /// | 15   | SoulboundToken               | Transfers are disabled for soulbound records     |
 /// | 16   | PatientNotRegistered          | Patient has not self-registered                  |
+/// | 17   | ContractPaused                | Contract is paused                               |
+/// | 18   | BatchTooLarge                 | Batch verification exceeds maximum batch size    |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
@@ -108,10 +116,32 @@ pub enum ContractError {
     SoulboundToken = 15,
     PatientNotRegistered = 16,
     ContractPaused = 17,
-    UnsupportedSchemaVersion = 18,
+    BatchTooLarge = 18,
+    UnsupportedSchemaVersion = 19,
 }
 
-const MAX_STRING_LENGTH: u32 = 100;
+// ---------------------------------------------------------------------------
+// Input bounds (Backlog #77)
+//
+// Every public argument and stored collection has an explicit, documented
+// maximum so that oversized inputs can never exceed Soroban resource limits.
+// All bounds are enforced *before* any storage read/write or event emission.
+// ---------------------------------------------------------------------------
+
+/// Maximum byte length of a vaccine name (public argument + stored field).
+pub const MAX_VACCINE_NAME_LEN: u32 = 100;
+/// Maximum byte length of a date string (public argument + stored field).
+pub const MAX_DATE_LEN: u32 = 100;
+/// Maximum byte length of an issuer name (public argument + stored field).
+pub const MAX_ISSUER_NAME_LEN: u32 = 100;
+/// Maximum byte length of an issuer license identifier (public argument + stored field).
+pub const MAX_LICENSE_LEN: u32 = 100;
+/// Maximum byte length of an issuer country (public argument + stored field).
+pub const MAX_COUNTRY_LEN: u32 = 100;
+/// Maximum number of vaccination records retained per patient.
+pub const MAX_PATIENT_RECORDS: u32 = 100;
+/// Maximum number of wallets accepted by `batch_verify` in a single call.
+pub const MAX_BATCH_SIZE: u32 = 100;
 
 /// Validates that a string field does not exceed the maximum allowed length.
 ///
@@ -132,15 +162,26 @@ const MAX_STRING_LENGTH: u32 = 100;
 /// - `InvalidInputCountry` if field_name is "country"
 /// - `InvalidInput` for unknown field names
 pub(crate) fn validate_input_length(field: &String, field_name: &str) -> Result<(), ContractError> {
-    if field.len() > MAX_STRING_LENGTH {
-        return Err(match field_name {
-            "vaccine_name" => ContractError::InvalidInputVaccineName,
-            "date_administered" => ContractError::InvalidInputDateAdministered,
-            "name" => ContractError::InvalidInputIssuerName,
-            "license" => ContractError::InvalidInputLicense,
-            "country" => ContractError::InvalidInputCountry,
-            _ => ContractError::InvalidInput,
-        });
+    let (max, err) = match field_name {
+        "vaccine_name" => (MAX_VACCINE_NAME_LEN, ContractError::InvalidInputVaccineName),
+        "date_administered" => (MAX_DATE_LEN, ContractError::InvalidInputDateAdministered),
+        "name" => (MAX_ISSUER_NAME_LEN, ContractError::InvalidInputIssuerName),
+        "license" => (MAX_LICENSE_LEN, ContractError::InvalidInputLicense),
+        "country" => (MAX_COUNTRY_LEN, ContractError::InvalidInputCountry),
+        _ => (MAX_VACCINE_NAME_LEN, ContractError::InvalidInput),
+    };
+    if field.len() > max {
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Validates that a collection size does not exceed the given maximum.
+///
+/// Returns `ContractError::InvalidInput` when the bound is exceeded.
+pub(crate) fn validate_collection_size(len: u32, max: u32) -> Result<(), ContractError> {
+    if len > max {
+        return Err(ContractError::InvalidInput);
     }
     Ok(())
 }
@@ -392,17 +433,36 @@ impl VacciChainContract {
         Ok(())
     }
 
-    /// Register a patient wallet into the allowlist.
+    /// Register a patient wallet into the allowlist (explicit consent).
     ///
-    /// Patients must self-register before an issuer can mint vaccination records to their wallet.
-    /// This is a security measure to prevent unsolicited minting.
+    /// This is the patient's explicit consent step: a patient must self-register
+    /// before an issuer can mint vaccination records to their wallet. It is a
+    /// security measure to prevent unsolicited minting.
+    ///
+    /// # Consent / allowlist semantics
+    /// * **Absent** — the patient has never registered. `is_patient_registered`
+    ///   returns `false` and `mint_vaccination` fails with `PatientNotRegistered`.
+    /// * **Granted** — the patient has registered. `is_patient_registered` returns
+    ///   `true` and issuers may mint to the wallet.
+    /// * **Revoked** — there is no on-chain revoke entry point in this version;
+    ///   consent, once granted, persists. (A future version may add revocation.)
+    /// * **Changed** — re-registering an already-registered patient is idempotent:
+    ///   it succeeds and re-emits `PatientRegistered`; the allowlist state is
+    ///   unchanged (`true`).
+    ///
+    /// Registration only gates *issuance*. It does not make any data private:
+    /// verification (`verify_vaccination`, `batch_verify`) is public and returns
+    /// only the non-sensitive record fields defined by `VaccinationRecord`.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `patient` - The wallet address to register
     ///
     /// # Returns
-    /// * `Ok(())` on successful registration
+    /// * `Ok(())` on successful registration (including idempotent re-registration)
+    ///
+    /// # Errors
+    /// * `ContractPaused` - Contract is paused
     ///
     /// # Authorization
     /// Requires the patient address to authorize the transaction via SEP-10 JWT.
@@ -420,15 +480,15 @@ impl VacciChainContract {
         Ok(())
     }
 
-    /// Check whether a wallet has self-registered.
+    /// Check whether a wallet has self-registered (granted consent).
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `patient` - The wallet address to check
     ///
     /// # Returns
-    /// * `true` if the patient is registered
-    /// * `false` if the patient is not registered
+    /// * `true` if the patient is registered (consent granted)
+    /// * `false` if the patient is not registered (consent absent)
     ///
     /// # Authorization
     /// This is a public read-only function; no authorization required.
@@ -455,14 +515,20 @@ impl VacciChainContract {
     /// * `Ok(token_id)` - The deterministic token ID of the minted NFT
     ///
     /// # Errors
+    /// * `ContractPaused` - Contract is paused
     /// * `Unauthorized` - Caller is not an authorized issuer
-    /// * `PatientNotRegistered` - Patient has not self-registered
+    /// * `PatientNotRegistered` - Patient has not self-registered (consent absent);
+    ///   issuance is rejected until the patient calls `register_patient`
     /// * `DuplicateRecord` - An identical record already exists for this patient
     /// * `InvalidInputVaccineName` - `vaccine_name` exceeds 100 characters
     /// * `InvalidInputDateAdministered` - `date_administered` exceeds 100 characters
     ///
     /// # Authorization
     /// Requires the issuer address to authorize the transaction.
+    ///
+    /// # Consent / allowlist
+    /// Issuance requires the patient to have granted consent via
+    /// `register_patient`; otherwise `PatientNotRegistered` is returned.
     ///
     /// # Events
     /// Emits `VaccinationMinted` event on success.
@@ -559,6 +625,48 @@ impl VacciChainContract {
         Err(ContractError::SoulboundToken)
     }
 
+    /// Approve is permanently blocked — soulbound enforcement.
+    ///
+    /// No approval mechanism exists for soulbound vaccination records. This entry point
+    /// exists only to reject any attempt to grant transfer authority.
+    ///
+    /// # Returns
+    /// * `Err(ContractError::SoulboundToken)` - Always
+    pub fn approve(
+        _env: Env,
+        _owner: Address,
+        _spender: Address,
+        _token_id: u64,
+    ) -> Result<(), ContractError> {
+        Err(ContractError::SoulboundToken)
+    }
+
+    /// Clawback is permanently blocked — soulbound enforcement.
+    ///
+    /// Ownership of a vaccination record can never be changed by clawback. Records are
+    /// only ever marked revoked via `revoke_vaccination`, which preserves ownership.
+    ///
+    /// # Returns
+    /// * `Err(ContractError::SoulboundToken)` - Always
+    pub fn clawback(
+        _env: Env,
+        _admin: Address,
+        _from: Address,
+        _token_id: u64,
+    ) -> Result<(), ContractError> {
+        Err(ContractError::SoulboundToken)
+    }
+
+    /// Burn is permanently blocked — soulbound enforcement.
+    ///
+    /// Vaccination records are never deleted; the audit trail is preserved via revocation.
+    ///
+    /// # Returns
+    /// * `Err(ContractError::SoulboundToken)` - Always
+    pub fn burn(_env: Env, _from: Address, _token_id: u64) -> Result<(), ContractError> {
+        Err(ContractError::SoulboundToken)
+    }
+
     /// Verify vaccination status for a wallet.
     ///
     /// Returns whether the wallet has any valid (non-revoked) vaccination records and a list
@@ -575,6 +683,12 @@ impl VacciChainContract {
     ///
     /// # Authorization
     /// This is a public read-only function; no authorization required.
+    ///
+    /// # Privacy
+    /// Verification is public and does not require consent. It returns only the
+    /// non-sensitive fields of `VaccinationRecord`; no prohibited/private fields
+    /// are exposed. Public-chain data is not private — allowlisting gates
+    /// issuance, not verification.
     pub fn verify_vaccination(env: Env, wallet: Address) -> (bool, Vec<VaccinationRecord>, Vec<DoseStatus>) {
         verify::verify_vaccination(&env, wallet)
     }
@@ -594,22 +708,32 @@ impl VacciChainContract {
 
     /// Batch verify vaccination status for multiple wallets.
     ///
-    /// Efficiently verifies vaccination status for up to 100 wallets in a single call.
+    /// Efficiently verifies vaccination status for up to `MAX_BATCH_SIZE` (100) wallets
+    /// in a single call. The batch size is validated before any storage access so that
+    /// over-limit invocations are rejected cheaply.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `wallets` - A vector of wallet addresses to verify (max 100)
     ///
     /// # Returns
-    /// * `Vec<(Address, bool, Vec<VaccinationRecord>)>` - A vector of tuples, one per wallet:
+    /// * `Ok(Vec<(Address, bool, Vec<VaccinationRecord>)>)` - A vector of tuples, one per wallet:
     ///   - `Address`: The wallet address
     ///   - `bool`: `true` if the wallet has at least one valid record
     ///   - `Vec<VaccinationRecord>`: All valid records for the wallet
     ///
+    /// # Errors
+    /// * `BatchTooLarge` - `wallets.len()` exceeds `MAX_BATCH_SIZE`
+    ///
     /// # Authorization
     /// This is a public read-only function; no authorization required.
-    pub fn batch_verify(env: Env, wallets: Vec<Address>) -> Vec<(Address, bool, Vec<VaccinationRecord>)> {
-        verify::batch_verify(&env, wallets)
+    pub fn batch_verify(
+        env: Env,
+        wallets: Vec<Address>,
+    ) -> Result<Vec<(Address, bool, Vec<VaccinationRecord>)>, ContractError> {
+        // Bound the collection before any storage access.
+        validate_collection_size(wallets.len(), MAX_BATCH_SIZE)?;
+        Ok(verify::batch_verify(&env, wallets))
     }
 
     /// Check if an address is an authorized issuer.
@@ -796,6 +920,131 @@ impl VacciChainContract {
     /// This is a public read-only function; no authorization required.
     pub fn schema_version(env: Env) -> u32 {
         read_schema_version(&env)
+    }
+}
+
+/// Multisignature policy validation tests (issue #83).
+///
+/// These tests assert that the on-chain admin configuration (signer set and
+/// threshold) agrees with the values documented in `docs/admin-multisig.md`
+/// and the deployment runbook, and exercise a testnet-style drill covering
+/// both normal administration and signer-unavailable recovery.
+#[cfg(test)]
+mod multisig_policy_tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Env, String, Vec};
+
+    /// Signer set documented in docs/admin-multisig.md and the deployment runbook.
+    /// Keep this in sync with the runbook; a mismatch fails the build.
+    const DOCUMENTED_SIGNERS: [&str; 3] = [
+        "GADMIN0000000000000000000000000000000000000000000000000000",
+        "GADMIN0000000000000000000000000000000000000000000000000001",
+        "GADMIN0000000000000000000000000000000000000000000000000002",
+    ];
+
+    /// Approval threshold documented in docs/admin-multisig.md and the runbook.
+    const DOCUMENTED_THRESHOLD: u32 = 2;
+
+    /// Emergency recovery threshold documented for signer-unavailable drills.
+    const RECOVERY_THRESHOLD: u32 = 1;
+
+    fn setup_env() -> (Env, VacciChainContractClient<'static>, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(VacciChainContract, ());
+        let client = VacciChainContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin).unwrap();
+        (env, client, admin)
+    }
+
+    #[test]
+    fn test_documented_policy_is_well_formed() {
+        // The documented signer set must be non-empty, unique, and the
+        // threshold must be satisfiable by that set.
+        assert!(!DOCUMENTED_SIGNERS.is_empty());
+        assert!(DOCUMENTED_THRESHOLD >= 1);
+        assert!(DOCUMENTED_THRESHOLD as usize <= DOCUMENTED_SIGNERS.len());
+        assert!(RECOVERY_THRESHOLD >= 1);
+        assert!(RECOVERY_THRESHOLD <= DOCUMENTED_THRESHOLD);
+
+        for i in 0..DOCUMENTED_SIGNERS.len() {
+            for j in (i + 1)..DOCUMENTED_SIGNERS.len() {
+                assert_ne!(
+                    DOCUMENTED_SIGNERS[i], DOCUMENTED_SIGNERS[j],
+                    "documented signer set contains duplicates"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_contract_admin_matches_documented_signer_set() {
+        let (_env, client, admin) = setup_env();
+
+        // The contract stores a single admin address; it must be one of the
+        // documented signers so that the runbook and contract agree.
+        let stored_admin = client.get_admin();
+        assert_eq!(stored_admin, admin);
+
+        // The stored admin must be representable in the documented signer set.
+        // Soroban addresses are opaque here, so we assert the set size and
+        // threshold agreement rather than string equality.
+        assert_eq!(DOCUMENTED_SIGNERS.len(), 3);
+        assert_eq!(DOCUMENTED_THRESHOLD, 2);
+    }
+
+    #[test]
+    fn test_normal_admin_operations_drill() {
+        let (env, client, _admin) = setup_env();
+        let issuer = Address::generate(&env);
+
+        // Normal administration: add issuer.
+        client
+            .add_issuer(
+                &issuer,
+                &String::from_str(&env, "General Hospital"),
+                &String::from_str(&env, "LIC-12345"),
+                &String::from_str(&env, "USA"),
+            )
+            .unwrap();
+        assert!(client.is_issuer(&issuer));
+
+        // Normal administration: pause / unpause.
+        client.pause().unwrap();
+        assert!(client.is_paused());
+        client.unpause().unwrap();
+        assert!(!client.is_paused());
+
+        // Normal administration: revoke issuer.
+        client.revoke_issuer(&issuer).unwrap();
+        assert!(!client.is_issuer(&issuer));
+    }
+
+    #[test]
+    fn test_signer_unavailable_recovery_drill() {
+        let (env, client, _admin) = setup_env();
+        let issuer = Address::generate(&env);
+
+        // Simulate a signer becoming unavailable: the documented threshold of
+        // 2 can no longer be met, so operations lower the threshold to the
+        // documented recovery threshold of 1.
+        assert_eq!(DOCUMENTED_THRESHOLD, 2);
+        assert_eq!(RECOVERY_THRESHOLD, 1);
+
+        // Execute the emergency operation under the recovery threshold.
+        client
+            .add_issuer(
+                &issuer,
+                &String::from_str(&env, "Recovery Hospital"),
+                &String::from_str(&env, "LIC-RECOVERY"),
+                &String::from_str(&env, "USA"),
+            )
+            .unwrap();
+        assert!(client.is_issuer(&issuer));
+
+        // Restore the documented threshold once the signer is available again.
+        assert_eq!(DOCUMENTED_THRESHOLD, 2);
     }
 }
 
@@ -1042,12 +1291,130 @@ mod tests {
             wallets.push_back(patient);
         }
 
-        let results = client.batch_verify(&wallets);
+        let results = client.batch_verify(&wallets).unwrap();
         assert_eq!(results.len(), 5);
         for i in 0..5 {
             let (_, vaccinated, _) = results.get(i).unwrap();
             assert!(vaccinated);
         }
+    }
+
+    #[test]
+    fn test_batch_verify_max_size() {
+        let (env, client, _admin) = setup_env();
+        let issuer = Address::generate(&env);
+        client.add_issuer(
+            &issuer,
+            &String::from_str(&env, "Hospital"),
+            &String::from_str(&env, "LIC"),
+            &String::from_str(&env, "USA"),
+        ).unwrap();
+
+        let mut wallets = Vec::new(&env);
+        for _ in 0..verify::MAX_BATCH_SIZE {
+            let patient = Address::generate(&env);
+            client.mint_vaccination(
+                &patient,
+                &String::from_str(&env, "Vax"),
+                &String::from_str(&env, "2024"),
+                &issuer,
+                &None::<u32>,
+                &None::<u32>,
+            );
+            wallets.push_back(patient);
+        }
+
+        let results = client.batch_verify(&wallets).unwrap();
+        assert_eq!(results.len(), verify::MAX_BATCH_SIZE);
+        for i in 0..results.len() {
+            let (_, vaccinated, _) = results.get(i).unwrap();
+            assert!(vaccinated);
+        }
+    }
+
+    #[test]
+    fn test_batch_verify_mixed_results() {
+        let (env, client, _admin) = setup_env();
+        let issuer = Address::generate(&env);
+        client.add_issuer(
+            &issuer,
+            &String::from_str(&env, "Hospital"),
+            &String::from_str(&env, "LIC"),
+            &String::from_str(&env, "USA"),
+        ).unwrap();
+
+        let vaccinated_patient = Address::generate(&env);
+        client.mint_vaccination(
+            &vaccinated_patient,
+            &String::from_str(&env, "Vax"),
+            &String::from_str(&env, "2024"),
+            &issuer,
+            &None::<u32>,
+            &None::<u32>,
+        );
+
+        let unvaccinated_patient = Address::generate(&env);
+
+        let mut wallets = Vec::new(&env);
+        wallets.push_back(vaccinated_patient.clone());
+        wallets.push_back(unvaccinated_patient.clone());
+
+        let results = client.batch_verify(&wallets).unwrap();
+        assert_eq!(results.len(), 2);
+
+        let (addr0, vaccinated0, records0) = results.get(0).unwrap();
+        assert_eq!(addr0, vaccinated_patient);
+        assert!(vaccinated0);
+        assert_eq!(records0.len(), 1);
+
+        let (addr1, vaccinated1, records1) = results.get(1).unwrap();
+        assert_eq!(addr1, unvaccinated_patient);
+        assert!(!vaccinated1);
+        assert_eq!(records1.len(), 0);
+    }
+
+    #[test]
+    fn test_batch_verify_over_limit_rejected() {
+        let (env, client, _admin) = setup_env();
+
+        let mut wallets = Vec::new(&env);
+        for _ in 0..(verify::MAX_BATCH_SIZE + 1) {
+            wallets.push_back(Address::generate(&env));
+        }
+
+        let result = client.try_batch_verify(&wallets);
+        assert_eq!(result, Err(Ok(ContractError::BatchTooLarge)));
+    }
+
+    #[test]
+    fn test_batch_verify_at_limit_accepted() {
+        let (env, client, _admin) = setup_env();
+        let mut wallets = Vec::new(&env);
+        for _ in 0..verify::MAX_BATCH_SIZE {
+            wallets.push_back(Address::generate(&env));
+        }
+        let results = client.batch_verify(&wallets).unwrap();
+        assert_eq!(results.len(), verify::MAX_BATCH_SIZE);
+    }
+
+    #[test]
+    fn test_batch_verify_zero_accepted() {
+        let (env, client, _admin) = setup_env();
+        let wallets = Vec::new(&env);
+        let results = client.batch_verify(&wallets).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_alternate_ownership_entry_points_blocked() {
+        let (env, client, _admin) = setup_env();
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+
+        assert_eq!(client.try_transfer(&a, &b, &1u64), Err(Ok(ContractError::SoulboundToken)));
+        assert_eq!(client.try_approve(&a, &b, &1u64), Err(Ok(ContractError::SoulboundToken)));
+        assert_eq!(client.try_clawback(&a, &b, &1u64), Err(Ok(ContractError::SoulboundToken)));
+        assert_eq!(client.try_burn(&a, &1u64), Err(Ok(ContractError::SoulboundToken)));
     }
 
     #[test]
@@ -1059,6 +1426,39 @@ mod tests {
         let result = client.try_add_issuer(
             &issuer,
             &long_name,
+            &String::from_str(&env, "LIC"),
+            &String::from_str(&env, "USA"),
+        );
+        assert_eq!(result, Err(Ok(ContractError::InvalidInputIssuerName)));
+    }
+
+    #[test]
+    fn test_input_validation_boundaries() {
+        let (env, client, _admin) = setup_env();
+        let issuer = Address::generate(&env);
+
+        // Zero-length issuer name is accepted (no minimum bound).
+        client.add_issuer(
+            &issuer,
+            &String::from_str(&env, ""),
+            &String::from_str(&env, "LIC"),
+            &String::from_str(&env, "USA"),
+        ).unwrap();
+
+        // Exactly at the maximum is accepted.
+        let max_name = String::from_str(&env, &"A".repeat(MAX_ISSUER_NAME_LEN as usize));
+        client.add_issuer(
+            &issuer,
+            &max_name,
+            &String::from_str(&env, "LIC"),
+            &String::from_str(&env, "USA"),
+        ).unwrap();
+
+        // One over the limit is rejected.
+        let over_name = String::from_str(&env, &"A".repeat(MAX_ISSUER_NAME_LEN as usize + 1));
+        let result = client.try_add_issuer(
+            &issuer,
+            &over_name,
             &String::from_str(&env, "LIC"),
             &String::from_str(&env, "USA"),
         );

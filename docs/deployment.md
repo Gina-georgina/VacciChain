@@ -26,7 +26,14 @@ This guide covers deploying VacciChain to a production environment on AWS ECS Fa
 9. [Verifying a Successful Deployment](#9-verifying-a-successful-deployment)
 10. [Monitoring and Alerting](#10-monitoring-and-alerting)
 11. [CloudWatch Logs](#11-cloudwatch-logs)
-12. [Rollback Procedure](#12-rollback-procedure)
+12. [Persistence Architecture](#12-persistence-architecture)
+13. [Proxy Headers and Client IP Derivation](#13-proxy-headers-and-client-ip-derivation)
+14. [Audit Log Rotation, Retention, and Integrity](#14-audit-log-rotation-retention-and-integrity)
+15. [Rollback Procedure](#15-rollback-procedure)
+16. [Base Image Pinning and Update Cadence](#16-base-image-pinning-and-update-cadence)
+17. [Terraform Dependency Scanning](#17-terraform-dependency-scanning)
+18. [Canary / Blue-Green Deployment and Rollback Drills](#18-canary--blue-green-deployment-and-rollback-drills)
+19. [Image and Artifact Retention Policy](#19-image-and-artifact-retention-policy)
 
 ---
 
@@ -38,9 +45,12 @@ Complete these steps before touching any infrastructure.
 - [ ] All tests passing: `npm test` (backend), `cargo test` (contracts), `pytest` (python-service)
 - [ ] Staging smoke tests passing (`npm run smoke:staging` against staging) — production promotion is blocked otherwise
 - [ ] Dependency scans clean: `npm audit`, `cargo audit`, `pip audit`
+- [ ] Terraform provider/module scan clean (see [section 14](#14-terraform-dependency-scanning))
+- [ ] Base images pinned to controlled tags or digests (see [section 13](#13-base-image-pinning-and-update-cadence))
 - [ ] Domain DNS configured and propagated
 - [ ] AWS account limits reviewed (ECS tasks, ECR storage, Secrets Manager)
 - [ ] Mainnet launch checklist reviewed: [`docs/mainnet-launch.md`](./mainnet-launch.md)
+- [ ] Multisig signer set and threshold agreed with key custodians and documented in [`docs/admin-multisig.md`](./admin-multisig.md) (see [section 13](#13-multisig-admin-configuration))
 
 ---
 
@@ -88,7 +98,9 @@ The compiled WASM artifact is written to:
 
 ### 3.2 Deploy to Mainnet
 
-The `Makefile` targets `testnet` by default. For mainnet, pass the network flags explicitly:
+The `Makefile` targets `testnet` by default. For mainnet, pass the network flags explicitly.
+
+> **The deployment command requires an explicit network.** Deployments without an explicit `--network` (and the matching `--network-passphrase` / `--rpc-url`) are rejected by the deployment tooling — there is no implicit default. This prevents accidentally deploying to the wrong Stellar network.
 
 ```bash
 cd contracts
@@ -102,6 +114,25 @@ stellar contract deploy \
 ```
 
 The command prints the contract ID (a 56-character address starting with `C`). **Record this value** — it becomes `VACCINATIONS_CONTRACT_ID`.
+
+#### Network-specific configuration validation
+
+Before any deploy or invoke, the tooling validates that the network name, passphrase, RPC URL, and Horizon URL are a consistent set for the selected network. A mismatch (for example `--network mainnet` combined with the testnet passphrase or a testnet RPC URL) aborts the command before a transaction is submitted.
+
+| Network | `STELLAR_NETWORK` | `STELLAR_NETWORK_PASSPHRASE` | `SOROBAN_RPC_URL` | `HORIZON_URL` |
+|---|---|---|---|---|
+| `mainnet` | `mainnet` | `Public Global Stellar Network ; September 2015` | `https://mainnet.sorobanrpc.com` | `https://horizon.stellar.org` |
+| `testnet` | `testnet` | `Test SDF Network ; September 2015` | `https://soroban-testnet.stellar.org` | `https://horizon-testnet.stellar.org` |
+
+The same validation runs at backend startup: if `STELLAR_NETWORK` does not match `STELLAR_NETWORK_PASSPHRASE` and the configured RPC/Horizon URLs, the service refuses to start. See [Section 5](#5-environment-variable-configuration) for the production values.
+
+#### Record the artifact hash
+
+Compute and record the SHA-256 hash of the WASM artifact you are about to deploy. You will need it for the post-deploy smoke test in [Section 9.7](#97-contract-id-and-artifact-hash-smoke-test):
+
+```bash
+sha256sum target/wasm32-unknown-unknown/release/vaccichain.wasm
+```
 
 ### 3.3 Initialize the Contract
 
@@ -318,13 +349,19 @@ These are safe to set directly in the ECS task definition (not in Secrets Manage
 | `PORT` | `4000` | Backend port |
 | `ALLOWED_ORIGINS` | `https://app.yourdomain.com` | Your production frontend URL |
 | `AUDIT_LOG_PATH` | `/data/audit.log` | Persistent EFS mount |
+| `AUDIT_LOG_MAX_BYTES` | `104857600` | Rotate the audit log at 100 MiB |
+| `AUDIT_LOG_RETENTION_DAYS` | `90` | Rotated segments older than this are purged |
+| `AUDIT_LOG_HASH_ALGORITHM` | `sha256` | Hash chain algorithm for tamper evidence |
 | `DATABASE_PATH` | `/data/vaccichain.db` | Persistent EFS mount |
+| `DATABASE_BUSY_TIMEOUT_MS` | `5000` | SQLite lock wait before failing a write |
+| `DATABASE_WAL_ENABLED` | `true` | Write-ahead logging for concurrent readers |
+| `TRUST_PROXY` | `1` | Number of trusted proxy hops (ALB only) |
 | `BACKEND_URL` | `http://backend:4000` | Internal service URL |
 | `ANALYTICS_API_KEY` | *(set in Secrets Manager)* | Generate with `openssl rand -hex 32` |
 | `RATE_LIMIT_SEP10` | `10` | Adjust based on expected traffic |
 | `RATE_LIMIT_VERIFY` | `60` | Adjust based on expected traffic |
 | `SOROBAN_FEE` | `1000` | Higher fee for mainnet priority |
-| `MULTISIG_THRESHOLD` | `2` | Require 2 approvals for admin ops |
+| `MULTISIG_THRESHOLD` | `2` | Require 2 approvals for admin ops — must equal the on-chain threshold documented in [`docs/admin-multisig.md`](./admin-multisig.md) |
 
 ### 5.3 Production Task Definition
 
@@ -363,6 +400,16 @@ aws ecr get-login-password --region us-east-1 | \
 ### 6.2 Build and Tag Images
 
 Use a versioned tag (e.g., the Git SHA or a semantic version) — never deploy `latest` to production.
+
+Base images in the Dockerfiles must follow the pinning policy in [section 13](#13-base-image-pinning-and-update-cadence). Record the resulting image digest after pushing — the digest is the immutable reference used for deployment and for cleanup protection:
+
+```bash
+aws ecr describe-images \
+  --repository-name vaccichain-backend \
+  --image-ids imageTag=$TAG \
+  --query 'imageDetails[0].imageDigest' \
+  --output text
+```
 
 ```bash
 export TAG=$(git rev-parse --short HEAD)
@@ -549,14 +596,47 @@ aws ecs describe-services \
   --services vaccichain-backend \
   --query 'services[0].{running:runningCount,desired:desiredCount,status:status}'
 
-# Backend health endpoint
-curl -sf https://app.yourdomain.com/health
+# Liveness probe — process-only, no dependency checks
+curl -sf https://app.yourdomain.com/health/live
 # Expected: {"status":"ok"}
+
+# Readiness probe — verifies database and required RPC state
+curl -sf https://app.yourdomain.com/health/ready
+# Expected: {"status":"ready","checks":{"database":"ok","rpc":"ok"}}
 
 # Swagger UI accessible
 curl -sf -o /dev/null -w "%{http_code}" https://app.yourdomain.com/docs
 # Expected: 200
 ```
+
+#### Liveness vs. Readiness Semantics
+
+The backend exposes two distinct health endpoints. They exist to keep orchestration from restarting healthy processes during transient dependency outages.
+
+| Endpoint | Purpose | Dependencies checked | Failure meaning |
+|---|---|---|---|
+| `GET /health/live` | Liveness — is the process alive and able to serve HTTP? | **None.** No database, no RPC, no external calls. | The process is wedged or crashed and should be restarted. |
+| `GET /health/ready` | Readiness — can this instance serve real traffic right now? | **Database** (SQLite at `DATABASE_PATH`) and **required RPC** (`SOROBAN_RPC_URL` reachability). | The instance is temporarily unable to serve traffic; it should be removed from rotation but **not** restarted. |
+
+**Dependency expectations:**
+
+- **Liveness (`/health/live`)** must never depend on the database or Stellar RPC. A temporary RPC or database outage must not cause liveness failures, otherwise orchestrators will crash-loop otherwise-healthy tasks.
+- **Readiness (`/health/ready`)** returns non-200 when the database is unreachable or the required Soroban RPC endpoint is down. It returns 200 only when both are healthy. Readiness failures are expected during dependency outages and should resolve automatically once the dependency recovers.
+
+**Response hygiene:** health responses never include secrets, connection strings, credentials, or raw upstream error payloads. They report only a coarse status per dependency (`ok` / `unavailable`) so the endpoints are safe to expose to load balancers and monitoring.
+
+#### Orchestration Guidance
+
+Map each probe to exactly one endpoint:
+
+| Orchestrator mechanism | Endpoint | Action on failure |
+|---|---|---|
+| ALB target group health check | `/health/ready` | Deregister the target from rotation (no task restart) |
+| ECS container health check | `/health/live` | ECS replaces the unhealthy task |
+| ECS deployment circuit breaker | `/health/ready` (via ALB) | Roll back the deployment if new tasks never become ready |
+| External uptime monitoring | `/health/ready` | Page on sustained failure |
+
+Do **not** point the ALB target group at `/health/live` — that would keep routing traffic to instances whose database or RPC dependency is down. Do **not** point the ECS container health check at `/health/ready` — that would restart tasks during temporary RPC outages. When creating the backend service (step 7.2), set the target group health check path to `/health/ready` and the container health check command to probe `/health/live`.
 
 ### 9.2 Stellar Connectivity
 
@@ -610,6 +690,31 @@ The automated staging gate in [Section 9.0](#90-staging-smoke-test-gate) must pa
 3. As an authorized issuer, issue a test vaccination record
 4. Navigate to the patient dashboard and confirm the record appears
 5. Use the public verify endpoint to confirm the record is on-chain
+
+### 9.7 Multisig Admin Configuration Verification
+
+Confirm the on-chain admin signer set and threshold match the values documented in [`docs/admin-multisig.md`](./admin-multisig.md). This is the post-deploy check required by issue #83.
+
+```bash
+# Read the on-chain admin configuration (signers + threshold)
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet \
+  --network-passphrase "Public Global Stellar Network ; September 2015" \
+  --rpc-url https://mainnet.sorobanrpc.com \
+  -- get_admin_config
+```
+
+Verify all of the following before signing off:
+
+- [ ] Every signer returned on-chain is listed in the documented signer set, and no extra signers are present
+- [ ] The on-chain threshold equals `MULTISIG_THRESHOLD` in the task definition and the documented threshold
+- [ ] Each signer's key custody matches the documented custodian (hardware wallet / air-gapped machine)
+- [ ] The documented approval procedure (who signs, in what order, where approvals are recorded) is current
+- [ ] A testnet drill has demonstrated both normal administration and signer-unavailable recovery (see [`docs/admin-multisig.md`](./admin-multisig.md))
+
+If any value differs, **stop** and reconcile the runbook and contract configuration before proceeding.
 
 ---
 
@@ -733,9 +838,129 @@ The ECS task execution role (`ecsTaskExecutionRole`) is granted `logs:CreateLogS
 
 ---
 
-## 12. Rollback Procedure
+## 12. Persistence Architecture
 
-### 11.1 Rolling Back a Service
+### 12.1 Selected Architecture
+
+The event index remains on **SQLite in WAL mode on the shared EFS mount**, with a single writer per database file enforced by the backend's write serialization. This decision was made after a load and failure analysis comparing the current storage with a multi-writer database option (PostgreSQL on RDS).
+
+**Why SQLite was retained:**
+
+- The index is append-heavy with a small, bounded working set; measured write throughput at 2 ECS tasks stays well below the SQLite ceiling.
+- EFS provides durable, shared storage with automatic replication within the region; the database file survives task replacement and AZ failover.
+- Operational simplicity: no additional managed database to patch, monitor, or pay for at current volume.
+
+**Known limits and the trigger to revisit:**
+
+- SQLite serializes writers. If sustained write latency exceeds 50 ms p95 or write contention errors (`SQLITE_BUSY`) appear in logs, the index must move to a multi-writer database.
+- The migration path to PostgreSQL is documented in [`docs/persistence-migration.md`](./persistence-migration.md); the backend's data access layer is abstracted so the swap does not change API behavior.
+
+### 12.2 Locking Behavior
+
+- WAL mode is enabled (`DATABASE_WAL_ENABLED=true`) so readers are never blocked by the writer.
+- Writers acquire the database lock with a bounded wait (`DATABASE_BUSY_TIMEOUT_MS`); on timeout the request fails with a retryable error rather than hanging.
+- Only one backend task performs index writes at a time; additional tasks serve reads. Scaling beyond one writer requires the PostgreSQL migration.
+
+### 12.3 Backup and Restore
+
+```bash
+# Consistent online backup (safe while the service is running)
+sqlite3 /data/vaccichain.db ".backup '/data/backups/vaccichain-$(date +%Y%m%d%H%M%S).db'"
+
+# Verify integrity of a backup before relying on it
+sqlite3 /data/backups/<BACKUP_FILE> "PRAGMA integrity_check;"
+# Expected: ok
+```
+
+Backups are written to `/data/backups` on EFS and copied to S3 on a daily schedule. Restore procedure: stop the backend service, replace `/data/vaccichain.db` with the chosen backup, run `PRAGMA integrity_check`, then restart the service.
+
+### 12.4 Failover
+
+- EFS is mounted in multiple AZs; if a task or AZ fails, ECS reschedules the task and it reattaches to the same database file.
+- Because writes are serialized, a failed writer task does not leave the database in a partially written state — WAL recovery on next open rolls back any incomplete transaction.
+- After any failover, confirm recovery succeeded:
+
+```bash
+aws logs tail /ecs/vaccichain-production/backend --filter-pattern "database" --since 10m
+# Expected: no "database is locked" or "disk I/O error" entries
+```
+
+### 12.5 Migration
+
+Schema migrations run automatically at backend startup and are idempotent. Before deploying a release that includes a migration:
+
+1. Take an online backup (section 12.3) and verify its integrity.
+2. Deploy to staging and confirm the migration completes and the smoke test passes.
+3. Deploy to production; watch logs for migration errors during the first 10 minutes.
+
+If a migration fails, roll back the service to the previous task definition revision (section 15.1) and restore the pre-migration backup.
+
+---
+
+## 13. Proxy Headers and Client IP Derivation
+
+The backend runs behind an Application Load Balancer. Express must trust exactly the proxies in front of it so that client IPs used for rate limiting and audit attribution cannot be spoofed by a caller-supplied `X-Forwarded-For` header.
+
+### 13.1 Trust-Proxy Configuration
+
+- Set `TRUST_PROXY=1` in the production task definition. This trusts exactly one hop — the ALB — and ignores any additional `X-Forwarded-For` entries supplied by the client.
+- Do **not** set `TRUST_PROXY=true` (trust all proxies) in production; that allows clients to forge their address.
+- If a CDN or WAF is added in front of the ALB, increment `TRUST_PROXY` to match the new hop count and update this document.
+
+### 13.2 Verification
+
+```bash
+# Direct request to the ALB: client IP should be the caller's address
+curl -sf https://app.yourdomain.com/health -H "X-Forwarded-For: 203.0.113.9"
+# The spoofed header must be ignored; logs should show the real source IP
+
+# Confirm the derived client IP in the audit log
+aws logs tail /ecs/vaccichain-production/backend --filter-pattern "clientIp" --since 5m
+```
+
+Integration tests in the backend suite cover both direct and proxied requests and assert the derived client identity matches the expected hop count.
+
+---
+
+## 14. Audit Log Rotation, Retention, and Integrity
+
+The backend writes an append-only NDJSON audit log to `AUDIT_LOG_PATH` on the EFS mount. Every mint, revoke, consent, and administrative change records the actor, request ID, action outcome, and timestamp.
+
+### 14.1 Rotation
+
+- The active log rotates when it reaches `AUDIT_LOG_MAX_BYTES`; the rotated segment is renamed with a timestamp suffix (e.g. `audit.log.20250101T000000Z`).
+- Rotation is performed under a lock so concurrent tasks never write to a segment being rotated.
+- A new active log is opened immediately; no audit events are dropped during rotation.
+
+### 14.2 Retention
+
+- Rotated segments older than `AUDIT_LOG_RETENTION_DAYS` are purged by the scheduled cleanup job.
+- Segments are also shipped to CloudWatch Logs and to S3 (with Object Lock) for long-term retention beyond the local window.
+- Retention changes require a documented review; do not shorten retention below the compliance minimum.
+
+### 14.3 Integrity Verification
+
+- Each log entry includes a hash of the previous entry, forming a hash chain. Any modification or deletion of an entry breaks the chain.
+- Verify a segment with the audit verification tool:
+
+```bash
+npm run audit:verify -- /data/audit.log
+# Expected: "chain intact" with the entry count
+```
+
+- Run verification after every rotation and as part of the daily backup job. A broken chain is a security incident — escalate immediately.
+
+### 14.4 Failure Handling
+
+- If the audit log cannot be written, the operation that requires auditing **fails closed**: the mint/revoke/consent/admin action is rejected rather than proceeding unaudited.
+- Write failures are logged to CloudWatch and trigger the `vaccichain-prod-audit-write-failure` alarm.
+- If the EFS mount is unavailable, the backend reports unhealthy on `/health` so ECS replaces the task rather than serving unaudited traffic.
+
+---
+
+## 15. Rollback Procedure
+
+### 15.1 Rolling Back a Service
 
 To revert to the previous image tag:
 
@@ -754,17 +979,19 @@ aws ecs update-service \
   --region us-east-1
 ```
 
-### 11.2 Rolling Back a Contract Deployment
+### 15.2 Rolling Back a Contract Deployment
 
 The Soroban contract supports upgrades via the `upgrade` function (admin-only). To revert:
 
 1. Build the previous WASM from the prior Git tag
-2. Upload the WASM to Stellar:
+2. Upload the WASM to Stellar (the network must be passed explicitly):
    ```bash
    stellar contract install \
      --wasm target/wasm32-unknown-unknown/release/vaccichain.wasm \
      --source <ADMIN_SECRET_KEY> \
-     --network mainnet
+     --network mainnet \
+     --network-passphrase "Public Global Stellar Network ; September 2015" \
+     --rpc-url https://mainnet.sorobanrpc.com
    ```
 3. Call `upgrade` with the previous WASM hash:
    ```bash
@@ -772,21 +999,215 @@ The Soroban contract supports upgrades via the `upgrade` function (admin-only). 
      --id <CONTRACT_ID> \
      --source <ADMIN_SECRET_KEY> \
      --network mainnet \
+     --network-passphrase "Public Global Stellar Network ; September 2015" \
+     --rpc-url https://mainnet.sorobanrpc.com \
      -- upgrade \
      --new_wasm_hash <PREVIOUS_WASM_HASH>
    ```
+4. Re-run the [contract ID and artifact hash smoke test](#97-contract-id-and-artifact-hash-smoke-test) to confirm the rollback landed on the expected network with the expected artifact.
 
 See [`docs/contract-upgrade.md`](./contract-upgrade.md) for the full upgrade and rollback process.
 
-### 11.3 Rollback Criteria
+### 15.3 Rollback Criteria
 
 Initiate a rollback if any of the following occur within 30 minutes of deployment:
 
-- `GET /health` returns non-200 for more than 2 minutes
+- `GET /health/ready` returns non-200 for more than 2 minutes (after dependency recovery has been ruled out)
+- `GET /health/live` returns non-200 (indicates a wedged or crashed process)
 - 5xx error rate exceeds 1% of requests
 - ECS tasks are crash-looping (more than 3 restarts)
 - Contract calls are failing with unexpected errors
 - Audit log shows unauthorized access attempts
+
+For canary/blue-green rollback and the rollback drill procedure, see [section 18](#18-canary--blue-green-deployment-and-rollback-drills).
+
+---
+
+## 16. Base Image Pinning and Update Cadence
+
+Production images must be built from controlled base images so that every build is reproducible and auditable.
+
+### 16.1 Pinning Rules
+
+- **Production Dockerfiles** (`backend/Dockerfile`, `frontend/Dockerfile`, `python-service/Dockerfile`) must reference base images by **digest** (`FROM node:20.11.1-bookworm-slim@sha256:<digest>`) or, at minimum, by a fully qualified version tag — never `latest`, `stable`, or an unversioned major tag.
+- Digest pinning is preferred for production; the human-readable tag is kept alongside the digest for readability.
+- Base image changes are made only through automated dependency PRs (Renovate) or an explicitly reviewed manual PR.
+- The pinned digest is recorded in the PR description when it changes, so the change is traceable in the audit trail.
+
+### 16.2 Update Cadence
+
+| Update type | Cadence | Merge policy |
+|---|---|---|
+| Digest-only refresh (same tag) | Weekly (Renovate schedule) | Auto-merge once CI is green |
+| Patch version bump (e.g. `20.11.1` → `20.11.2`) | Weekly | Auto-merge once CI is green |
+| Minor version bump (e.g. `20.x` → `22.x`) | As released | Manual review required |
+| Major version bump (e.g. `20` → `22`) | As released | Manual review + staging soak required |
+
+Renovate opens base-image PRs on a weekly schedule. Digest and patch updates auto-merge after CI passes; minor and major updates require a reviewer and a successful staging deployment before merging.
+
+### 16.3 Verifying Pins
+
+```bash
+# Fail if any Dockerfile uses an unpinned or floating base image
+grep -nE '^\s*FROM\s+\S+:(latest|stable)\b' backend/Dockerfile frontend/Dockerfile python-service/Dockerfile && exit 1 || true
+
+# Show current pins
+grep -nE '^\s*FROM\s+' backend/Dockerfile frontend/Dockerfile python-service/Dockerfile
+```
+
+---
+
+## 17. Terraform Dependency Scanning
+
+CI scans Terraform providers and modules for known vulnerabilities and policy violations. The scan runs on every pull request that touches `infra/` and on a nightly schedule.
+
+### 17.1 What Is Scanned
+
+- Terraform **providers** locked in `.terraform.lock.hcl` (via `terraform providers lock` and a vulnerability scanner such as `trivy config` / `tfsec`)
+- Terraform **modules** referenced in `infra/` (registry and git sources)
+- Terraform **configuration** for insecure defaults (public buckets, open security groups, unencrypted volumes)
+
+### 17.2 Security Policy
+
+| Severity | Action |
+|---|---|
+| `CRITICAL` | CI **fails**; merge blocked; fix or documented exception required |
+| `HIGH` | CI **fails**; merge blocked; fix or documented exception required |
+| `MEDIUM` | CI warns; tracked as a follow-up issue |
+| `LOW` | Reported only |
+
+Exceptions must be recorded in `infra/security-exceptions.md` with an owner and expiry date. Expired exceptions fail CI.
+
+### 17.3 Running the Scan Locally
+
+```bash
+cd infra/envs/production
+terraform init -backend=false
+terraform providers lock -platform=linux_amd64
+
+# Vulnerability and misconfiguration scan
+trivy config --severity HIGH,CRITICAL --exit-code 1 .
+```
+
+A non-zero exit code means the change violates the security policy and must not be merged.
+
+---
+
+## 18. Canary / Blue-Green Deployment and Rollback Drills
+
+Backend releases use a blue/green traffic switch with a canary stage so that a failing release can be rolled back without downtime.
+
+### 18.1 Deployment Flow
+
+1. **Deploy green** — register a new task definition revision and create/update the green target group with the new image digest. No production traffic is sent yet.
+2. **Wait for healthy targets** — the deployment blocks until the green target group reports all targets healthy and `/health` returns `200`.
+3. **Canary switch (10%)** — shift 10% of ALB traffic to green and observe for 10 minutes. Abort on any 5xx increase or failed health check.
+4. **Full switch (100%)** — shift remaining traffic to green, keep blue running for 30 minutes as the rollback target.
+5. **Retire blue** — after the soak window and passing smoke tests, scale blue down to zero.
+
+```bash
+# Example: shift 10% of traffic to the green target group
+aws elbv2 modify-listener \
+  --listener-arn $LISTENER_ARN \
+  --default-actions '[{
+    "Type": "forward",
+    "ForwardConfig": {
+      "TargetGroups": [
+        {"TargetGroupArn": "'"$BLUE_TG_ARN"'", "Weight": 90},
+        {"TargetGroupArn": "'"$GREEN_TG_ARN"'", "Weight": 10}
+      ]
+    }
+  }]'
+```
+
+The deployment fails (and does not switch traffic) if green targets do not become healthy within the configured grace period.
+
+### 18.2 Rollback
+
+If the canary or smoke checks fail, shift 100% of traffic back to blue and stop the green deployment:
+
+```bash
+aws elbv2 modify-listener \
+  --listener-arn $LISTENER_ARN \
+  --default-actions Type=forward,TargetGroupArn=$BLUE_TG_ARN
+
+aws ecs update-service \
+  --cluster vaccichain-prod \
+  --service vaccichain-backend \
+  --task-definition vaccichain-prod:<PREVIOUS_REVISION>
+```
+
+### 18.3 Rollback Drill
+
+The rollback path must be exercised at least once per quarter using a deliberately failing test release:
+
+1. Build a test image that fails its health check (e.g. returns `500` from `/health`).
+2. Deploy it through the normal pipeline to a staging (or production canary) target group.
+3. Confirm the deployment **does not** complete the traffic switch and that the canary is aborted.
+4. Confirm traffic returns to the previous (blue) target group and the service remains healthy.
+5. Record the drill date, outcome, and any issues in the release log.
+
+A drill that does not abort cleanly is treated as a release blocker until fixed.
+
+---
+
+## 19. Image and Artifact Retention Policy
+
+Retention keeps registries and workflow artifacts within cost limits while preserving release evidence.
+
+### 19.1 Retention Classes
+
+| Class | Examples | Retention |
+|---|---|---|
+| Disposable build outputs | PR/preview images, untagged layers, CI artifacts from non-release runs | 14 days |
+| Release candidates | Tagged images from `main` that were not promoted | 30 days |
+| Signed production releases | Images referenced by a production deployment, signed release artifacts, SBOMs, provenance attestations | Indefinite (never auto-deleted) |
+
+### 19.2 Cleanup Rules
+
+- ECR lifecycle policies delete untagged images after 14 days and non-release tagged images after 30 days.
+- GitHub Actions artifacts from non-release workflows expire after 14 days.
+- Signed production release artifacts (image digests, SBOMs, signatures, deployment records) are retained indefinitely as audit evidence.
+
+### 19.3 Protection of Deployed Images
+
+Automated cleanup **must not** delete:
+
+- The image digest currently deployed to any production ECS service
+- The previous revision kept as the rollback target
+- Any image referenced by a signed release record
+
+Before deleting, the cleanup job resolves the digests in use by production services and excludes them:
+
+```bash
+# Digests currently deployed in production — must be excluded from cleanup
+aws ecs describe-services \
+  --cluster vaccichain-prod \
+  --services vaccichain-backend \
+  --query 'services[0].taskDefinition' --output text | \
+  xargs -I{} aws ecs describe-task-definition --task-definition {} \
+  --query 'taskDefinition.containerDefinitions[].image' --output text
+```
+
+Cleanup jobs run in dry-run mode first and log every candidate for deletion; any candidate matching a protected digest is skipped and reported.
+
+---
+
+## 13. Multisig Admin Configuration
+
+On-chain admin operations are protected by a multisignature policy. The authoritative record of the signer set, threshold, key custody, and approval procedures lives in [`docs/admin-multisig.md`](./admin-multisig.md) (issue #83).
+
+**Deployment runbook and contract configuration must agree on:**
+
+- **Signer set** — the exact public keys authorized to approve admin operations, and the custodian responsible for each
+- **Threshold** — the minimum number of signatures required, which must match `MULTISIG_THRESHOLD` in the task definition (see [section 5.2](#52-non-secret-environment-variables))
+- **Approval procedure** — how approvals are requested, collected, and recorded for each admin operation
+
+Before deploying, confirm the documented signer set and threshold are current. After deploying, complete the verification in [section 9.7](#97-multisig-admin-configuration-verification).
+
+### 13.1 Signer-Unavailable Recovery
+
+If a signer key is lost or a custodian is unavailable, follow the recovery procedure in [`docs/admin-multisig.md`](./admin-multisig.md). Recovery must be rehearsed on testnet before mainnet launch, demonstrating both normal administration and signer-unavailable recovery.
 
 ---
 
@@ -798,8 +1219,10 @@ Initiate a rollback if any of the following occur within 30 minutes of deploymen
 - [TLS Setup](./tls-setup.md) — HTTPS and certificate configuration
 - [Mainnet Launch Checklist](./mainnet-launch.md) — Pre-launch sign-off checklist
 - [Contract Upgrade Guide](./contract-upgrade.md) — Upgrading the Soroban contract
+- [Persistence Migration](./persistence-migration.md) — Moving the event index to PostgreSQL
 - [Staging Setup](./staging-setup.md) — Staging environment reference
 - [Staging Smoke Tests](./staging-setup.md#smoke-tests) — Release-level smoke-test gate that blocks production promotion
+- [Infra Security Exceptions](../infra/security-exceptions.md) — Documented scan exceptions
 - [Stellar Documentation](https://developers.stellar.org/)
 - [AWS ECS Fargate](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html)
 - [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/)

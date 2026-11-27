@@ -5,8 +5,10 @@
  * Indexed event types: VaccinationMinted, IssuerAdded, IssuerRevoked
  */
 const StellarSdk = require('@stellar/stellar-sdk');
-const { upsertEvents, getLatestLedger } = require('./db');
+const { upsertEvents, getLatestLedger, checkDatabaseIntegrity } = require('./db');
+const { toIndexedMint } = require('../schemas/vaccinationRecord');
 const { invalidateCache } = require('../stellar/issuerCache');
+const { setGauge } = require('../metrics');
 const config = require('../config');
 
 
@@ -24,15 +26,29 @@ const RPC_BACKOFF_MAX_MS = Number.isFinite(config.SOROBAN_RPC_BACKOFF_MAX_MS)
   ? config.SOROBAN_RPC_BACKOFF_MAX_MS
   : 30_000;
 
-// Map Soroban symbol_short event topic names to our internal event_type strings
+// Map Soroban symbol_short event topic names to our internal event_type strings.
+// Versioned symbols (e.g. minted_v1, minted_v2) map to the same internal
+// event_type; the version is preserved in the payload as `schema_version`.
 const TOPIC_MAP = {
-  minted:  'VaccinationMinted',
-  iss_add: 'IssuerAdded',
-  iss_rev: 'IssuerRevoked',
+  minted:     'VaccinationMinted',
+  minted_v1:  'VaccinationMinted',
+  minted_v2:  'VaccinationMinted',
+  iss_add:    'IssuerAdded',
+  iss_add_v1: 'IssuerAdded',
+  iss_add_v2: 'IssuerAdded',
+  iss_rev:    'IssuerRevoked',
+  iss_rev_v1: 'IssuerRevoked',
+  iss_rev_v2: 'IssuerRevoked',
 };
 
-// Maximum number of events processed per batch before yielding to the event loop.
-const BATCH_SIZE = Number(process.env.INDEXER_BATCH_SIZE) || 50;
+// Default schema version for unversioned (legacy) topic symbols.
+const DEFAULT_SCHEMA_VERSION = 1;
+
+/** Extract the schema version encoded in a topic symbol, or the default. */
+function extractSchemaVersion(topicStr) {
+  const match = /_v(\d+)$/.exec(topicStr ?? '');
+  return match ? Number(match[1]) : DEFAULT_SCHEMA_VERSION;
+}
 
 let timer = null;
 let running = false;
@@ -40,23 +56,12 @@ let inFlight = null;
 let stopped = true;
 let lastCommittedLedger = null;
 
-// Observable job status snapshot for the polling job.
-const jobStatus = {
-  lastRunAt: null,
-  lastDurationMs: null,
-  lastGetEventsMs: null,
-  lastUpsertMs: null,
-  lastEventCount: 0,
-  lastBatchCount: 0,
-  lastError: null,
-  lastErrorAt: null,
-  runs: 0,
-  errors: 0,
-};
-
-function getJobStatus() {
-  return { ...jobStatus };
-}
+// Retry configuration for lock contention / transient DB failures.
+// Multiple backend tasks may poll concurrently; SQLite serialises writers, so
+// a contended write surfaces as SQLITE_BUSY. We retry with backoff instead of
+// dropping the batch (which would leave gaps in the index).
+const MAX_WRITE_RETRIES = Number(process.env.INDEXER_WRITE_RETRIES || 5);
+const BASE_RETRY_DELAY_MS = Number(process.env.INDEXER_RETRY_BASE_MS || 100);
 
 function getRpc() {
   return new StellarSdk.SorobanRpc.Server(SOROBAN_RPC_URL);
@@ -69,6 +74,57 @@ function yieldToEventLoop() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Persist a batch of events with retry-on-lock-contention.
+ * Returns true if the batch was written, false if it was abandoned.
+ */
+async function persistEventsWithRetry(events) {
+  for (let attempt = 0; attempt <= MAX_WRITE_RETRIES; attempt++) {
+    try {
+      upsertEvents(events);
+      return true;
+    } catch (err) {
+      const contention = isLockContentionError(err);
+      if (!contention || attempt === MAX_WRITE_RETRIES) {
+        if (process.env.NODE_ENV !== 'test') {
+          console.error(
+            `[indexer] Failed to persist ${events.length} event(s) after ${attempt + 1} attempt(s):`,
+            err.message
+          );
+        }
+        return false;
+      }
+      // Exponential backoff with jitter to de-synchronise competing writers.
+      const delay = BASE_RETRY_DELAY_MS * 2 ** attempt + Math.floor(Math.random() * BASE_RETRY_DELAY_MS);
+      if (process.env.NODE_ENV !== 'test') {
+        console.warn(
+          `[indexer] Lock contention writing events (attempt ${attempt + 1}/${MAX_WRITE_RETRIES}); retrying in ${delay}ms`
+        );
+      }
+      await sleep(delay);
+    }
+  }
+  return false;
+}
+
+/** Log the current schema/migration state so operators can detect drift after failover. */
+function logMigrationState() {
+  if (process.env.NODE_ENV === 'test') return;
+  try {
+    const state = getMigrationState();
+    console.log(
+      `[indexer] DB migration state: version=${state.version} applied=${state.applied} pending=${state.pending}`
+    );
+    if (state.pending > 0) {
+      console.warn(
+        `[indexer] ${state.pending} pending migration(s) detected — run migrations before scaling backend tasks`
+      );
+    }
+  } catch (err) {
+    console.error('[indexer] Unable to read migration state:', err.message);
+  }
 }
 
 /** Compute bounded exponential backoff delay for a given attempt (0-based). */
@@ -135,8 +191,12 @@ function parseEvent(raw) {
         ? Math.floor(new Date(raw.ledgerClosedAt).getTime() / 1000)
         : 0,
       contract_id: raw.contractId ?? CONTRACT_ID,
-      payload: raw.value ?? {},
+      payload: event_type === 'VaccinationMinted' ? toIndexedMint(raw.value) : (raw.value ?? {}),
     };
+
+    // Preserve the event schema version so indexers can distinguish payloads
+    // emitted before and after contract upgrades.
+    parsed.payload.schema_version = extractSchemaVersion(topicStr);
 
     // Extract issuer address from topics for IssuerAdded/Revoked events
     if (parsed.event_type === 'IssuerAdded' || parsed.event_type === 'IssuerRevoked') {
@@ -161,10 +221,39 @@ async function runPoll() {
     return;
   }
 
-  // Prevent overlapping runs from piling up on the event loop.
-  if (running) {
+  // Refuse to process new events if the database failed its integrity check.
+  // Never silently initialize an empty replacement database over a corrupt one.
+  const integrity = checkDatabaseIntegrity();
+  if (!integrity.ok) {
+    console.error(
+      '[indexer] OPERATOR ALERT: database integrity check failed — refusing to process events. ' +
+      'Investigate and repair the index database before restarting the poller. ' +
+      `Reason: ${integrity.reason}`
+    );
+    return;
+  }
+
+  const rpc = getRpc();
+  const startLedger = getCheckpoint() + 1;
+
+  let response;
+  try {
+    // Read-only call: safe to retry. The shared client applies bounded
+    // timeouts and a retry policy, and classifies exhausted failures.
+    response = await getEvents({
+      startLedger,
+      filters: [{ contractIds: [CONTRACT_ID] }],
+    });
+  } catch (err) {
+    // Do NOT advance the checkpoint on RPC failure — the next poll retries
+    // from the same startLedger so no ledger events are silently skipped.
     if (process.env.NODE_ENV !== 'test') {
-      console.warn('[indexer] Previous poll still running — skipping this tick');
+      const correlationId = err.correlationId || 'n/a';
+      const classification = err.classification || 'unknown';
+      console.error(
+        `[indexer] Poll error (classification=${classification}, correlationId=${correlationId}):`,
+        err.message,
+      );
     }
     return;
   }
@@ -179,52 +268,24 @@ async function runPoll() {
     const rpc = getRpc();
     const startLedger = getCheckpoint() + 1;
 
-    const getStart = Date.now();
-    let response;
-    try {
-      response = await fetchEventsWithRetry(rpc, {
-        startLedger,
-        filters: [{ contractIds: [CONTRACT_ID] }],
-      });
-    } catch (err) {
-      // Do NOT advance the checkpoint on RPC failure — the next poll retries
-      // from the same startLedger so no ledger events are silently skipped.
-      jobStatus.errors += 1;
-      jobStatus.lastError = err.message;
-      jobStatus.lastErrorAt = new Date().toISOString();
-      if (process.env.NODE_ENV !== 'test') {
-        console.error('[indexer] Poll error (checkpoint unchanged):', err.message);
-      }
+  // Record successful poll timestamp and latest indexed ledger for SLO alerting
+  // (poller lag / data freshness).
+  setGauge('indexer_last_successful_poll_timestamp_seconds', Math.floor(Date.now() / 1000));
+  setGauge('indexer_latest_indexed_ledger', getLatestLedger());
+
+  if (valid.length) {
+    const stored = await persistEventsWithRetry(valid);
+    if (!stored) {
+      // Do not advance past this batch: the next poll re-reads from the same
+      // startLedger so no events are lost when a write is abandoned.
       return;
     }
     jobStatus.lastGetEventsMs = Date.now() - getStart;
 
-    const rawEvents = response.events ?? [];
+    setGauge('indexer_latest_indexed_ledger', getLatestLedger());
 
-    // Validate and quarantine malformed payloads. Malformed events are dropped
-    // from persistence but the checkpoint is NOT advanced past them, so they are
-    // re-examined on the next poll rather than silently skipped.
-    const valid = [];
-    const seenIds = new Set();
-    let malformed = 0;
-    let maxLedger = startLedger - 1;
-
-    for (const raw of rawEvents) {
-      if (Number.isFinite(raw?.ledger) && raw.ledger > maxLedger) {
-        maxLedger = raw.ledger;
-      }
-      const parsed = parseEvent(raw);
-      if (!parsed || !parsed.id) {
-        malformed++;
-        continue;
-      }
-      if (seenIds.has(parsed.id)) continue; // dedupe duplicate delivery
-      seenIds.add(parsed.id);
-      valid.push(parsed);
-    }
-
-    if (malformed > 0 && process.env.NODE_ENV !== 'test') {
-      console.warn(`[indexer] Quarantined ${malformed} malformed event(s) at ledger ${startLedger}`);
+    if (process.env.NODE_ENV !== 'test') {
+      console.log(`[indexer] Stored ${valid.length} new event(s) from ledger ${startLedger}`);
     }
 
     jobStatus.lastEventCount = valid.length;
@@ -322,6 +383,7 @@ function poll() {
 function startPoller(intervalMs) {
   if (timer) return;
   stopped = false;
+  logMigrationState();
   loadCheckpoint();
   poll(); // immediate first run
   timer = setInterval(() => {
@@ -365,8 +427,11 @@ module.exports = {
   stopPoller,
   poll,
   parseEvent,
+  TOPIC_MAP,
+  extractSchemaVersion,
   loadCheckpoint,
   getCheckpoint,
   backoffDelay,
-  getJobStatus,
+  persistEventsWithRetry,
+  logMigrationState,
 };
