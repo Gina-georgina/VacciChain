@@ -17,6 +17,14 @@ import { pageContainer, section } from '../layout.js';
 const styles = {
   header: { borderLeft: '4px solid #0ea5e9', paddingLeft: '0.75rem', marginBottom: '1.5rem' },
   btn: { padding: '0.6rem 1.5rem', background: '#0ea5e9', color: '#fff', border: 'none', borderRadius: 8, cursor: 'pointer' },
+  secondaryBtn: { padding: '0.5rem 1.1rem', background: 'transparent', color: '#0ea5e9', border: '1px solid #0ea5e9', borderRadius: 8, cursor: 'pointer' },
+  privacySection: { border: '1px solid #1e293b', borderRadius: 10, padding: '1rem 1.25rem', marginBottom: '1.5rem', background: '#0f172a' },
+  privacyHeader: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem', marginBottom: '0.5rem' },
+  privacyTitle: { color: '#e2e8f0', margin: 0, fontSize: '1.05rem' },
+  statusRow: { color: '#94a3b8', fontSize: '0.9rem', margin: '0.25rem 0' },
+  statusValue: { color: '#e2e8f0', fontWeight: 600 },
+  scopeList: { margin: '0.25rem 0 0', paddingLeft: '1.25rem', color: '#94a3b8', fontSize: '0.9rem' },
+  confirmation: { color: '#4ade80', fontSize: '0.9rem', marginTop: '0.5rem' },
 };
 
 export default function PatientDashboard() {
@@ -25,6 +33,8 @@ export default function PatientDashboard() {
   const { records, loading, error, refetch, page = 1, totalPages = 1, total = records.length, setPage } = useVaccination(publicKey);
   const { consented, giveConsent, loading: consentLoading } = useConsent();
   const [qrRecord, setQrRecord] = useState(null);
+  const [showConsentSettings, setShowConsentSettings] = useState(false);
+  const [consentConfirmation, setConsentConfirmation] = useState(null);
 
   // Clear wallet-specific UI state whenever the active account changes or the
   // wallet disconnects, so the prior account's data is never shown.
@@ -50,6 +60,22 @@ export default function PatientDashboard() {
   const isEmpty = !loading && !error && records.length === 0;
   const isPartial = !loading && !error && records.length > 0;
 
+  const handleConsentUpdate = async (nextConsent) => {
+    try {
+      if (nextConsent === false) {
+        await revokeConsent();
+        setConsentConfirmation(t('consent.revokedConfirmation', 'Your consent has been revoked. Records are no longer shared.'));
+      } else {
+        await giveConsent(nextConsent);
+        setConsentConfirmation(t('consent.updatedConfirmation', 'Your consent settings have been updated.'));
+      }
+    } finally {
+      // Always re-render from the authoritative API state.
+      if (refreshConsent) await refreshConsent();
+      setShowConsentSettings(false);
+    }
+  };
+
   if (!publicKey) {
     return (
       <div style={{ ...pageContainer, marginTop: '2rem', marginBottom: '2rem' }}>
@@ -59,7 +85,7 @@ export default function PatientDashboard() {
     );
   }
 
-  if (consented === false) {
+  if (consented === false && !showConsentSettings) {
     return (
       <div style={{ ...pageContainer, marginTop: '2rem', marginBottom: '2rem' }}>
         <ConsentScreen

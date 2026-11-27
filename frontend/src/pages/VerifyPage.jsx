@@ -41,6 +41,18 @@ const styles = {
   fieldError: { color: '#f87171', marginTop: '0.5rem', fontSize: '0.9rem' },
 };
 
+// Only surface messages we control; never leak raw provider/network internals.
+const GENERIC_ERROR = 'Verification failed. Please try again.';
+
+function safeErrorMessage(e) {
+  const msg = e && typeof e.message === 'string' ? e.message : '';
+  // Allow short, human-readable messages that don't look like stack traces or JSON blobs.
+  if (msg && msg.length <= 200 && !/[{}\n]/.test(msg) && !/stack|internal|provider|rpc|fetch/i.test(msg)) {
+    return msg;
+  }
+  return GENERIC_ERROR;
+}
+
 export default function VerifyPage() {
   const { t } = useTranslation();
   const toast = useToast();
@@ -60,6 +72,7 @@ export default function VerifyPage() {
     setResult(null);
     setResultWallet(null);
     setError(null);
+    setLastAddress(trimmed);
     try {
       const res = await fetch(`/v1/verify/${trimmed}`);
       const data = await res.json();

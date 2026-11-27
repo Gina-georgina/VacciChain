@@ -38,6 +38,55 @@ const NETWORK_MISMATCH_MESSAGE =
   `Your wallet is connected to a different Stellar network than this app (expected ${CONFIGURED_NETWORK}). ` +
   'Open Freighter, switch to the correct network, then retry. No transaction was signed.';
 
+// Sanitized, user-facing messages per error category. Never surface raw
+// provider internals or secrets to the UI.
+const WALLET_ERROR_MESSAGES = {
+  missing_extension:
+    'Freighter wallet not found. Install the Freighter browser extension, then reload this page and try again.',
+  rejected:
+    'Connection request was declined. Open Freighter and approve the request, then try again.',
+  locked:
+    'Your Freighter wallet is locked. Unlock Freighter with your password, then try again.',
+  provider_error:
+    'The wallet could not complete the request. Please try again, or reload the page if the problem persists.',
+};
+
+function makeWalletError(category) {
+  return {
+    category,
+    message: WALLET_ERROR_MESSAGES[category] || WALLET_ERROR_MESSAGES.provider_error,
+  };
+}
+
+// Map a raw Freighter/provider error into a typed, sanitized category.
+function classifyWalletError(e) {
+  const raw = String((e && (e.message || e.error || e)) || '').toLowerCase();
+
+  if (
+    raw.includes('not found') ||
+    raw.includes('not installed') ||
+    raw.includes('not available') ||
+    raw.includes('no freighter') ||
+    raw.includes('extension')
+  ) {
+    return makeWalletError('missing_extension');
+  }
+  if (
+    raw.includes('reject') ||
+    raw.includes('denied') ||
+    raw.includes('declin') ||
+    raw.includes('cancel') ||
+    raw.includes('user refused') ||
+    raw.includes('not allowed')
+  ) {
+    return makeWalletError('rejected');
+  }
+  if (raw.includes('lock') || raw.includes('unlock') || raw.includes('password')) {
+    return makeWalletError('locked');
+  }
+  return makeWalletError('provider_error');
+}
+
 export function AuthProvider({ children }) {
   const toast = useToast();
   const announce = useAnnounce();
@@ -45,6 +94,7 @@ export function AuthProvider({ children }) {
   const [role, setRole] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [walletError, setWalletError] = useState(null);
   const [freighterInstalled, setFreighterInstalled] = useState(() => typeof window !== 'undefined' && !!window.freighter);
   // True while restoring persisted identity on mount; route guards can render a loading state
   const [restoring, setRestoring] = useState(() => {
@@ -126,11 +176,21 @@ export function AuthProvider({ children }) {
   const connect = useCallback(async () => {
     setLoading(true);
     setError(null);
+    setWalletError(null);
     try {
-      const connected = await isConnected();
-      if (!connected) {
+      let connected = false;
+      try {
+        connected = await isConnected();
+      } catch {
+        connected = false;
+      }
+      if (!connected || (typeof window !== 'undefined' && !window.freighter)) {
         setFreighterInstalled(false);
-        throw new Error('Freighter wallet not found. Please install it.');
+        const walletErr = makeWalletError('missing_extension');
+        setWalletError(walletErr);
+        setError(walletErr.message);
+        toast(walletErr.message, 'error');
+        throw new Error(walletErr.message);
       }
       const pk = await getPublicKey();
       await refreshNetwork();
@@ -245,17 +305,20 @@ export function AuthProvider({ children }) {
       headers: { ...options.headers, Authorization: `Bearer ${t}` },
     });
 
-    // If no token in memory yet, run SEP-10 to get one
-    if (!tokenRef.current) {
+    const refreshToken = async () => {
       const pk = await getPublicKey();
       const data = await runSep10(pk);
       if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
       tokenRef.current = data.token;
       activeKeyRef.current = pk;
       setRole(data.role);
-    }
+    };
 
-    let res = await doFetch(tokenRef.current);
+    try {
+      // If no token in memory yet, run SEP-10 to get one
+      if (!tokenRef.current) {
+        await refreshToken();
+      }
 
     if (res.status === 401) {
       const pk = await getPublicKey();
@@ -267,8 +330,20 @@ export function AuthProvider({ children }) {
       res = await doFetch(data.token);
     }
 
-    return res;
-  }, [runSep10]);
+      if (res.status === 401) {
+        await refreshToken();
+        res = await doFetch(tokenRef.current);
+      }
+
+      return res;
+    } catch (e) {
+      const walletErr = classifyWalletError(e);
+      setWalletError(walletErr);
+      setError(walletErr.message);
+      toast(walletErr.message, 'error');
+      throw new Error(walletErr.message);
+    }
+  }, [runSep10, toast]);
 
   const isConnectedState = !!publicKey;
   // Role is considered loading while restoring persisted identity or while a SEP-10 flow is in flight

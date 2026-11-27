@@ -9,6 +9,50 @@ const PAGE_SIZE = 10;
 const recordsUrl = (wallet, page) => `/v1/vaccination/${wallet}?page=${page}&limit=${PAGE_SIZE}`;
 const CACHE_TTL = 30_000; // 30 seconds
 
+// Transaction lifecycle constants
+const TX_POLL_INTERVAL = 2_000; // 2 seconds
+const TX_POLL_TIMEOUT = 60_000; // 60 seconds
+const TX_HASH_REGEX = /^[0-9a-f]{64}$/i;
+
+// Safe, user-facing error categories (no provider internals)
+export const TX_ERROR = {
+  NETWORK: 'network',
+  TIMEOUT: 'timeout',
+  REJECTED: 'rejected',
+  SERVER: 'server',
+  UNKNOWN: 'unknown',
+};
+
+const SUPPORT_PATH = {
+  label: 'Contact support',
+  url: 'mailto:support@example.com?subject=Transaction%20issue',
+};
+
+function isValidTxHash(hash) {
+  return typeof hash === 'string' && TX_HASH_REGEX.test(hash);
+}
+
+function categorizeError(e) {
+  if (!e) return TX_ERROR.UNKNOWN;
+  if (e.name === 'AbortError') return TX_ERROR.TIMEOUT;
+  if (e.name === 'TypeError' || /network|fetch/i.test(e.message || '')) return TX_ERROR.NETWORK;
+  if (e.status && e.status >= 500) return TX_ERROR.SERVER;
+  if (e.status && e.status >= 400) return TX_ERROR.REJECTED;
+  return TX_ERROR.UNKNOWN;
+}
+
+function buildResult(status, extra = {}) {
+  return {
+    status,
+    tokenId: extra.tokenId ?? null,
+    transactionHash: extra.transactionHash ?? null,
+    explorerUrl: extra.explorerUrl ?? null,
+    error: extra.error ?? null,
+    retry: extra.retry ?? null,
+    support: SUPPORT_PATH,
+  };
+}
+
 // Redaction utility for client-side diagnostics. Strips tokens, patient
 // identifiers and record details before anything is logged or surfaced.
 const SENSITIVE_KEY_PATTERN = /(token|secret|password|authorization|auth|jwt|key|wallet|address|patient|name|dob|birth|record|vaccin|issuer|hash)/i;
@@ -117,8 +161,34 @@ export function useVaccination(walletAddress) {
     return fetchFromApi(recordsUrl(walletAddress, page), controller.signal);
   }, [walletAddress, page, fetchFromApi]);
 
+  const pollTransaction = useCallback(async (txHash, signal) => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < TX_POLL_TIMEOUT) {
+      if (signal.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+      let res;
+      try {
+        res = await apiFetchRef.current(`/v1/transaction/${txHash}/status`, { signal });
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        throw Object.assign(new Error('network'), { name: 'TypeError', category: TX_ERROR.NETWORK });
+      }
+      if (res.ok) {
+        const data = await res.json();
+        const state = data && data.status;
+        if (state === 'confirmed' || state === 'failed') {
+          return { status: state, tokenId: data.tokenId ?? null };
+        }
+      } else if (res.status >= 400 && res.status < 500) {
+        throw Object.assign(new Error('rejected'), { status: res.status, category: TX_ERROR.REJECTED });
+      }
+      await new Promise((r) => setTimeout(r, TX_POLL_INTERVAL));
+    }
+    throw Object.assign(new Error('timeout'), { name: 'AbortError', category: TX_ERROR.TIMEOUT });
+  }, []);
+
   const issueVaccination = useCallback(async (payload) => {
     setLoading(true);
+    let txHash = null;
     try {
       const res = await apiFetchRef.current(apiUrl('/v1/vaccination/issue'), {
         method: 'POST',
@@ -139,7 +209,7 @@ export function useVaccination(walletAddress) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [pollTransaction]);
 
   const checkIssuerStatus = useCallback(async () => {
     try {
