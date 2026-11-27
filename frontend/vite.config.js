@@ -10,6 +10,7 @@ export default defineConfig({
       '/auth': 'http://backend:4000',
       '/vaccination': 'http://backend:4000',
       '/verify': 'http://backend:4000',
+      '/analytics': 'http://python-service:8001',
     },
   },
 

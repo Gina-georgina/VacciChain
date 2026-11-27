@@ -124,7 +124,37 @@ function adaptiveLimiter(req, res, next) {
  *       400:
  *         description: Invalid wallet format
  *       429:
- *         description: Rate limit exceeded (60 requests per IP per minute)
+ *         description: >
+ *           Rate limit exceeded (60 requests per trusted client per minute).
+ *           The response body includes `retryAfter` (seconds until the caller may retry)
+ *           and the response carries `RateLimit-*` and `Retry-After` headers.
+ *         headers:
+ *           Retry-After:
+ *             description: Seconds to wait before retrying
+ *             schema:
+ *               type: integer
+ *           RateLimit-Limit:
+ *             description: Request quota for the current window
+ *             schema:
+ *               type: integer
+ *           RateLimit-Remaining:
+ *             description: Requests remaining in the current window
+ *             schema:
+ *               type: integer
+ *           RateLimit-Reset:
+ *             description: Seconds until the current window resets
+ *             schema:
+ *               type: integer
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 error:
+ *                   type: string
+ *                 retryAfter:
+ *                   type: integer
+ *                   description: Seconds until the caller may retry
  *       503:
  *         description: >
  *           RPC timeout or service unavailable. Response body has
@@ -143,7 +173,8 @@ router.get(
   verifyLimiter,
   async (req, res) => {
     const { wallet } = req.params;
-    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+    // Trusted client identity resolved by the rate limiter (respects trust proxy config).
+    const ip = req.rateLimitClientId || req.ip || req.socket?.remoteAddress || 'unknown';
 
     const now = Date.now();
     const cached = verifyCache.get(wallet);

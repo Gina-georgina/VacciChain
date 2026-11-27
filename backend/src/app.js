@@ -22,12 +22,18 @@ const apiVersion = require('./middleware/apiVersion');
 const securityHeaders = require('./middleware/securityHeaders');
 const { getRpcServer } = require('./stellar/soroban');
 const { getHealthStatus, getReadinessStatus, startHealthProbe } = require('./health');
+const { getDbReadiness } = require('./indexer/db');
 
 const requestId = require('./middleware/requestId');
 const { sanitizeInputs } = require('./middleware/sanitize');
 const errorHandler = require('./middleware/errorHandler');
+const { onboardingLimiter, batchVerifyLimiter } = require('./middleware/rateLimit');
+const idempotency = require('./middleware/idempotency');
 
 const app = express();
+// Trust only the configured number of proxy hops so client identity (and thus
+// rate-limit keys) cannot be spoofed via forwarding headers.
+app.set('trust proxy', config.TRUST_PROXY);
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean);
 
 // --- Graceful shutdown / in-flight request tracking -------------------------
@@ -132,16 +138,22 @@ app.use(sanitizeInputs);
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
+    // logger redacts sensitive headers/fields before emitting the record.
     logger.info('request', {
       requestId: req.requestId,
       method: req.method,
       route: req.path,
       statusCode: res.statusCode,
       durationMs: Date.now() - start,
+      headers: req.headers,
     });
   });
   next();
 });
+
+// Idempotency for mint (issue) requests — runs after auth so the issuer wallet
+// is available for key scoping. Only applies to POST /vaccination/issue.
+app.use('/vaccination/issue', idempotency);
 
 app.use('/auth', authRoutes);
 app.use('/vaccination', vaccinationRoutes);
@@ -152,6 +164,7 @@ app.use('/events', eventsRoutes);
 // v1 routes — all API endpoints are versioned under /v1/
 const v1 = express.Router();
 v1.use(apiVersion);
+v1.use('/vaccination/issue', idempotency);
 v1.use('/auth', authRoutes);
 v1.use('/vaccination', vaccinationRoutes);
 v1.use('/verify', verifyRoutes);
@@ -159,7 +172,8 @@ v1.use('/admin', adminRoutes);
 v1.use('/patient', patientRoutes);
 v1.use('/patient', consentRoutes);
 v1.use('/events', eventsRoutes);
-v1.use('/onboarding', onboardingRoutes);
+v1.use('/onboarding', onboardingLimiter, onboardingRoutes);
+v1.use('/verify/batch', batchVerifyLimiter);
 v1.use('/analytics', analyticsProxyRoutes);
 app.use('/v1', v1);
 
@@ -182,6 +196,11 @@ app.use(errorHandler);
  */
 app.get('/health', async (_req, res) => {
   const body = getHealthStatus();
+  const db = getDbReadiness();
+  body.database = { status: db.status, schemaVersion: db.schemaVersion };
+  if (db.status !== 'ok') {
+    body.status = 'degraded';
+  }
   res.status(body.status === 'ok' ? 200 : 503).json(body);
 });
 

@@ -44,6 +44,8 @@ export default function IssuerDashboard() {
   const [success, setSuccess] = useState(null);
   const [mintResult, setMintResult] = useState(null);
   const [confirming, setConfirming] = useState(false);
+  const [pendingMint, setPendingMint] = useState(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [isAuthorized, setIsAuthorized] = useState(null);
 
   const validate = (f) => {
@@ -93,14 +95,46 @@ export default function IssuerDashboard() {
     );
   }
 
-  const handleSubmit = async (e) => {
+  const handleSubmit = (e) => {
     e.preventDefault();
-    const result = await issueVaccination(form);
-    if (result) {
-      setMintResult(result);
-      setForm(EMPTY_FORM);
-      sessionStorage.removeItem(FORM_KEY);
+    if (isSubmitting || loading || !isAuthorized) return;
+    if (!isValid) {
+      setTouched({ patient_address: true, vaccine_name: true, date_administered: true });
+      return;
     }
+    setPendingMint({
+      patient_address: form.patient_address.trim(),
+      vaccine_name: form.vaccine_name.trim(),
+      date_administered: form.date_administered,
+    });
+    setConfirming(true);
+  };
+
+  const handleConfirmMint = async () => {
+    if (isSubmitting || !pendingMint) return;
+    setIsSubmitting(true);
+    setError(null);
+    try {
+      const result = await issueVaccination(pendingMint);
+      if (result) {
+        setMintResult(result);
+        setForm(EMPTY_FORM);
+        sessionStorage.removeItem(FORM_KEY);
+      } else {
+        setError(t('issuer.mintFailed', 'Mint failed. Please try again.'));
+      }
+    } catch (err) {
+      setError(err?.message || t('issuer.mintFailed', 'Mint failed. Please try again.'));
+    } finally {
+      setIsSubmitting(false);
+      setConfirming(false);
+      setPendingMint(null);
+    }
+  };
+
+  const handleCancelMint = () => {
+    setConfirming(false);
+    setPendingMint(null);
   };
 
   const fields = [
@@ -124,23 +158,51 @@ export default function IssuerDashboard() {
           { key: 'date_administered', label: 'Date Administered', placeholder: 'YYYY-MM-DD' },
         ].map(({ key, label, placeholder }) => (
           <div key={key}>
-            <label htmlFor={key} style={styles.label}>{label}</label>
+            <label htmlFor={key} style={styles.label}>
+              {label} <span aria-hidden="true" style={{ color: '#f87171' }}>*</span>
+              <span style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>(required)</span>
+            </label>
             <input
               id={key}
               style={errors[key] ? styles.inputError : styles.input}
               placeholder={placeholder}
               value={form[key]}
               onChange={(e) => setForm((f) => ({ ...f, [key]: e.target.value }))}
+              onBlur={() => setTouched((prev) => ({ ...prev, [key]: true }))}
               required
+              aria-required="true"
+              aria-invalid={Boolean(errors[key])}
+              aria-describedby={errors[key] ? `${key}-error` : undefined}
             />
-            {errors[key] && <p style={styles.fieldError}>{errors[key]}</p>}
+            {errors[key] && (
+              <p id={`${key}-error`} style={styles.fieldError} role="alert">
+                {errors[key]}
+              </p>
+            )}
           </div>
         ))}
-        <button style={isAuthorized ? styles.btn : styles.btnDisabled} type="submit" disabled={loading || !isAuthorized} aria-disabled={loading || !isAuthorized}>
-          {loading ? 'Minting…' : 'Issue Vaccination NFT'}
+        <button
+          style={isAuthorized && !isSubmitting ? styles.btn : styles.btnDisabled}
+          type="submit"
+          disabled={loading || isSubmitting || !isAuthorized}
+          aria-disabled={loading || isSubmitting || !isAuthorized}
+        >
+          {loading || isSubmitting ? 'Minting…' : 'Issue Vaccination NFT'}
         </button>
       </form>
+      <ConfirmMintDialog
+        open={confirming}
+        values={pendingMint}
+        submitting={isSubmitting}
+        onConfirm={handleConfirmMint}
+        onCancel={handleCancelMint}
+      />
       <div aria-live="polite" aria-atomic="true">
+        {error && (
+          <div role="alert" style={{ marginTop: '1rem', padding: '0.75rem 1rem', background: '#7f1d1d', borderRadius: 8, color: '#f87171' }}>
+            {error}
+          </div>
+        )}
         {mintResult && (
           <div style={{ marginTop: '1rem', padding: '0.75rem 1rem', background: '#0f172a', borderRadius: 8, color: '#4ade80' }}>
             <p>✅ Vaccination NFT minted!</p>

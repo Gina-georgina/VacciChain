@@ -47,6 +47,54 @@ nav a { color: var(--nav-text); }
 nav a[aria-current="page"] { color: var(--accent); font-weight: 600; }
 #main-content:focus { outline: none; }
 
+/* Utility class to disable animations/transitions for components using inline styles */
+.reduce-motion,
+.reduce-motion *,
+.reduce-motion *::before,
+.reduce-motion *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    animation-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Disable non-essential keyframe animations (skeletons, toasts, nav, etc.) */
+  .skeleton,
+  .skeleton *,
+  [class*="skeleton"],
+  [class*="toast"],
+  [class*="notification"],
+  nav,
+  nav * {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  /* Ensure skeleton pulse is fully disabled */
+  .skeleton-pulse,
+  .pulse {
+    animation: none !important;
+    opacity: 1 !important;
+  }
+
+  /* Disable smooth scrolling and parallax-like effects */
+  html {
+    scroll-behavior: auto !important;
+  }
+}
+
 /* ── NavBar responsive styles ───────────────────────────────────────────── */
 
 /*
