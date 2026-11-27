@@ -5,7 +5,7 @@ const StellarSdk = require('@stellar/stellar-sdk');
 const authMiddleware = require('../middleware/auth');
 const { adminAuthMiddleware } = require('../middleware/auth');
 const { queryAuditLog, audit } = require('../middleware/auditLog');
-const { insertApiKey, listApiKeys, revokeApiKey } = require('../indexer/db');
+const { insertApiKey, listApiKeys, revokeApiKey, updateApiKeyScopes } = require('../indexer/db');
 const { rotateKey, reloadFromEnv } = require('../jwtKeys');
 const { approveProposal, getProposal } = require('../middleware/multiSig');
 const { isValidStellarPublicKey } = require('../middleware/wallet');
@@ -263,23 +263,130 @@ router.get('/audit', adminAuthMiddleware, adminOnly, (req, res) => {
  */
 router.post('/api-keys', adminAuthMiddleware, adminOnly, validate(createApiKeySchema), (req, res) => {
   const { label } = req.body;
+  const scopes = normalizeScopes(req.body.scopes);
+  if (scopes === null) {
+    return res.status(400).json({ error: 'scopes must be an array of strings' });
+  }
 
-  const rawKey  = crypto.randomBytes(32).toString('hex');
-  const keyHash = crypto.createHash('sha256').update(rawKey).digest('hex');
+  const rawKey  = generateApiKey();
+  const keyHash = hashApiKey(rawKey);
   const id      = crypto.randomUUID();
+  const createdAt = new Date().toISOString();
 
-  insertApiKey({ id, key_hash: keyHash, label: label.trim(), created_at: new Date().toISOString() });
-
-  res.status(201).json({ id, label: label.trim(), key: rawKey });
+  try {
+    insertApiKey({
+      id,
+      key_hash: keyHash,
+      label: label.trim(),
+      scopes,
+      created_at: createdAt,
+      rotated_from: null,
+    });
+    audit({ actor: req.user.wallet, action: 'api_key.create', target: id, result: 'success', meta: { label: label.trim(), scopes } });
+    res.status(201).json({ id, label: label.trim(), scopes, created_at: createdAt, key: rawKey });
+  } catch (err) {
+    audit({ actor: req.user.wallet, action: 'api_key.create', target: id, result: 'failure', meta: { error: err.message } });
+    res.status(500).json({ error: err.message });
+  }
 });
 
 router.get('/api-keys', adminAuthMiddleware, adminOnly, (_req, res) => {
   res.json(listApiKeys());
 });
 
+/**
+ * POST /admin/api-keys/:id/rotate
+ *
+ * Issues a replacement key for an existing (non-revoked) key. The old record
+ * is revoked and linked to the new one via rotated_from; the new raw key is
+ * returned exactly once.
+ */
+router.post('/api-keys/:id/rotate', adminAuthMiddleware, adminOnly, (req, res) => {
+  const oldId = req.params.id;
+  const existing = listApiKeys().find((k) => k.id === oldId);
+  if (!existing) {
+    audit({ actor: req.user.wallet, action: 'api_key.rotate', target: oldId, result: 'failure', meta: { error: 'not found' } });
+    return res.status(404).json({ error: 'API key not found' });
+  }
+  if (existing.revoked_at) {
+    audit({ actor: req.user.wallet, action: 'api_key.rotate', target: oldId, result: 'failure', meta: { error: 'already revoked' } });
+    return res.status(409).json({ error: 'API key already revoked' });
+  }
+
+  const rawKey  = generateApiKey();
+  const keyHash = hashApiKey(rawKey);
+  const newId   = crypto.randomUUID();
+  const createdAt = new Date().toISOString();
+
+  try {
+    insertApiKey({
+      id: newId,
+      key_hash: keyHash,
+      label: existing.label,
+      scopes: existing.scopes || [],
+      created_at: createdAt,
+      rotated_from: oldId,
+    });
+    revokeApiKey(oldId);
+    audit({ actor: req.user.wallet, action: 'api_key.rotate', target: oldId, result: 'success', meta: { new_id: newId } });
+    res.status(201).json({
+      id: newId,
+      label: existing.label,
+      scopes: existing.scopes || [],
+      created_at: createdAt,
+      rotated_from: oldId,
+      key: rawKey,
+    });
+  } catch (err) {
+    audit({ actor: req.user.wallet, action: 'api_key.rotate', target: oldId, result: 'failure', meta: { error: err.message } });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * PATCH /admin/api-keys/:id/scopes
+ * Body: { scopes: string[] }
+ *
+ * Replaces the scope set of an existing, non-revoked key.
+ */
+router.patch('/api-keys/:id/scopes', adminAuthMiddleware, adminOnly, (req, res) => {
+  const id = req.params.id;
+  const scopes = normalizeScopes(req.body.scopes);
+  if (scopes === null || scopes.length === 0) {
+    audit({ actor: req.user.wallet, action: 'api_key.scope', target: id, result: 'failure', meta: { error: 'invalid scopes' } });
+    return res.status(400).json({ error: 'scopes must be a non-empty array of strings' });
+  }
+
+  const existing = listApiKeys().find((k) => k.id === id);
+  if (!existing) {
+    audit({ actor: req.user.wallet, action: 'api_key.scope', target: id, result: 'failure', meta: { error: 'not found' } });
+    return res.status(404).json({ error: 'API key not found' });
+  }
+  if (existing.revoked_at) {
+    audit({ actor: req.user.wallet, action: 'api_key.scope', target: id, result: 'failure', meta: { error: 'already revoked' } });
+    return res.status(409).json({ error: 'API key already revoked' });
+  }
+
+  try {
+    updateApiKeyScopes(id, scopes);
+    audit({ actor: req.user.wallet, action: 'api_key.scope', target: id, result: 'success', meta: { scopes } });
+    res.json({ id, scopes });
+  } catch (err) {
+    audit({ actor: req.user.wallet, action: 'api_key.scope', target: id, result: 'failure', meta: { error: err.message } });
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.delete('/api-keys/:id', adminAuthMiddleware, adminOnly, (req, res) => {
-  revokeApiKey(req.params.id);
-  res.json({ revoked: true });
+  const id = req.params.id;
+  try {
+    revokeApiKey(id);
+    audit({ actor: req.user.wallet, action: 'api_key.revoke', target: id, result: 'success' });
+    res.json({ revoked: true });
+  } catch (err) {
+    audit({ actor: req.user.wallet, action: 'api_key.revoke', target: id, result: 'failure', meta: { error: err.message } });
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── JWT key rotation ──────────────────────────────────────────────────────────

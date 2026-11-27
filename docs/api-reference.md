@@ -291,6 +291,139 @@ should rely on the API error codes above rather than raw contract error strings.
 
 ---
 
+## Verifier API Keys
+
+Third-party verifiers authenticate with an API key instead of a JWT. Keys are
+provisioned by an admin, individually scoped, rotatable, and revocable.
+
+### Key format and storage
+
+- Keys are returned **once** at creation time in the form `vck_<prefix>_<secret>`.
+- Only a verifiable hash of the secret is stored server-side; the plaintext key is
+  never persisted or retrievable again.
+- The `<prefix>` portion is stored in clear text so keys can be identified in
+  audit logs without exposing the secret.
+
+### Header contract
+
+Send the key on every verifier request:
+
+```
+X-API-Key: vck_<prefix>_<secret>
+```
+
+Errors:
+- 401: missing, malformed, unknown, revoked, or expired key
+- 403: key is valid but lacks the scope required by the endpoint
+
+### Scopes
+
+Each key is created with an explicit list of scopes. Supported scopes:
+
+| Scope | Grants access to |
+| --- | --- |
+| `verify:read` | `GET /verify/:wallet` |
+| `records:read` | `GET /vaccination/:wallet` |
+| `records:write` | `POST /vaccination/issue` (issuer keys only) |
+
+Requests to endpoints outside the key's scopes return `403`.
+
+### Lifecycle
+
+1. **Provision** — an admin creates a key with a label and scopes. The plaintext
+   key is returned in the response and must be stored by the verifier.
+2. **Rotate** — an admin rotates a key, producing a new secret. The previous
+   secret remains valid until the end of the configured grace period (default
+   24 hours), after which it stops authenticating.
+3. **Revoke** — an admin revokes a key immediately. Revoked keys fail with `401`
+   and cannot be reactivated; provision a new key instead.
+
+### Audit events
+
+Every lifecycle action and authentication failure is recorded with the key
+prefix, actor, timestamp, and outcome. Emitted events:
+
+- `api_key.created`
+- `api_key.rotated`
+- `api_key.revoked`
+- `api_key.auth_failed` (reason: `unknown`, `revoked`, `expired`, `scope_denied`)
+
+---
+
+## POST /admin/api-keys
+
+Provision a new verifier API key. Admin-only.
+
+Headers:
+- `Authorization: Bearer <admin_jwt>`
+
+Request:
+```json
+{
+  "label": "Clinic A verifier",
+  "scopes": ["verify:read", "records:read"]
+}
+```
+
+Response (201):
+```json
+{
+  "id": "key_01H...",
+  "prefix": "vck_ab12cd",
+  "api_key": "vck_ab12cd_<secret>",
+  "scopes": ["verify:read", "records:read"],
+  "created_at": "2026-05-01T12:34:56Z"
+}
+```
+
+Errors:
+- 400: missing label or unknown scope
+- 403: caller is not an admin
+
+---
+
+## POST /admin/api-keys/:id/rotate
+
+Rotate the secret for an existing key. Admin-only.
+
+Headers:
+- `Authorization: Bearer <admin_jwt>`
+
+Request:
+```json
+{ "grace_period_seconds": 86400 }
+```
+
+Response (200):
+```json
+{
+  "id": "key_01H...",
+  "prefix": "vck_ab12cd",
+  "api_key": "vck_ab12cd_<new_secret>",
+  "previous_valid_until": "2026-05-02T12:34:56Z"
+}
+```
+
+Errors:
+- 404: key not found
+- 409: key is revoked
+
+---
+
+## DELETE /admin/api-keys/:id
+
+Revoke a key immediately. Admin-only.
+
+Headers:
+- `Authorization: Bearer <admin_jwt>`
+
+Response (204): no body.
+
+Errors:
+- 404: key not found
+
+---
+
 ## Analytics (Python service)
 
 Base URL: `http://localhost:8001`

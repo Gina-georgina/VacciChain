@@ -438,6 +438,12 @@ router.get(
 router.get(
   '/:wallet',
   validateStellarPublicKey('params', 'wallet'),
+  // Declare the scope required for verifier API keys. JWT callers are unaffected
+  // because verifierApiKey only enforces this when an API key is presented.
+  (req, res, next) => {
+    req.requiredScope = 'verify:read';
+    next();
+  },
   jwtOrApiKey,
   adaptiveLimiter,
   async (req, res, next) => {

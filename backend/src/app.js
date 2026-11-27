@@ -6,8 +6,9 @@ const cors = require('cors');
 const swaggerUi = require('swagger-ui-express');
 const logger = require('./logger');
 const { initDb } = require('./indexer/db');
-const { startPoller, stopPoller } = require('./indexer/poller');
+const { startPoller, stopPoller, getPollerStatus } = require('./indexer/poller');
 const swaggerSpec = require('./swagger');
+const { getJobStatus } = require('./jobs/status');
 
 const authRoutes = require('./routes/auth');
 const vaccinationRoutes = require('./routes/vaccination');
@@ -186,6 +187,12 @@ app.use(
     res.redirect(308, target);
   }
 );
+
+// Observable background job status (indexer poller + offloaded batch verification).
+// Heavy work is executed by background workers, never synchronously in handlers.
+app.get('/admin/jobs/status', (_req, res) => {
+  res.json(getJobStatus({ poller: getPollerStatus() }));
+});
 
 // Global error handler — must be registered after all routes
 app.use(errorHandler);

@@ -389,3 +389,4 @@ Integrators must not assume that the absence of a field in the API response mean
 - Public-chain data is **not private**: on-chain records are readable by anyone. The API omits prohibited fields, but do not treat on-chain data as confidential.
 - JWTs are scoped by role (`patient` or `issuer`) and expire after 1 hour.
 - SEP-10 nonces are single-use. A replayed challenge will be rejected with `401`.
+- Verifier API keys are stored only as salted hashes; treat the plaintext key like a password and never commit it to source control.
