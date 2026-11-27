@@ -35,6 +35,17 @@ variable "trusted_proxy_cidrs" {
   default = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 }
 
+# Percentage of backend traffic routed to the canary target group (0-100).
+# 0 = all traffic on the stable target group; 100 = fully promoted canary.
+variable "backend_canary_weight" {
+  type    = number
+  default = 0
+  validation {
+    condition     = var.backend_canary_weight >= 0 && var.backend_canary_weight <= 100
+    error_message = "backend_canary_weight must be between 0 and 100."
+  }
+}
+
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
@@ -151,10 +162,12 @@ resource "aws_lb_target_group" "backend" {
   vpc_id      = var.vpc_id
   target_type = "ip"
   health_check {
-    path                = "/health"
+    path                = "/ready"
+    matcher             = "200"
     healthy_threshold   = 2
     unhealthy_threshold = 3
     interval            = 30
+    timeout             = 5
   }
 }
 
@@ -165,9 +178,12 @@ resource "aws_lb_target_group" "frontend" {
   vpc_id      = var.vpc_id
   target_type = "ip"
   health_check {
-    path              = "/"
-    healthy_threshold = 2
-    interval          = 30
+    path                = "/ready"
+    matcher             = "200"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    interval            = 30
+    timeout             = 5
   }
 }
 
@@ -181,12 +197,43 @@ resource "aws_lb_listener" "http" {
   }
 }
 
+# ── Canary target group for backend (weighted traffic switching) ──────────────
+# Deploy the new backend revision to this target group, verify health/smoke
+# checks, then shift weights on the listener rule below. Rollback = set the
+# canary weight back to 0 and drain the canary target group.
+resource "aws_lb_target_group" "backend_canary" {
+  name        = "${var.name}-backend-canary-tg"
+  port        = 4000
+  protocol    = "HTTP"
+  vpc_id      = var.vpc_id
+  target_type = "ip"
+  health_check {
+    path                = "/health"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    interval            = 30
+  }
+}
+
 resource "aws_lb_listener_rule" "api" {
   listener_arn = aws_lb_listener.http.arn
   priority     = 10
   action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.backend.arn
+    type = "forward"
+    forward {
+      target_group {
+        arn    = aws_lb_target_group.backend.arn
+        weight = var.backend_canary_weight
+      }
+      target_group {
+        arn    = aws_lb_target_group.backend_canary.arn
+        weight = 100 - var.backend_canary_weight
+      }
+      stickiness {
+        enabled  = true
+        duration = 3600
+      }
+    }
   }
   condition {
     path_pattern { values = ["/v1/*", "/health"] }
@@ -195,9 +242,9 @@ resource "aws_lb_listener_rule" "api" {
 
 # ── Persistence: EFS for SQLite (single-writer) ───────────────────────────────
 resource "aws_efs_file_system" "db" {
-  count      = var.persistence_backend == "sqlite-efs" ? 1 : 0
-  encrypted  = true
-  tags       = { Name = "${var.name}-db" }
+  count     = var.persistence_backend == "sqlite-efs" ? 1 : 0
+  encrypted = true
+  tags      = { Name = "${var.name}-db" }
 }
 
 resource "aws_efs_mount_target" "db" {
@@ -233,22 +280,22 @@ resource "aws_security_group" "db" {
 }
 
 resource "aws_db_instance" "db" {
-  count                   = var.persistence_backend == "postgres-rds" ? 1 : 0
-  identifier              = "${var.name}-db"
-  engine                  = "postgres"
-  engine_version          = "16"
-  instance_class          = "db.t4g.medium"
-  allocated_storage       = 50
-  max_allocated_storage   = 200
-  storage_encrypted       = true
-  multi_az                = true
-  db_subnet_group_name    = aws_db_subnet_group.db[0].name
-  vpc_security_group_ids  = [aws_security_group.db[0].id]
-  backup_retention_period = 7
-  deletion_protection     = true
-  skip_final_snapshot     = false
+  count                     = var.persistence_backend == "postgres-rds" ? 1 : 0
+  identifier                = "${var.name}-db"
+  engine                    = "postgres"
+  engine_version            = "16"
+  instance_class            = "db.t4g.medium"
+  allocated_storage         = 50
+  max_allocated_storage     = 200
+  storage_encrypted         = true
+  multi_az                  = true
+  db_subnet_group_name      = aws_db_subnet_group.db[0].name
+  vpc_security_group_ids    = [aws_security_group.db[0].id]
+  backup_retention_period   = 7
+  deletion_protection       = true
+  skip_final_snapshot       = false
   final_snapshot_identifier = "${var.name}-db-final"
-  username                = "vaccichain"
+  username                  = "vaccichain"
   manage_master_user_password = true
 }
 
@@ -306,11 +353,11 @@ resource "aws_ecs_task_definition" "backend" {
       }
     }
     healthCheck = {
-      command     = ["CMD-SHELL", "wget -qO- http://localhost:4000/health || exit 1"]
+      command     = ["CMD-SHELL", "wget -qO- http://localhost:4000/ready || exit 1"]
       interval    = 30
       timeout     = 5
       retries     = 3
-      startPeriod = 15
+      startPeriod = 30
     }
   }])
 }
@@ -322,6 +369,14 @@ resource "aws_ecs_service" "backend" {
   # SQLite over EFS supports only a single writer; scale out only with RDS.
   desired_count = var.persistence_backend == "sqlite-efs" ? 1 : var.desired_count
   launch_type   = "FARGATE"
+
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
 
   network_configuration {
     subnets         = var.private_subnets
@@ -359,6 +414,13 @@ resource "aws_ecs_task_definition" "frontend" {
         "awslogs-stream-prefix" = "frontend"
       }
     }
+    healthCheck = {
+      command     = ["CMD-SHELL", "wget -qO- http://localhost:80/ready || exit 1"]
+      interval    = 30
+      timeout     = 5
+      retries     = 3
+      startPeriod = 30
+    }
   }])
 }
 
@@ -368,6 +430,14 @@ resource "aws_ecs_service" "frontend" {
   task_definition = aws_ecs_task_definition.frontend.arn
   desired_count   = var.desired_count
   launch_type     = "FARGATE"
+
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
 
   network_configuration {
     subnets         = var.private_subnets
@@ -408,6 +478,13 @@ resource "aws_ecs_task_definition" "analytics" {
         "awslogs-stream-prefix" = "python-service"
       }
     }
+    healthCheck = {
+      command     = ["CMD-SHELL", "wget -qO- http://localhost:8001/ready || exit 1"]
+      interval    = 30
+      timeout     = 5
+      retries     = 3
+      startPeriod = 30
+    }
   }])
 }
 
@@ -418,6 +495,14 @@ resource "aws_ecs_service" "analytics" {
   desired_count   = var.desired_count
   launch_type     = "FARGATE"
 
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
   network_configuration {
     subnets         = var.private_subnets
     security_groups = [aws_security_group.tasks.id]
@@ -426,6 +511,8 @@ resource "aws_ecs_service" "analytics" {
 
 output "alb_dns_name" { value = aws_lb.this.dns_name }
 output "cluster_name" { value = aws_ecs_cluster.this.name }
+output "backend_target_group_arn"        { value = aws_lb_target_group.backend.arn }
+output "backend_canary_target_group_arn" { value = aws_lb_target_group.backend_canary.arn }
 output "persistence_backend" { value = var.persistence_backend }
 output "database_endpoint" {
   value = var.persistence_backend == "postgres-rds" ? aws_db_instance.db[0].endpoint : null

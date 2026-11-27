@@ -22,6 +22,7 @@ GET /v1/verify/public/:wallet
 ```json
 {
   "wallet": "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF",
+  "status": "valid",
   "verified": true,
   "records": [
     {
@@ -29,7 +30,8 @@ GET /v1/verify/public/:wallet
       "vaccine_name": "Pfizer-BioNTech",
       "date_administered": "2024-01-15T10:30:00Z",
       "dose_number": 1,
-      "dose_series": 2
+      "dose_series": 2,
+      "revoked": false
     }
   ],
   "record_count": 1,
@@ -44,6 +46,22 @@ GET /v1/verify/public/:wallet
 - `truncated`: `true` when more records exist beyond this page.
 - `next_cursor`: Cursor for the next page, or `null` when `truncated` is `false`.
 
+### Verification Status Values
+
+The `status` field is the authoritative signal for interpreting a response. It
+takes exactly one of the following values:
+
+| `status` | Meaning | `verified` | `records` |
+|----------|---------|------------|-----------|
+| `valid` | At least one non-revoked record was returned by the contract | `true` | Non-empty |
+| `revoked` | Records exist but every record has been revoked | `false` | Non-empty (each with `revoked: true`) |
+| `absent` | The contract responded successfully and holds no records for this wallet | `false` | `[]` |
+| `unavailable` | The contract could not be queried (RPC timeout, node error, partial read) | `false` | `[]` |
+
+`verified` is `true` **only** when `status` is `valid`. Clients MUST branch on
+`status` (or on `verified === true`) and MUST NOT infer a positive result from
+the mere presence of a 200 response.
+
 **Error Responses:**
 
 | Status | Condition |
@@ -51,8 +69,15 @@ GET /v1/verify/public/:wallet
 | 400 | Invalid wallet format, invalid `limit` (non-integer or `< 1`), or malformed/expired `cursor` |
 | 413 | Request body exceeds the batch size limit (batch endpoint only) |
 | 429 | Rate limit exceeded (60 requests/min per IP) |
-| 503 | RPC timeout or service unavailable |
-| 500 | Contract query failed |
+| 503 | RPC timeout or service unavailable (`status: "unavailable"`) |
+| 500 | Contract query failed (`status: "unavailable"`) |
+
+> **Never collapse failures into a positive result.** An RPC failure, timeout,
+> partial history read, or contract error MUST NOT be reported as
+> `verified: true` or `status: "valid"`. Such conditions are always surfaced as
+> `status: "unavailable"` (with a 5xx status code) or `status: "absent"` when
+> the contract positively confirms there are no records. Treating an error as
+> "no records found" or as a successful verification is prohibited.
 
 ## Size and Work Limits
 
@@ -153,15 +178,24 @@ GET /v1/verify/:wallet
 - Prevents abuse and DDoS attacks
 
 ### Simplified Response Schema
-- Public endpoint returns minimal schema: `{ wallet, verified, records, record_count, truncated, next_cursor }`
-- Authenticated endpoint returns detailed schema: `{ wallet, vaccinated, verified, record_count, records }`
+- Public endpoint returns minimal schema: `{ wallet, status, verified, records }`
+- Authenticated endpoint returns detailed schema: `{ wallet, status, vaccinated, verified, record_count, records }`
 - Cleaner API for public consumers
+- `status` distinguishes `valid`, `revoked`, `absent`, and `unavailable` data
 
 ### Bounded Response Size
 - Records per page capped at `100` (default `20`)
 - Response body capped at `256 KiB`; excess records are truncated with `truncated: true`
 - Batch requests capped at `50` wallets and `1 MiB` response size
 - Prevents unbounded histories from exhausting memory, CPU, or bandwidth
+
+### Not a Medical Determination
+- Responses describe on-chain record state only; they are **not** a medical
+  determination, diagnosis, or proof of immunity
+- `status: "absent"` or `status: "unavailable"` MUST NOT be interpreted as
+  evidence that a person is unvaccinated
+- Consumers must present `unavailable` as "could not be determined" rather than
+  as a negative result
 
 ## Usage Examples
 
@@ -186,10 +220,19 @@ const wallet = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF';
 const response = await fetch(`/v1/verify/public/${wallet}`);
 const data = await response.json();
 
-if (data.verified) {
-  console.log(`Wallet has ${data.records.length} vaccination records`);
-} else {
-  console.log('No vaccination records found');
+switch (data.status) {
+  case 'valid':
+    console.log(`Wallet has ${data.records.length} vaccination records`);
+    break;
+  case 'revoked':
+    console.log('All vaccination records have been revoked');
+    break;
+  case 'absent':
+    console.log('No vaccination records found');
+    break;
+  case 'unavailable':
+    console.log('Verification could not be determined; try again later');
+    break;
 }
 ```
 
@@ -202,12 +245,16 @@ response = requests.get(f'https://api.vaccichain.example.com/v1/verify/public/{w
 data = response.json()
 
 if response.status_code == 200:
+    print(f"Status: {data['status']}")
     print(f"Verified: {data['verified']}")
     print(f"Records: {len(data['records'])}")
 elif response.status_code == 400:
     print(f"Invalid wallet: {data['error']}")
 elif response.status_code == 429:
     print("Rate limit exceeded")
+elif response.status_code in (500, 503):
+    # Never treat this as a positive verification result
+    print("Verification unavailable; status could not be determined")
 ```
 
 ## Implementation Details
@@ -249,7 +296,7 @@ Public endpoint requests are logged with:
 |---------|--------|---------------|
 | Authentication | Not required | Required (JWT or API key) |
 | Rate limit | 60 req/min per IP | 60 req/min per JWT user or 120 req/min per API key |
-| Response fields | `wallet, verified, records` | `wallet, vaccinated, verified, record_count, records` |
+| Response fields | `wallet, status, verified, records` | `wallet, status, vaccinated, verified, record_count, records` |
 | Audit actor | Client IP | User wallet or API key ID |
 | Use case | Public verification, third-party integrators | Internal systems, trusted partners |
 
@@ -281,6 +328,14 @@ Public endpoint requests are logged with:
 - `cursor` validated as an opaque token; malformed or expired cursors return `400`
 - Batch requests validated against the `50`-wallet maximum before any contract query
 
+### Failure Semantics
+- RPC failures, timeouts, and partial reads are reported as
+  `status: "unavailable"` with a 5xx status code
+- Failures are never cached as `valid` and never returned as `verified: true`
+- A missing record set is only reported as `absent` when the contract
+  positively confirms an empty result
+- Results are informational only and do not constitute a medical determination
+
 ## Configuration
 
 ### Environment Variables
@@ -301,6 +356,8 @@ RATE_LIMIT_VERIFY=60
 - Rate limit violations
 - Error rates (400, 429, 500, 503)
 - RPC timeout frequency
+- Count of responses by `status` (`valid`, `revoked`, `absent`, `unavailable`)
+- Alert if any `unavailable` response is ever served with `verified: true`
 
 ### Audit Log Queries
 ```javascript
@@ -320,10 +377,19 @@ const walletLookups = entries.filter(e => e.target === wallet);
 - Public endpoint accessible without JWT or API key
 - No Authorization header needed
 
-✅ **Returns { verified: true/false, records: [...] } schema**
-- Response includes `verified` boolean
+✅ **Returns { status, verified: true/false, records: [...] } schema**
+- Response includes `status` distinguishing `valid`, `revoked`, `absent`, `unavailable`
+- Response includes `verified` boolean (`true` only for `status: "valid"`)
 - Response includes `records` array
 - Simplified schema for public consumers
+
+✅ **Results cannot be read as a medical determination**
+- Documentation states results are informational only
+- `absent` and `unavailable` are explicitly not evidence of being unvaccinated
+
+✅ **RPC failures cannot collapse into a positive verification**
+- Failures surface as `status: "unavailable"` with a 5xx code
+- Tests assert that error/timeout paths never yield `verified: true`
 
 ✅ **Wallet format is validated; invalid format returns 400**
 - Uses existing `validateStellarPublicKey` middleware

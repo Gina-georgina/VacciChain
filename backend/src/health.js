@@ -4,26 +4,81 @@ const logger = require('./logger');
 
 let sorobanHealthy = true;
 let lastProbeAt = null;
+let lastProbeDurationMs = null;
+let lastProbeError = null;
+let probeSuccessCount = 0;
+let probeFailureCount = 0;
+let dbInitialized = false;
 
 function getHealthStatus() {
   const status = sorobanHealthy ? 'ok' : 'degraded';
   return {
     status,
     uptime: Number(process.uptime().toFixed(3)),
+    soroban: {
+      healthy: sorobanHealthy,
+      lastProbeAt: lastProbeAt ? lastProbeAt.toISOString() : null,
+      lastProbeTimestamp: lastProbeAt ? lastProbeAt.getTime() : null,
+      lastProbeDurationMs,
+      lastProbeError,
+      probeSuccessCount,
+      probeFailureCount,
+    },
+  };
+}
+
+function getHealthMetrics() {
+  // Structured metrics suitable for scraping by a metrics collector.
+  // Exposes gauges for probe success/failure and last probe timestamp,
+  // plus counters that support latency and error-rate SLIs.
+  return {
+    timestamp: new Date().toISOString(),
+    gauges: {
+      soroban_probe_healthy: sorobanHealthy ? 1 : 0,
+      soroban_probe_last_timestamp_seconds: lastProbeAt
+        ? Number((lastProbeAt.getTime() / 1000).toFixed(3))
+        : 0,
+      soroban_probe_last_duration_ms: lastProbeDurationMs === null ? 0 : lastProbeDurationMs,
+    },
+    counters: {
+      soroban_probe_success_total: probeSuccessCount,
+      soroban_probe_failure_total: probeFailureCount,
+    },
+  };
+}
+
+function getReadinessStatus() {
+  const checks = {
+    db: dbInitialized ? 'ok' : 'unavailable',
+    soroban: sorobanHealthy ? 'ok' : 'unavailable',
+  };
+  const ready = dbInitialized && sorobanHealthy;
+  return {
+    status: ready ? 'ready' : 'not_ready',
+    ready,
+    checks,
+    uptime: Number(process.uptime().toFixed(3)),
+    lastProbeAt: lastProbeAt ? lastProbeAt.toISOString() : null,
   };
 }
 
 async function probeSorobanHealth() {
+  const startedAt = Date.now();
   try {
     await getRpcServer().getHealth();
     sorobanHealthy = true;
+    lastProbeError = null;
+    probeSuccessCount += 1;
   } catch (error) {
     sorobanHealthy = false;
+    lastProbeError = error.message || String(error);
+    probeFailureCount += 1;
     logger.warn('Soroban health probe failed', {
       message: error.message,
       code: error.code,
     });
   } finally {
+    lastProbeDurationMs = Date.now() - startedAt;
     lastProbeAt = new Date();
   }
 }
@@ -48,9 +103,16 @@ function setSorobanHealthy(value) {
   lastProbeAt = new Date();
 }
 
+function setDbInitialized(value) {
+  dbInitialized = Boolean(value);
+}
+
 module.exports = {
   getHealthStatus,
+  getHealthMetrics,
+  getReadinessStatus,
   startHealthProbe,
   setSorobanHealthy,
+  setDbInitialized,
   _getLastProbeAt: () => lastProbeAt,
 };

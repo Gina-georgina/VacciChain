@@ -121,6 +121,26 @@ module "ecs" {
     module.secrets.secret_arns,
     { EVENT_INDEX_DATABASE_URL = module.event_index_db.connection_secret_arn }
   )
+
+  # Container health checks (Backlog 120)
+  backend_health_check_path     = "/health"
+  frontend_health_check_path    = "/health"
+  analytics_health_check_path   = "/health"
+  backend_health_check_grace_period   = 60
+  frontend_health_check_grace_period  = 30
+  analytics_health_check_grace_period = 60
+  health_check_interval         = 30
+  health_check_timeout          = 5
+  health_check_retries          = 3
+  health_check_start_period     = 15
+
+  # Target group health checks
+  target_group_health_check_path     = "/health"
+  target_group_health_check_interval = 30
+  target_group_health_check_timeout  = 5
+  target_group_healthy_threshold     = 2
+  target_group_unhealthy_threshold   = 3
+  target_group_deregistration_delay  = 30
 }
 
 output "alb_dns_name" { value = module.ecs.alb_dns_name }
@@ -131,6 +151,3 @@ output "event_index_endpoint" {
 }
 
 output "trust_proxy_hops" { value = var.trust_proxy_hops }
-</｜｜DSML｜｜ parameter>
-</invoke>
-</result>
