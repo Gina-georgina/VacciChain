@@ -33,6 +33,9 @@ const s = {
   sectionTitle: { color: '#94a3b8', fontSize: '0.85rem', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '1rem' },
   error: { color: '#f87171', padding: '0.75rem', background: '#1e293b', borderRadius: 8, marginBottom: '1rem' },
   loading: { color: '#64748b', textAlign: 'center', padding: '2rem 0' },
+  sectionError: { color: '#f87171', padding: '0.75rem', background: '#1e293b', borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap' },
+  partialNote: { color: '#fcd34d', fontSize: '0.8rem', marginBottom: '0.75rem' },
+  retryBtn: { background: '#0ea5e9', color: '#0f172a', border: 'none', borderRadius: 6, padding: '0.4rem 0.9rem', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer' },
   table: { width: '100%', borderCollapse: 'collapse', fontSize: '0.9rem' },
   th: { textAlign: 'left', color: '#64748b', fontWeight: 500, padding: '0.5rem 0.75rem', borderBottom: '1px solid #1e293b' },
   td: { padding: '0.6rem 0.75rem', color: '#e2e8f0', borderBottom: '1px solid #1e293b' },
@@ -319,6 +322,11 @@ function Section({ id, title, source, empty, children }) {
     timerRef.current = setInterval(fetchAll, REFRESH_INTERVAL);
     return () => clearInterval(timerRef.current);
   }, [fetchAll, role]);
+
+  const rates = sections.rates.data;
+  const issuers = sections.issuers.data;
+  const anomalies = sections.anomalies.data;
+  const loading = sections.rates.status === 'loading' || sections.issuers.status === 'loading' || sections.anomalies.status === 'loading';
 
   const ratesStatus = loading && rates === null ? 'loading' : dataStatus(rates, lastRefresh);
   const issuersStatus = loading && issuers === null ? 'loading' : dataStatus(issuers, lastRefresh);

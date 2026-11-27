@@ -11,7 +11,12 @@ export default function QRCodeModal({ url, onClose }) {
   const canvasRef = useRef(null);
   const overlayRef = useRef(null);
   const modalRef = useRef(null);
-  const previousActive = useRef(null);
+
+  const { onKeyDown } = useAccessibleDialog({
+    dialogRef: modalRef,
+    onClose,
+    dismissible: true,
+  });
 
   useEffect(() => {
     let active = true;
@@ -23,29 +28,6 @@ export default function QRCodeModal({ url, onClose }) {
     return () => { active = false; };
   }, [url]);
 
-  useEffect(() => {
-    previousActive.current = document.activeElement;
-    const nodes = getFocusableElements(modalRef.current);
-    (nodes[0] || modalRef.current)?.focus?.();
-
-    const onKey = (e) => {
-      if (e.key === 'Escape') { e.preventDefault(); onClose(); }
-      if (e.key === 'Tab') {
-        const nodes = getFocusableElements(modalRef.current);
-        if (nodes.length === 0) { e.preventDefault(); return; }
-        const idx = nodes.indexOf(document.activeElement);
-        if (e.shiftKey) {
-          if (idx === 0 || document.activeElement === modalRef.current) { nodes[nodes.length - 1].focus(); e.preventDefault(); }
-        } else {
-          if (idx === nodes.length - 1) { nodes[0].focus(); e.preventDefault(); }
-        }
-      }
-    };
-
-    document.addEventListener('keydown', onKey);
-    return () => { document.removeEventListener('keydown', onKey); previousActive.current?.focus?.(); };
-  }, [onClose]);
-
   const handleDownload = () => {
     const link = document.createElement('a');
     link.download = 'vaccination-qr.png';
@@ -55,9 +37,6 @@ export default function QRCodeModal({ url, onClose }) {
 
   return (
     <div
-      role="dialog"
-      aria-modal="true"
-      aria-label="Vaccination QR Code"
       onClick={(e) => e.target === overlayRef.current && onClose()}
       ref={overlayRef}
       style={{
@@ -66,7 +45,11 @@ export default function QRCodeModal({ url, onClose }) {
       }}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Vaccination QR Code"
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={onKeyDown}
         ref={modalRef}
         tabIndex={-1}
         style={{

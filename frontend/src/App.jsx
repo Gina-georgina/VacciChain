@@ -31,7 +31,7 @@ export default function App() {
   }, [dark]);
 
   return (
-    <AuthProvider>
+    <>
       <SkipToContent />
       <DemoBanner/>
       <NavBar dark={dark} onToggleDark={() => setDark(d => !d)} />
@@ -80,6 +80,14 @@ export default function App() {
         </Suspense>
         </ChunkErrorBoundary>
       </main>
+    </>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AppShell />
     </AuthProvider>
   );
 }

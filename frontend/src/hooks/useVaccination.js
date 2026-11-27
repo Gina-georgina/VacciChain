@@ -34,7 +34,7 @@ function safeErrorMessage(e, fallback) {
 }
 
 export function useVaccination(walletAddress) {
-  const { apiFetch } = useAuth();
+  const { apiFetch, walletAddress: activeAccount } = useAuth();
   const toast = useToast();
   const [records, setRecords] = useState([]);
   const [page, setPage] = useState(1);
@@ -42,6 +42,8 @@ export function useVaccination(walletAddress) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const abortRef = useRef(null);
+  // Track the account the current records belong to so we never show stale data
+  const recordsAccountRef = useRef(null);
   // Keep latest apiFetch/toast in refs so effects don't re-run when they change
   const apiFetchRef = useRef(apiFetch);
   const toastRef = useRef(toast);

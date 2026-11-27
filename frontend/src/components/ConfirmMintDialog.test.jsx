@@ -1,4 +1,5 @@
 import { render, screen, fireEvent } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import ConfirmMintDialog from './ConfirmMintDialog';
 
 describe('ConfirmMintDialog', () => {

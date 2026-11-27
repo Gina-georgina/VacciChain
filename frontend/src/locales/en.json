@@ -2,6 +2,18 @@
   "accessibility": {
     "skipToContent": "Skip to main content"
   },
+  "asyncState": {
+    "loading": "Loading…",
+    "loadingAria": "Loading content",
+    "empty": "No data available.",
+    "partial": "Some data could not be loaded.",
+    "partialDetails": "Showing {{loaded}} of {{total}} items.",
+    "error": "Something went wrong while loading data.",
+    "errorDetails": "Error: {{message}}",
+    "retry": "Retry",
+    "retrying": "Retrying…",
+    "retryAria": "Retry loading data"
+  },
   "nav": {
     "home": "Home",
     "myRecords": "My Records",
