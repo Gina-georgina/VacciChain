@@ -33,9 +33,57 @@ jobs:
         working-directory: contracts
         run: make build
 
+      - name: Compute WASM artifact hash
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          # Hash every deployable .wasm produced by the build.
+          find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > artifacts/wasm-sha256.txt
+          cat artifacts/wasm-sha256.txt
+
+      - name: Upload WASM artifact hash
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-wasm-hash
+          path: contracts/artifacts/wasm-sha256.txt
+          retention-days: 90
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-wasm
+          path: contracts/target/wasm32-unknown-unknown/release/*.wasm
+          retention-days: 90
+
       - name: Run contract tests
         working-directory: contracts
         run: cargo test
+
+      - name: Run storage lifecycle, migration, and resource baseline tests
+        working-directory: contracts
+        run: |
+          cargo test --test storage_lifecycle -- --nocapture
+          cargo test --test migration -- --nocapture
+          cargo test --test resource_baseline -- --nocapture
+
+      - name: Compare resource baselines against thresholds
+        working-directory: contracts
+        run: |
+          cargo test --test resource_baseline -- --nocapture | tee resource-baseline-report.txt
+          if grep -q "RESOURCE_REGRESSION" resource-baseline-report.txt; then
+            echo "Material resource regression detected; see resource-baseline-report.txt"
+            exit 1
+          fi
+
+      - name: Upload resource baseline comparison
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-resource-baseline
+          path: contracts/resource-baseline-report.txt
 
       - name: Run contract tests with coverage
         working-directory: contracts
@@ -63,6 +111,70 @@ jobs:
         with:
           name: contract-audit-report
           path: contracts/audit-report.txt
+
+  # Reproducible WASM build verification (Backlog #93).
+  # Rebuilds the contract WASM on a clean runner using the pinned toolchain,
+  # computes its SHA-256 hash, and compares it to the hash produced by the
+  # primary `contract` job. Fails if the hashes differ.
+  #
+  # Known nondeterministic inputs (documented per acceptance criteria):
+  #   - Rust toolchain is pinned via rust-toolchain.toml (channel + components).
+  #   - Cargo dependencies are pinned via contracts/Cargo.lock.
+  #   - The build is expected to be byte-for-byte reproducible; if a future
+  #     toolchain introduces nondeterminism, record it here and in
+  #     contracts/REPRODUCIBLE_BUILD.md.
+  reproducible-wasm:
+    name: Reproducible WASM build
+    runs-on: ubuntu-latest
+    needs: [contract]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Build WASM (clean runner)
+        working-directory: contracts
+        run: make build
+
+      - name: Compute WASM artifact hash
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > artifacts/wasm-sha256.txt
+          cat artifacts/wasm-sha256.txt
+
+      - name: Download primary build hash
+        uses: actions/download-artifact@v4
+        with:
+          name: contract-wasm-hash
+          path: primary-hash
+
+      - name: Compare hashes
+        run: |
+          set -euo pipefail
+          echo "Primary build hash:"
+          cat primary-hash/wasm-sha256.txt
+          echo "Reproduced build hash:"
+          cat contracts/artifacts/wasm-sha256.txt
+          if ! diff -u primary-hash/wasm-sha256.txt contracts/artifacts/wasm-sha256.txt; then
+            echo "::error::WASM artifact hashes differ between builds; the build is not reproducible."
+            exit 1
+          fi
+          echo "WASM artifact hashes match — build is reproducible."
+
+      - name: Upload reproduced WASM hash
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-wasm-hash-reproduced
+          path: contracts/artifacts/wasm-sha256.txt
+          retention-days: 90
 
   backend:
     name: Node.js backend
@@ -214,12 +326,13 @@ jobs:
   all-tests:
     name: All tests passed
     runs-on: ubuntu-latest
-    needs: [contract, backend, frontend, python]
+    needs: [contract, reproducible-wasm, backend, frontend, python]
     if: always()
     steps:
       - name: Check all test jobs succeeded
         run: |
           if [[ "${{ needs.contract.result }}" != "success" || \
+                "${{ needs.reproducible-wasm.result }}" != "success" || \
                 "${{ needs.backend.result }}"  != "success" || \
                 "${{ needs.frontend.result }}"  != "success" || \
                 "${{ needs.python.result }}"    != "success" ]]; then
@@ -243,10 +356,68 @@ jobs:
       - name: Build python-service image
         run: docker build ./python-service -t vaccichain-python:ci
 
+  terraform-scan:
+    name: Terraform / IaC dependency and misconfiguration scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy config scan on infra
+        id: scan-infra
+        uses: aquasecurity/trivy-action@v1
+        with:
+          scan-type: config
+          scan-ref: infra
+          format: sarif
+          output: infra-trivy.sarif
+          severity: HIGH,CRITICAL
+          ignorefile: .trivyignore
+          exit-code: 1
+        continue-on-error: true
+
+      - name: Run Trivy config scan on staging
+        id: scan-staging
+        uses: aquasecurity/trivy-action@v1
+        with:
+          scan-type: config
+          scan-ref: staging
+          format: sarif
+          output: staging-trivy.sarif
+          severity: HIGH,CRITICAL
+          ignorefile: .trivyignore
+          exit-code: 1
+        continue-on-error: true
+
+      - name: Upload Trivy IaC results to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: |
+            infra-trivy.sarif
+            staging-trivy.sarif
+
+      - name: Upload IaC scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-scan-results
+          path: |
+            infra-trivy.sarif
+            staging-trivy.sarif
+          retention-days: 30
+
+      - name: Fail on HIGH/CRITICAL findings
+        if: always()
+        run: |
+          if [[ "${{ steps.scan-infra.outcome }}" == "failure" || "${{ steps.scan-staging.outcome }}" == "failure" ]]; then
+            echo "One or more Terraform/IaC targets contain HIGH or CRITICAL findings."
+            exit 1
+          fi
+
   container-scan:
     name: Container vulnerability scanning
     runs-on: ubuntu-latest
-    needs: docker
+    needs: [docker, terraform-scan]
     steps:
       - uses: actions/checkout@v4
 

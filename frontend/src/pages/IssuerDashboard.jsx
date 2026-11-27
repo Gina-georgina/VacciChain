@@ -6,9 +6,9 @@ import ConfirmMintDialog from '../components/ConfirmMintDialog';
 import CopyButton from '../components/CopyButton';
 import RoleBadge from '../components/RoleBadge';
 import AsyncState from '../components/AsyncState';
+import { pageContainerNarrow } from '../layout.js';
 
 const styles = {
-  page: { maxWidth: 500, width: '100%', margin: '2rem auto', padding: '0 1rem', boxSizing: 'border-box' },
   form: { display: 'flex', flexDirection: 'column', gap: '1rem' },
   input: { padding: '0.6rem 0.75rem', background: '#1e293b', border: '1px solid #334155', borderRadius: 8, color: '#e2e8f0', fontSize: '1rem', width: '100%', boxSizing: 'border-box' },
   inputError: { padding: '0.6rem 0.75rem', background: '#1e293b', border: '1px solid #f87171', borderRadius: 8, color: '#e2e8f0', fontSize: '1rem', width: '100%', boxSizing: 'border-box' },
@@ -136,7 +136,7 @@ export default function IssuerDashboard() {
 
   if (!publicKey) {
     return (
-      <div style={styles.page}>
+      <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
         <p style={{ color: '#94a3b8', marginBottom: '1rem' }}>Connect your issuer wallet.</p>
         <button style={styles.btn} onClick={connect} aria-label="Connect issuer wallet">Connect Wallet</button>
       </div>
@@ -144,12 +144,12 @@ export default function IssuerDashboard() {
   }
 
   if (role !== 'issuer') {
-    return <div style={styles.page}><p style={{ color: '#f87171' }}>{t('issuer.accessDenied')}</p></div>;
+    return <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}><p style={{ color: '#f87171' }}>{t('issuer.accessDenied')}</p></div>;
   }
 
   if (authStatus === 'loading' || authStatus === 'idle') {
     return (
-      <div style={styles.page}>
+      <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
         <AsyncState status="loading" message="Checking authorization status..." />
       </div>
     );
@@ -157,7 +157,7 @@ export default function IssuerDashboard() {
 
   if (authStatus === 'error') {
     return (
-      <div style={styles.page}>
+      <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
         <AsyncState
           status="error"
           message={authError || t('issuer.authCheckFailed', 'Unable to verify issuer authorization.')}
@@ -192,7 +192,7 @@ export default function IssuerDashboard() {
   ];
 
   return (
-    <div style={styles.page}>
+    <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
       <div style={{ borderLeft: '4px solid #22c55e', paddingLeft: '0.75rem', marginBottom: '1.5rem' }}>
         <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem' }}>
           <h2 style={{ color: '#e2e8f0', margin: 0 }}>Issue Vaccination NFT</h2>

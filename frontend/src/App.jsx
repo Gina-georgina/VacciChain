@@ -1,4 +1,5 @@
 import { Routes, Route } from 'react-router-dom';
+import { useEffect } from 'react';
 import Landing from './pages/Landing';
 import PatientDashboard from './pages/PatientDashboard';
 import IssuerDashboard from './pages/IssuerDashboard';
@@ -12,10 +13,20 @@ import FreighterBanner from './components/FreighterBanner';
 import DemoBanner from './components/DemoBanner';
 import NavBar from './components/NavBar';
 import SkipToContent from './components/SkipToContent';
+import NotFoundPage from './pages/NotFoundPage';
 
 function AppShell() {
   const [dark, setDark] = useDarkMode();
   const { address } = useFreighter();
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (dark) {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
+  }, [dark]);
 
   return (
     <>
@@ -35,6 +46,7 @@ function AppShell() {
           <Route path="/admin" element={<AdminDashboard />} />
           <Route path="/apply" element={<IssuerOnboarding />} />
           <Route path="/analytics" element={<AnalyticsDashboard />} />
+          <Route path="*" element={<NotFoundPage />} />
         </Routes>
       </main>
     </>
