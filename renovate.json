@@ -1,5 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Update cadence: Renovate runs weekly (before 3am on Monday). Docker digest-only updates are auto-merged; minor/major base image updates require approval. Terraform providers and modules are kept updated weekly and grouped for review.",
   "extends": [
     "config:base",
     ":docker"
@@ -9,6 +10,9 @@
     "enabled": true,
     "major": {
       "enabled": false
+    },
+    "digest": {
+      "enabled": true
     }
   },
   "vulnerabilityAlerts": {
@@ -18,19 +22,19 @@
   "docker-compose": {
     "enabled": false
   },
-  "cargo": {
-    "enabled": true,
-    "rangeStrategy": "update-lockfile"
+  "terraform": {
+    "enabled": true
   },
   "packageRules": [
     {
-      "description": "Auto-merge Docker digest-only updates",
+      "description": "Auto-merge Docker digest-only updates weekly",
       "matchDatasources": ["docker"],
       "matchUpdateTypes": ["digest"],
       "automerge": true,
       "automergeType": "pr",
       "automergeStrategy": "squash",
-      "minimumReleaseAge": "0 days"
+      "minimumReleaseAge": "0 days",
+      "schedule": ["before 3am on Monday"]
     },
     {
       "description": "Require approval for minor/major Node.js updates",
@@ -51,42 +55,11 @@
       "automerge": false
     },
     {
-      "description": "Soroban SDK updates: never auto-merge; require tests, resource comparison, and release-note updates",
-      "matchManagers": ["cargo"],
-      "matchPackageNames": ["soroban-sdk", "soroban-spec", "soroban-env-host", "soroban-env-common", "soroban-env-guest"],
-      "automerge": false,
-      "labels": ["contracts", "dependencies", "soroban-sdk"],
-      "prBodyNotes": [
-        "### Soroban SDK upgrade checklist",
-        "- [ ] All contract tests pass (`cargo test`)",
-        "- [ ] Resource usage comparison performed (CPU/memory/fees) and results attached",
-        "- [ ] Release notes updated to document the SDK version change"
-      ]
-    },
-    {
-      "description": "Rust toolchain updates: never auto-merge; require tests, resource comparison, and release-note updates",
-      "matchManagers": ["cargo", "rust-toolchain", "rust-toolchain-toml"],
-      "matchPackageNames": ["rust", "rustc", "rust-toolchain"],
-      "automerge": false,
-      "labels": ["contracts", "dependencies", "rust-toolchain"],
-      "prBodyNotes": [
-        "### Rust toolchain upgrade checklist",
-        "- [ ] All contract tests pass (`cargo test`)",
-        "- [ ] Resource usage comparison performed (CPU/memory/fees) and results attached",
-        "- [ ] Release notes updated to document the toolchain version change"
-      ]
-    },
-    {
-      "description": "Other Cargo dependency updates in contracts: require review, no auto-merge",
-      "matchManagers": ["cargo"],
-      "automerge": false,
-      "labels": ["contracts", "dependencies"],
-      "prBodyNotes": [
-        "### Contract dependency upgrade checklist",
-        "- [ ] All contract tests pass (`cargo test`)",
-        "- [ ] Resource usage comparison performed (CPU/memory/fees) and results attached",
-        "- [ ] Release notes updated to document the dependency change"
-      ]
+      "description": "Keep Terraform providers and modules updated weekly, grouped for review",
+      "matchManagers": ["terraform"],
+      "groupName": "terraform providers and modules",
+      "schedule": ["before 3am on Monday"],
+      "automerge": false
     }
   ],
   "schedule": [

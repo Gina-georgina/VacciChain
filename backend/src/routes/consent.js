@@ -1,134 +1,80 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
-const {
-  getConsent,
-  recordConsent,
-  revokeConsent,
-  hasConsented,
-  transaction,
-} = require('../indexer/db');
+const { adminAuthMiddleware, requireWalletAccess } = require('../middleware/auth');
+const { getConsent, recordConsent, hasConsented, transaction } = require('../indexer/db');
 const validate = require('../middleware/validate');
 const { recordConsentSchema } = require('./schemas/consent.schemas');
+const { AppError } = require('../middleware/errors');
 
 const router = express.Router();
 
 /**
- * Consent state machine (API boundary)
- * -------------------------------------
- * The consent record is a patient-controlled allowlist flag that gates whether
- * an issuer is permitted to mint credentials for the patient's wallet. It is
- * NOT a privacy guarantee: any credential that is issued and anchored on a
- * public chain is publicly observable. Consent only controls *issuance*.
- *
- * States:
- *   - absent   : no consent record exists. Issuance MUST be rejected.
- *   - granted  : patient explicitly consented. Issuance is allowed.
- *   - revoked  : patient withdrew consent. Issuance MUST be rejected.
- *                Previously issued credentials remain on-chain and public.
- *   - changed  : consent was re-granted after a revocation (or the consent
- *                record was updated). Issuance is allowed again; the
- *                `changed_at` timestamp reflects the most recent transition.
- *
- * Transitions:
- *   absent  -> granted  (POST /patient/consent)
- *   granted -> revoked  (DELETE /patient/consent)
- *   revoked -> changed  (POST /patient/consent, re-grant)
- *   changed -> revoked  (DELETE /patient/consent)
- *
- * Contract allowlist semantics:
- *   The on-chain allowlist mirrors this state. `granted` and `changed` map to
- *   "allowlisted"; `absent` and `revoked` map to "not allowlisted". Issuers
- *   MUST check both the API state and the on-chain allowlist before minting.
+ * @swagger
+ * /v1/patient/consent/{wallet}:
+ *   get:
+ *     summary: Get consent status for a wallet
+ *     tags:
+ *       - Consent
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: wallet
+ *         required: true
+ *         schema: { type: string }
+ *         description: Stellar wallet address
+ *     responses:
+ *       200:
+ *         description: Consent status
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - patients may only read their own consent
  */
-
-const CONSENT_STATES = Object.freeze({
-  ABSENT: 'absent',
-  GRANTED: 'granted',
-  REVOKED: 'revoked',
-  CHANGED: 'changed',
-});
-
-/**
- * Derive the explicit consent state from a stored consent record.
- * @param {object|null|undefined} consent
- * @returns {{ state: string, allowlisted: boolean, consented_at: string|null, revoked_at: string|null, changed_at: string|null }}
- */
-function deriveConsentState(consent) {
-  if (!consent) {
-    return {
-      state: CONSENT_STATES.ABSENT,
-      allowlisted: false,
-      consented_at: null,
-      revoked_at: null,
-      changed_at: null,
-    };
-  }
-
-  const consentedAt = consent.consented_at ?? null;
-  const revokedAt = consent.revoked_at ?? null;
-  const changedAt = consent.changed_at ?? null;
-
-  if (consent.revoked === true || (revokedAt && !consent.active)) {
-    return {
-      state: CONSENT_STATES.REVOKED,
-      allowlisted: false,
-      consented_at: consentedAt,
-      revoked_at: revokedAt,
-      changed_at: changedAt,
-    };
-  }
-
-  // Re-granted after a prior revocation => "changed".
-  if (changedAt || (revokedAt && consent.active)) {
-    return {
-      state: CONSENT_STATES.CHANGED,
-      allowlisted: true,
-      consented_at: consentedAt,
-      revoked_at: revokedAt,
-      changed_at: changedAt,
-    };
-  }
-
-  return {
-    state: CONSENT_STATES.GRANTED,
-    allowlisted: true,
-    consented_at: consentedAt,
-    revoked_at: null,
-    changed_at: null,
-  };
-}
-
-/**
- * Build the public consent response payload.
- * Includes an explicit privacy notice so callers do not infer that
- * consent/allowlisting makes on-chain data private.
- */
-function buildConsentResponse(wallet, consent) {
-  const derived = deriveConsentState(consent);
-  return {
-    wallet,
-    state: derived.state,
-    consented: derived.allowlisted,
-    allowlisted: derived.allowlisted,
-    consented_at: derived.consented_at,
-    revoked_at: derived.revoked_at,
-    changed_at: derived.changed_at,
-    privacy_notice:
-      'Consent and allowlisting control issuance only. Credentials anchored on a public chain are publicly observable and are not made private by consent.',
-  };
-}
 
 /**
  * GET /patient/consent/:wallet
- * Returns explicit consent state for a wallet. Public — used by issuers
- * before minting. Callers MUST treat any state other than `granted` or
- * `changed` (i.e. `allowlisted: false`) as a rejection for issuance.
+ * Returns consent status for a wallet. Requires a JWT (#45): a patient may
+ * only read their own consent; issuers (re-verified on-chain, used before
+ * minting) and admins may read any wallet's.
  */
-router.get('/consent/:wallet', (req, res) => {
+router.get('/consent/:wallet', adminAuthMiddleware, requireWalletAccess('wallet'), (req, res) => {
   const { wallet } = req.params;
+
+  if (req.user.role === 'patient' && req.user.wallet !== wallet) {
+    return next(new AppError('forbidden', 'Patients may only access their own consent data', 403));
+  }
+
   const consent = getConsent(wallet);
   res.json(buildConsentResponse(wallet, consent));
 });
+
+/**
+ * @swagger
+ * /v1/patient/consent:
+ *   post:
+ *     summary: Record explicit patient consent
+ *     tags:
+ *       - Consent
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               wallet:
+ *                 type: string
+ *             required:
+ *               - wallet
+ *     responses:
+ *       201:
+ *         description: Consent recorded
+ *       401:
+ *         description: Unauthorized
+ */
 
 /**
  * POST /patient/consent
@@ -144,7 +90,7 @@ router.get('/consent/:wallet', (req, res) => {
  * observe "no consent" and race to insert. The transaction is rolled back on
  * any partial failure.
  */
-router.post('/consent', authMiddleware, validate(recordConsentSchema), (req, res) => {
+router.post('/consent', authMiddleware, validate(recordConsentSchema), (req, res, next) => {
   const { publicKey } = req.user;
 
   let existing = null;

@@ -29,9 +29,9 @@ function issuerToken() {
 
 // ── admin API key routes ──────────────────────────────────────────────────────
 
-describe('POST /admin/api-keys', () => {
+describe('POST /v1/admin/api-keys', () => {
   it('requires auth', async () => {
-    const res = await request(app).post('/admin/api-keys').send({ label: 'Test' });
+    const res = await request(app).post('/v1/admin/api-keys').send({ label: 'Test' });
     expect(res.status).toBe(401);
   });
 
@@ -39,7 +39,7 @@ describe('POST /admin/api-keys', () => {
     const token = jwtFactory({ sub: 'p', role: 'patient', wallet: VALID_WALLET });
 
     const res = await request(app)
-      .post('/admin/api-keys')
+      .post('/v1/admin/api-keys')
       .set('Authorization', `Bearer ${token}`)
       .send({ label: 'Test' });
     expect(res.status).toBe(403);
@@ -47,7 +47,7 @@ describe('POST /admin/api-keys', () => {
 
   it('rejects missing label', async () => {
     const res = await request(app)
-      .post('/admin/api-keys')
+      .post('/v1/admin/api-keys')
       .set('Authorization', `Bearer ${issuerToken()}`)
       .send({});
     expect(res.status).toBe(400);
@@ -56,7 +56,7 @@ describe('POST /admin/api-keys', () => {
 
   it('creates a key and returns it once', async () => {
     const res = await request(app)
-      .post('/admin/api-keys')
+      .post('/v1/admin/api-keys')
       .set('Authorization', `Bearer ${issuerToken()}`)
       .send({ label: 'School A' });
     expect(res.status).toBe(201);
@@ -67,15 +67,15 @@ describe('POST /admin/api-keys', () => {
   });
 });
 
-describe('GET /admin/api-keys', () => {
+describe('GET /v1/admin/api-keys', () => {
   it('requires auth', async () => {
-    const res = await request(app).get('/admin/api-keys');
+    const res = await request(app).get('/v1/admin/api-keys');
     expect(res.status).toBe(401);
   });
 
   it('returns list of keys without raw key value', async () => {
     const res = await request(app)
-      .get('/admin/api-keys')
+      .get('/v1/admin/api-keys')
       .set('Authorization', `Bearer ${issuerToken()}`);
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
@@ -85,24 +85,24 @@ describe('GET /admin/api-keys', () => {
   });
 });
 
-describe('DELETE /admin/api-keys/:id', () => {
+describe('DELETE /v1/admin/api-keys/:id', () => {
   it('revokes a key', async () => {
     const createRes = await request(app)
-      .post('/admin/api-keys')
+      .post('/v1/admin/api-keys')
       .set('Authorization', `Bearer ${issuerToken()}`)
       .send({ label: 'To Revoke' });
     expect(createRes.status).toBe(201);
     const { id } = createRes.body;
 
     const revokeRes = await request(app)
-      .delete(`/admin/api-keys/${id}`)
+      .delete(`/v1/admin/api-keys/${id}`)
       .set('Authorization', `Bearer ${issuerToken()}`);
     expect(revokeRes.status).toBe(200);
     expect(revokeRes.body.revoked).toBe(true);
 
     // Key should now appear as revoked in list
     const listRes = await request(app)
-      .get('/admin/api-keys')
+      .get('/v1/admin/api-keys')
       .set('Authorization', `Bearer ${issuerToken()}`);
     const found = listRes.body.find(k => k.id === id);
     expect(found.revoked).toBeTruthy();

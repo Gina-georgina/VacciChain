@@ -1,221 +1,25 @@
 const StellarSdk = require('@stellar/stellar-sdk');
 const config = require('../config');
 const logger = require('../logger');
+const {
+  withTimeout,
+  withRetry,
+  classifyError,
+  getCorrelationId,
+  SorobanError,
+  SorobanRpcError,
+  SorobanTransactionError,
+  SorobanSimulationError,
+  SorobanTimeoutError,
+  SorobanTransientError,
+  SorobanPermanentError,
+} = require('./client');
 
 const {
   SOROBAN_RPC_URL,
   STELLAR_NETWORK_PASSPHRASE: NETWORK_PASSPHRASE,
   VACCINATIONS_CONTRACT_ID: CONTRACT_ID,
-  SOROBAN_RPC_MAX_RETRIES,
-  SOROBAN_RPC_TIMEOUT_MS,
 } = config;
-
-// Canonical network passphrases for the Stellar networks we support.
-const KNOWN_NETWORKS = Object.freeze({
-  public: 'Public Global Stellar Network ; September 2015',
-  testnet: 'Test SDF Network ; September 2015',
-  futurenet: 'Test SDF Future Network ; October 2022',
-  standalone: 'Standalone Network ; February 2017',
-});
-
-// Expected network for this deployment. Must be set explicitly (e.g. STELLAR_NETWORK=testnet)
-// so we never silently deploy or invoke against the wrong network.
-const EXPECTED_NETWORK = (process.env.STELLAR_NETWORK || '').trim().toLowerCase();
-
-// Expected WASM hash of the deployed contract artifact (hex, optional but checked when set).
-const EXPECTED_WASM_HASH = (process.env.VACCINATIONS_CONTRACT_WASM_HASH || '').trim().toLowerCase();
-
-class SorobanNetworkError extends SorobanError {
-  constructor(message, originalError) {
-    super(message, originalError);
-    this.name = 'SorobanNetworkError';
-  }
-}
-
-class SorobanContractIdError extends SorobanError {
-  constructor(message, originalError) {
-    super(message, originalError);
-    this.name = 'SorobanContractIdError';
-  }
-}
-
-/**
- * Resolve the expected network passphrase from an explicit network name.
- * Throws if the network is missing or unknown.
- */
-function resolveNetworkPassphrase(network) {
-  const name = (network || '').trim().toLowerCase();
-  if (!name) {
-    throw new SorobanNetworkError(
-      'Explicit network is required (set STELLAR_NETWORK to one of: ' +
-        Object.keys(KNOWN_NETWORKS).join(', ') + ')'
-    );
-  }
-  const passphrase = KNOWN_NETWORKS[name];
-  if (!passphrase) {
-    throw new SorobanNetworkError(
-      `Unknown network "${name}". Expected one of: ${Object.keys(KNOWN_NETWORKS).join(', ')}`
-    );
-  }
-  return passphrase;
-}
-
-/**
- * Validate that the configured network passphrase matches the expected network.
- * @param {string} [network] - Explicit network name (defaults to STELLAR_NETWORK)
- * @param {string} [passphrase] - Passphrase to validate (defaults to configured passphrase)
- */
-function validateNetwork(network = EXPECTED_NETWORK, passphrase = NETWORK_PASSPHRASE) {
-  const expectedPassphrase = resolveNetworkPassphrase(network);
-  if (!passphrase) {
-    throw new SorobanNetworkError('STELLAR_NETWORK_PASSPHRASE is not configured');
-  }
-  if (passphrase !== expectedPassphrase) {
-    throw new SorobanNetworkError(
-      `Network passphrase mismatch: configured "${passphrase}" does not match ` +
-        `expected network "${network}" ("${expectedPassphrase}")`
-    );
-  }
-  return { network, passphrase };
-}
-
-/**
- * Validate that a contract ID is a well-formed Stellar contract (strkey C...) address.
- * @param {string} [contractId] - Contract ID to validate (defaults to configured contract ID)
- */
-function validateContractId(contractId = CONTRACT_ID) {
-  if (!contractId) {
-    throw new SorobanContractIdError('VACCINATIONS_CONTRACT_ID is not configured');
-  }
-  let parsed;
-  try {
-    parsed = StellarSdk.Address.fromString(contractId);
-  } catch (error) {
-    throw new SorobanContractIdError(`Invalid contract ID "${contractId}"`, error);
-  }
-  if (parsed.type !== 'contract') {
-    throw new SorobanContractIdError(
-      `Contract ID "${contractId}" is not a contract address (type: ${parsed.type})`
-    );
-  }
-  return contractId;
-}
-
-/**
- * Validate both network and contract ID configuration. Call before any deployment or invocation.
- */
-function validateDeploymentConfig() {
-  const network = validateNetwork();
-  const contractId = validateContractId();
-  return { network: network.network, passphrase: network.passphrase, contractId };
-}
-
-/**
- * Fetch the deployed contract instance and verify it belongs to the expected network
- * and (optionally) matches the expected WASM hash.
- * @param {Object} [options]
- * @param {string} [options.contractId] - Contract ID to verify (defaults to configured)
- * @param {string} [options.network] - Expected network name (defaults to STELLAR_NETWORK)
- * @param {string} [options.wasmHash] - Expected WASM hash (defaults to VACCINATIONS_CONTRACT_WASM_HASH)
- */
-async function verifyDeployedContract(options = {}) {
-  const network = options.network || EXPECTED_NETWORK;
-  const contractId = options.contractId || CONTRACT_ID;
-  const expectedWasmHash = (options.wasmHash || EXPECTED_WASM_HASH || '').toLowerCase();
-
-  // Validate local configuration first so we fail fast on mismatches.
-  validateNetwork(network);
-  validateContractId(contractId);
-
-  const rpc = getRpcServer();
-  const contract = new StellarSdk.Contract(contractId);
-
-  const dummyKeypair = StellarSdk.Keypair.random();
-  const account = new StellarSdk.Account(dummyKeypair.publicKey(), '0');
-  const tx = new StellarSdk.TransactionBuilder(account, {
-    fee: TX_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
-  })
-    .addOperation(contract.call('__verify_deployment__'))
-    .setTimeout(30)
-    .build();
-
-  const sim = await withRetry(() => rpc.simulateTransaction(tx), 'verifyDeployedContract');
-  const instance = sim.result?.result?.() ?? sim.result;
-  const wasmHash = instance?.wasmHash ? Buffer.from(instance.wasmHash).toString('hex') : null;
-
-  if (!wasmHash) {
-    throw new SorobanContractIdError(
-      `Unable to read WASM hash for contract "${contractId}" on network "${network}"`
-    );
-  }
-  if (expectedWasmHash && wasmHash !== expectedWasmHash) {
-    throw new SorobanContractIdError(
-      `WASM hash mismatch for contract "${contractId}": deployed ${wasmHash}, expected ${expectedWasmHash}`
-    );
-  }
-
-  return { network, contractId, wasmHash };
-}
-
-class SorobanError extends Error {
-  constructor(message, originalError) {
-    super(message);
-    this.name = 'SorobanError';
-    this.original = originalError;
-  }
-}
-
-class SorobanRpcError extends SorobanError {
-  constructor(message, originalError) {
-    super(message, originalError);
-    this.name = 'SorobanRpcError';
-  }
-}
-
-class SorobanTransactionError extends SorobanError {
-  constructor(message, originalError) {
-    super(message, originalError);
-    this.name = 'SorobanTransactionError';
-  }
-}
-
-class SorobanSimulationError extends SorobanError {
-  constructor(message, originalError) {
-    super(message, originalError);
-    this.name = 'SorobanSimulationError';
-  }
-}
-
-class SorobanTimeoutError extends SorobanError {
-  constructor(context, elapsedMs) {
-    super(`RPC timeout after ${elapsedMs}ms (context: ${context})`);
-    this.name = 'SorobanTimeoutError';
-    this.context = context;
-    this.elapsedMs = elapsedMs;
-  }
-}
-
-/**
- * Race an async fn against a timeout. Cleans up the timer on resolution.
- * Throws SorobanTimeoutError if the timeout fires first.
- */
-async function withTimeout(fn, context) {
-  const start = Date.now();
-  let timer;
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      const elapsed = Date.now() - start;
-      logger.warn('Soroban RPC timeout', { context, rpcUrl: SOROBAN_RPC_URL, elapsedMs: elapsed });
-      reject(new SorobanTimeoutError(context, elapsed));
-    }, SOROBAN_RPC_TIMEOUT_MS);
-  });
-  try {
-    return await Promise.race([fn(), timeoutPromise]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 // Fee in stroops (1 XLM = 10_000_000 stroops). Minimum is 100.
 const TX_FEE = String(process.env.SOROBAN_FEE || 100);
@@ -227,55 +31,20 @@ function getRpcServer() {
 }
 
 /**
- * Helper to retry RPC calls with exponential backoff.
- * @param {Function} fn - The RPC call to execute
- * @param {string} context - Context for logging
+ * Execute a single-attempt RPC call (used for non-idempotent operations such as
+ * transaction submission). Applies a bounded timeout but never retries, so a
+ * transaction is never submitted twice.
  */
-async function withRetry(fn, context = '') {
-  let lastError;
-  for (let attempt = 0; attempt <= SOROBAN_RPC_MAX_RETRIES; attempt++) {
-    try {
-      if (attempt > 0) {
-        const backoff = Math.pow(2, attempt - 1) * 100; // 100ms, 200ms, 400ms
-        logger.info(`Retrying Soroban RPC call`, {
-          context,
-          attempt,
-          maxRetries: SOROBAN_RPC_MAX_RETRIES,
-          backoffMs: backoff,
-        });
-        await new Promise((resolve) => setTimeout(resolve, backoff));
-      }
-      return await withTimeout(fn, context);
-    } catch (error) {
-      lastError = error;
+async function callOnce(fn, context) {
+  return withTimeout(fn, context);
+}
 
-      // Don't retry 4xx errors as they are likely client-side/contract logic errors
-      const status = error.response?.status;
-      if (status && status >= 400 && status < 500) {
-        logger.warn(`Non-retryable Soroban RPC error`, {
-          context,
-          status,
-          message: error.message,
-        });
-        throw error;
-      }
-
-      if (attempt === SOROBAN_RPC_MAX_RETRIES) {
-        logger.error(`Soroban RPC call failed after maximum retries`, {
-          context,
-          attempt,
-          message: error.message,
-        });
-      } else {
-        logger.debug(`Soroban RPC call transient failure`, {
-          context,
-          attempt,
-          message: error.message,
-        });
-      }
-    }
-  }
-  throw lastError;
+/**
+ * Execute an idempotent read-only RPC call with bounded timeout and retries.
+ * Only safe-to-retry operations should use this.
+ */
+async function callRead(fn, context) {
+  return withRetry(fn, context, { idempotent: true });
 }
 
 /**
@@ -289,7 +58,7 @@ async function invokeContract(secretKey, method, args) {
   validateDeploymentConfig();
   const rpc = getRpcServer();
   const keypair = StellarSdk.Keypair.fromSecret(secretKey);
-  const account = await withRetry(() => rpc.getAccount(keypair.publicKey()), 'getAccount');
+  const account = await callRead(() => rpc.getAccount(keypair.publicKey()), 'getAccount');
 
   const contract = new StellarSdk.Contract(CONTRACT_ID);
 
@@ -304,33 +73,34 @@ async function invokeContract(secretKey, method, args) {
     .setTimeout(30)
     .build();
 
-  const prepared = await withRetry(() => rpc.prepareTransaction(tx), 'prepareTransaction');
+  const prepared = await callRead(() => rpc.prepareTransaction(tx), 'prepareTransaction');
   prepared.sign(keypair);
 
-  const response = await withRetry(() => rpc.sendTransaction(prepared), 'sendTransaction');
+  // Submission is NOT idempotent: single attempt only, bounded by timeout.
+  const response = await callOnce(() => rpc.sendTransaction(prepared), 'sendTransaction');
   if (response.status === 'ERROR') {
     const errDetail = JSON.stringify(response.errorResult);
     if (errDetail.includes('txINSUFFICIENT_FEE') || errDetail.includes('fee')) {
-      throw new Error(
+      throw new SorobanPermanentError(
         `Transaction rejected: fee too low (current: ${TX_FEE} stroops). ` +
         `Increase SOROBAN_FEE in your environment. Details: ${errDetail}`
       );
     }
-    const error = new Error(`Contract invocation failed: ${errDetail}`);
+    const error = new SorobanTransactionError(`Contract invocation failed: ${errDetail}`);
     error.sorobanErrorResult = response.errorResult;
     throw error;
   }
 
-  // Poll for result
+  // Poll for result (read-only, safe to retry)
   let result;
   for (let i = 0; i < 10; i++) {
     await new Promise((r) => setTimeout(r, 2000));
-    result = await withRetry(() => rpc.getTransaction(response.hash), 'getTransaction');
+    result = await callRead(() => rpc.getTransaction(response.hash), 'getTransaction');
     if (result.status !== 'NOT_FOUND') break;
   }
 
   if (result.status !== 'SUCCESS') {
-    const error = new Error(`Transaction failed: ${result.status}`);
+    const error = new SorobanTransactionError(`Transaction failed: ${result.status}`);
     error.sorobanResultXdr = result.resultXdr;
     error.sorobanStatus = result.status;
     throw error;
@@ -472,9 +242,9 @@ async function simulateContract(method, args) {
     .setTimeout(30)
     .build();
 
-  const sim = await withRetry(() => rpc.simulateTransaction(tx), 'simulateTransaction');
+  const sim = await callRead(() => rpc.simulateTransaction(tx), 'simulateTransaction');
   if (StellarSdk.SorobanRpc.Api.isSimulationError(sim)) {
-    const error = new Error(`Simulation failed: ${sim.error}`);
+    const error = new SorobanSimulationError(`Simulation failed: ${sim.error}`);
     error.simulationError = sim.error;
     throw error;
   }
@@ -486,7 +256,11 @@ async function simulateContract(method, args) {
  * Send a 503 RPC timeout response. Use in route catch blocks when err is SorobanTimeoutError.
  */
 function sendRpcTimeout(res) {
-  return res.status(503).json({ error: 'RPC timeout', retryAfter: 5 });
+  return res.status(503).json({
+    error: 'RPC timeout',
+    retryAfter: 5,
+    correlationId: getCorrelationId(),
+  });
 }
 
 module.exports = {
@@ -498,20 +272,15 @@ module.exports = {
   addIssuer,
   revokeIssuer,
   sendRpcTimeout,
-  validateNetwork,
-  validateContractId,
-  validateDeploymentConfig,
-  verifyDeployedContract,
-  resolveNetworkPassphrase,
-  KNOWN_NETWORKS,
+  classifyError,
   VerificationStatus,
   SorobanError,
   SorobanRpcError,
   SorobanTransactionError,
   SorobanSimulationError,
   SorobanTimeoutError,
-  SorobanNetworkError,
-  SorobanContractIdError,
+  SorobanTransientError,
+  SorobanPermanentError,
 };
 
 /**

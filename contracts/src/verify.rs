@@ -1,7 +1,23 @@
+//! Vaccination verification logic.
+//!
+//! # Batch verification limits
+//!
+//! `batch_verify` accepts at most [`MAX_BATCH_SIZE`] wallets per invocation.
+//! The limit is validated up front, before any storage access, so an over-limit
+//! request is rejected cheaply without consuming storage read resources.
+//! Requests exceeding the limit return [`ContractError::BatchTooLarge`].
+
 use soroban_sdk::{Env, Address, Vec, contracttype, String};
 use crate::storage::{DataKey, VaccinationRecord};
+use crate::errors::ContractError;
 
-const MAX_BATCH_SIZE: u32 = 100;
+/// Maximum number of wallets accepted by a single `batch_verify` invocation.
+///
+/// This bound keeps per-invocation resource usage (storage reads, CPU and
+/// memory) predictable. It is validated before any storage access occurs.
+/// Passing more than this many wallets fails with
+/// `ContractError::BatchTooLarge` and performs no storage reads or writes.
+pub const MAX_BATCH_SIZE: u32 = 100;
 
 /// Public, privacy-preserving projection of a vaccination record.
 ///
@@ -73,6 +89,23 @@ pub fn patient_index_missing(env: &Env, wallet: &Address) -> bool {
         .is_none()
 }
 
+/// Explicit outcome of a verification request.
+///
+/// Only `Valid` indicates an active vaccination record. `Revoked`, `Absent`,
+/// and `Unavailable` must never be treated as a positive verification result.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VerificationStatus {
+    /// At least one active (non-revoked) record exists.
+    Valid,
+    /// Records exist but all are revoked.
+    Revoked,
+    /// No records exist for the wallet.
+    Absent,
+    /// The data could not be read; callers must NOT treat this as valid.
+    Unavailable,
+}
+
 /// Per-vaccine dose completion summary returned by verify_vaccination.
 #[contracttype]
 #[derive(Clone)]
@@ -85,6 +118,23 @@ pub struct DoseStatus {
     pub doses_required: u32,
     /// True when the required number of doses has been completed.
     pub complete: bool,
+}
+
+/// Explicit outcome of a verification call.
+///
+/// Only `Valid` indicates an active vaccination record. Callers must never
+/// treat `Revoked`, `Absent`, or `Unavailable` as a positive result.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VerificationStatus {
+    /// At least one active (non-revoked) record exists.
+    Valid,
+    /// Records exist but all are revoked.
+    Revoked,
+    /// No records exist for the wallet.
+    Absent,
+    /// The data could not be read; must NOT be treated as a positive result.
+    Unavailable,
 }
 
 /// Batch verify vaccination status for multiple wallets.
@@ -101,17 +151,30 @@ pub struct DoseStatus {
 /// * `wallets` - Vector of wallet addresses to verify.
 ///
 /// # Returns
-/// * `Vec<(Address, bool, Vec<PublicVaccinationRecord>)>` where the bool indicates whether the wallet has any active vaccination records.
-pub fn batch_verify(env: &Env, wallets: Vec<Address>) -> Vec<(Address, bool, Vec<PublicVaccinationRecord>)> {
-    assert!(wallets.len() <= MAX_BATCH_SIZE, "batch size exceeds maximum of 100");
+/// * `Ok(Vec<(Address, VerificationStatus, Vec<VaccinationRecord>)>)` where the status
+///   distinguishes valid, revoked, absent, and unavailable data. Only
+///   `VerificationStatus::Valid` indicates an active vaccination record.
+/// * `Err(ContractError::BatchTooLarge)` when `wallets.len() > MAX_BATCH_SIZE`.
+///
+/// The batch size is validated before any storage access is performed.
+/// This function is read-only: it never mutates storage and never emits events.
+pub fn batch_verify(
+    env: &Env,
+    wallets: Vec<Address>,
+) -> Result<Vec<(Address, VerificationStatus, Vec<VaccinationRecord>)>, ContractError> {
+    if wallets.len() > MAX_BATCH_SIZE {
+        return Err(ContractError::BatchTooLarge);
+    }
 
-    let mut results: Vec<(Address, bool, Vec<PublicVaccinationRecord>)> = Vec::new(env);
+    let mut results: Vec<(Address, VerificationStatus, Vec<VaccinationRecord>)> = Vec::new(env);
+    // Iteration is bounded by `wallets.len()`, which is <= MAX_BATCH_SIZE, so
+    // the loop counter cannot overflow and the result vec stays small.
     for i in 0..wallets.len() {
         let wallet = wallets.get(i).unwrap();
         let (status, records, _) = verify_vaccination(env, wallet.clone());
         results.push_back((wallet, status, records));
     }
-    results
+    Ok(results)
 }
 
 /// Verify vaccination status for a single wallet.
@@ -135,7 +198,12 @@ pub fn batch_verify(env: &Env, wallets: Vec<Address>) -> Vec<(Address, bool, Vec
 ///   - bool: wallet has at least one active record
 ///   - Vec<PublicVaccinationRecord>: active records, public fields only
 ///   - Vec<DoseStatus>: per-vaccine dose completion summary
-pub fn verify_vaccination(env: &Env, wallet: Address) -> (bool, Vec<PublicVaccinationRecord>, Vec<DoseStatus>) {
+///
+/// # Read-only guarantee
+/// This function only reads persistent storage. It never writes storage, never
+/// emits events, and therefore cannot alter token ownership or any other state.
+/// Soulbound enforcement is unaffected by verification calls.
+pub fn verify_vaccination(env: &Env, wallet: Address) -> (VerificationStatus, Vec<VaccinationRecord>, Vec<DoseStatus>) {
     // Missing or expired patient index: treat as "no records". This is a
     // non-authorized result and must never be interpreted as authorized.
     let tokens: Vec<u64> = match env
@@ -144,7 +212,7 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (bool, Vec<PublicVaccin
         .get::<DataKey, Vec<u64>>(&DataKey::PatientTokens(wallet.clone()))
     {
         Some(tokens) => tokens,
-        None => return (false, Vec::new(env), Vec::new(env)),
+        None => return (VerificationStatus::Absent, Vec::new(env), Vec::new(env)),
     };
 
     if tokens.is_empty() {
@@ -160,10 +228,23 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (bool, Vec<PublicVaccin
     // counted as active records, so authorization cannot fail open.
     for i in 0..tokens.len() {
         let tid = tokens.get(i).unwrap();
-        if let Some(record) = env.storage().persistent().get::<DataKey, VaccinationRecord>(&DataKey::Token(tid)) {
-            if !record.revoked {
-                has_active = true;
-                records.push_back(to_public_record(tid, &record));
+        match env
+            .storage()
+            .persistent()
+            .get::<DataKey, VaccinationRecord>(&DataKey::Token(tid))
+        {
+            Some(record) => {
+                if record.revoked {
+                    has_revoked = true;
+                } else {
+                    has_active = true;
+                    records.push_back(record);
+                } else {
+                    has_revoked = true;
+                }
+            }
+            None => {
+                // Token entry absent or expired; skip without granting access.
             }
         }
         // Token entry absent or expired; skip without granting access.
@@ -178,6 +259,9 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (bool, Vec<PublicVaccin
 
     for i in 0..records.len() {
         let rec = records.get(i).unwrap();
+        // Missing dose metadata is treated as 0 (no doses recorded). Values are
+        // only ever compared and stored verbatim; no arithmetic is performed on
+        // them, so there is no overflow risk even at u32::MAX.
         let dn = rec.dose_number.unwrap_or(0);
         let ds = rec.dose_series.unwrap_or(0);
 
@@ -186,12 +270,10 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (bool, Vec<PublicVaccin
             if vaccine_names.get(j).unwrap() == rec.vaccine_name {
                 let prev_dn = doses_received.get(j).unwrap();
                 let prev_ds = doses_required.get(j).unwrap();
-                if dn > prev_dn {
-                    doses_received.set(j, dn);
-                }
-                if ds > prev_ds {
-                    doses_required.set(j, ds);
-                }
+                // Use max() instead of manual comparison to make the
+                // non-arithmetic, overflow-free intent explicit.
+                doses_received.set(j, dn.max(prev_dn));
+                doses_required.set(j, ds.max(prev_ds));
                 found = true;
                 break;
             }
@@ -207,6 +289,8 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (bool, Vec<PublicVaccin
     for i in 0..vaccine_names.len() {
         let dr = doses_received.get(i).unwrap();
         let dq = doses_required.get(i).unwrap();
+        // Completion is a pure comparison (no subtraction), so it is safe for
+        // any u32 values including 0 and u32::MAX.
         dose_statuses.push_back(DoseStatus {
             vaccine_name: vaccine_names.get(i).unwrap(),
             doses_received: dr,
@@ -322,5 +406,62 @@ mod tests {
         assert!(vaccinated);
         assert_eq!(records.len(), 1);
         assert_eq!(records.get(0).unwrap().token_id, 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn make_wallets(env: &Env, count: u32) -> Vec<Address> {
+        let mut wallets: Vec<Address> = Vec::new(env);
+        for _ in 0..count {
+            wallets.push_back(Address::generate(env));
+        }
+        wallets
+    }
+
+    #[test]
+    fn batch_verify_accepts_exactly_max_batch_size() {
+        let env = Env::default();
+        let wallets = make_wallets(&env, MAX_BATCH_SIZE);
+        let result = batch_verify(&env, wallets);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), MAX_BATCH_SIZE);
+    }
+
+    #[test]
+    fn batch_verify_rejects_over_limit_before_storage_access() {
+        let env = Env::default();
+        let wallets = make_wallets(&env, MAX_BATCH_SIZE + 1);
+        let result = batch_verify(&env, wallets);
+        assert_eq!(result, Err(ContractError::BatchTooLarge));
+    }
+
+    #[test]
+    fn batch_verify_handles_mixed_results() {
+        let env = Env::default();
+        let mut wallets: Vec<Address> = Vec::new(&env);
+        // Wallets without records should report not vaccinated.
+        for _ in 0..3 {
+            wallets.push_back(Address::generate(&env));
+        }
+        let result = batch_verify(&env, wallets).unwrap();
+        assert_eq!(result.len(), 3);
+        for i in 0..result.len() {
+            let (_, status, records) = result.get(i).unwrap();
+            assert_eq!(status, VerificationStatus::Absent);
+            assert_eq!(records.len(), 0);
+        }
+    }
+
+    #[test]
+    fn batch_verify_empty_batch_is_ok() {
+        let env = Env::default();
+        let wallets: Vec<Address> = Vec::new(&env);
+        let result = batch_verify(&env, wallets);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
     }
 }

@@ -6,38 +6,62 @@ const { resolveContractErrorMessage } = require('../stellar/contractErrors');
 const { verifyLimiter, verifierKeyLimiter } = require('../middleware/rateLimiter');
 const verifierApiKey = require('../middleware/verifierApiKey');
 const authMiddleware = require('../middleware/auth');
+const { toApiRecords } = require('../schemas/vaccinationRecord');
 const { audit } = require('../middleware/auditLog');
+const { AppError } = require('../middleware/errors');
 
 const router = express.Router();
 
 const verifyCache = new Map();
 const CACHE_TTL = 60 * 1000; // 60 seconds
 
-// Fields that must never be exposed by the public verification endpoint.
-// Public-chain data is not private, so we explicitly allowlist what is returned.
-const PUBLIC_RECORD_FIELDS = ['vaccine', 'date', 'verified'];
+// Maximum number of records returned in a single verification response.
+// Histories longer than this are truncated; clients can page through the
+// remainder using the `limit` and `offset` query parameters.
+const MAX_RECORDS_LIMIT = 100;
+const DEFAULT_RECORDS_LIMIT = 50;
 
 /**
- * Shape a record for the public endpoint, keeping only allowlisted fields.
- * Any prohibited/private field is dropped.
+ * Parse and clamp the `limit` / `offset` query parameters.
+ * - `limit` defaults to DEFAULT_RECORDS_LIMIT and is clamped to [1, MAX_RECORDS_LIMIT].
+ * - `offset` defaults to 0 and must be a non-negative integer.
+ * Invalid values fall back to the defaults so responses stay bounded.
  */
-function toPublicRecord(record) {
-  if (!record || typeof record !== 'object') return {};
-  const shaped = {};
-  for (const field of PUBLIC_RECORD_FIELDS) {
-    if (record[field] !== undefined) {
-      shaped[field] = record[field];
-    }
-  }
-  return shaped;
+function parsePagination(query = {}) {
+  const rawLimit = Number.parseInt(query.limit, 10);
+  const rawOffset = Number.parseInt(query.offset, 10);
+
+  let limit = Number.isFinite(rawLimit) ? rawLimit : DEFAULT_RECORDS_LIMIT;
+  if (limit < 1) limit = 1;
+  if (limit > MAX_RECORDS_LIMIT) limit = MAX_RECORDS_LIMIT;
+
+  let offset = Number.isFinite(rawOffset) && rawOffset > 0 ? rawOffset : 0;
+
+  return { limit, offset };
 }
 
 /**
- * Shape a list of records for the public endpoint.
+ * Apply pagination/truncation to a record history and build metadata.
+ * The returned `records` array never exceeds `limit` entries.
  */
-function toPublicRecords(records) {
-  if (!Array.isArray(records)) return [];
-  return records.map(toPublicRecord);
+function paginateRecords(records, { limit, offset }) {
+  const all = Array.isArray(records) ? records : [];
+  const total = all.length;
+  const page = all.slice(offset, offset + limit);
+  const truncated = offset + page.length < total;
+
+  return {
+    records: page,
+    meta: {
+      total,
+      returned: page.length,
+      limit,
+      offset,
+      truncated,
+      max_limit: MAX_RECORDS_LIMIT,
+      next_offset: truncated ? offset + page.length : null,
+    },
+  };
 }
 
 /**
@@ -114,17 +138,9 @@ function adaptiveLimiter(req, res, next) {
  *       and third-party integrators. No authentication required.
  *       Results are cached for 60 seconds to reduce RPC load.
  *
- *       Consent & allowlist semantics:
- *       - Consent absent: no record is issued; verification reports verified=false.
- *       - Consent granted: record is issued and publicly verifiable.
- *       - Consent revoked: previously issued records are no longer verifiable;
- *         verification reports verified=false.
- *       - Consent changed: the latest consent state governs verification.
- *
- *       Privacy note: on-chain data is public. This endpoint therefore returns
- *       only a minimal, allowlisted projection (wallet, verified, and a redacted
- *       record summary). Prohibited/private fields (e.g. patient identifiers,
- *       provider notes, raw consent metadata) are never returned here.
+ *       Response size is bounded: at most 100 records are ever returned per call
+ *       (default 50). Longer histories are truncated and reported via `meta.truncated`
+ *       and `meta.next_offset`; page through the remainder with `limit` and `offset`.
  *     tags:
  *       - Verification
  *     parameters:
@@ -134,6 +150,23 @@ function adaptiveLimiter(req, res, next) {
  *         schema:
  *           type: string
  *         description: Stellar wallet address to verify
+ *       - in: query
+ *         name: limit
+ *         required: false
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 100
+ *           default: 50
+ *         description: Maximum number of records to return (clamped to 1..100).
+ *       - in: query
+ *         name: offset
+ *         required: false
+ *         schema:
+ *           type: integer
+ *           minimum: 0
+ *           default: 0
+ *         description: Number of records to skip before returning results.
  *     responses:
  *       200:
  *         description: Vaccination status retrieved (redacted public projection)
@@ -160,18 +193,60 @@ function adaptiveLimiter(req, res, next) {
  *                   type: array
  *                   description: Redacted record summaries (no prohibited fields)
  *                   items:
- *                     type: object
- *                     properties:
- *                       vaccine:
- *                         type: string
- *                       date:
- *                         type: string
- *                       verified:
- *                         type: boolean
+ *                     $ref: '#/components/schemas/VaccinationRecord'
+ *                 meta:
+ *                   type: object
+ *                   description: Pagination/truncation metadata
+ *                   properties:
+ *                     total:
+ *                       type: integer
+ *                     returned:
+ *                       type: integer
+ *                     limit:
+ *                       type: integer
+ *                     offset:
+ *                       type: integer
+ *                     truncated:
+ *                       type: boolean
+ *                     max_limit:
+ *                       type: integer
+ *                     next_offset:
+ *                       type: integer
+ *                       nullable: true
  *       400:
  *         description: Invalid wallet format
  *       429:
- *         description: Rate limit exceeded (60 requests per IP per minute)
+ *         description: >
+ *           Rate limit exceeded (60 requests per trusted client per minute).
+ *           The response body includes `retryAfter` (seconds until the caller may retry)
+ *           and the response carries `RateLimit-*` and `Retry-After` headers.
+ *         headers:
+ *           Retry-After:
+ *             description: Seconds to wait before retrying
+ *             schema:
+ *               type: integer
+ *           RateLimit-Limit:
+ *             description: Request quota for the current window
+ *             schema:
+ *               type: integer
+ *           RateLimit-Remaining:
+ *             description: Requests remaining in the current window
+ *             schema:
+ *               type: integer
+ *           RateLimit-Reset:
+ *             description: Seconds until the current window resets
+ *             schema:
+ *               type: integer
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 error:
+ *                   type: string
+ *                 retryAfter:
+ *                   type: integer
+ *                   description: Seconds until the caller may retry
  *       503:
  *         description: >
  *           RPC timeout or service unavailable. Response body has
@@ -190,21 +265,25 @@ router.get(
   verifyLimiter,
   async (req, res) => {
     const { wallet } = req.params;
-    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+    // Trusted client identity resolved by the rate limiter (respects trust proxy config).
+    const ip = req.rateLimitClientId || req.ip || req.socket?.remoteAddress || 'unknown';
 
     const now = Date.now();
     const cached = verifyCache.get(wallet);
     if (cached && (now - cached.timestamp < CACHE_TTL)) {
+      const { records, meta } = paginateRecords(cached.records, pagination);
       return res.json({
         wallet,
         status: cached.status,
         verified: cached.status === VERIFY_STATUS.VALID,
-        records: toPublicRecords(cached.records)
+        records,
+        meta
       });
     }
 
     try {
-      const { vaccinated, records } = await verifyVaccination(wallet);
+      const { vaccinated, records: rawRecords } = await verifyVaccination(wallet);
+      const records = toApiRecords(rawRecords);
       const status = deriveStatus(vaccinated, records);
 
       verifyCache.set(wallet, {
@@ -222,11 +301,13 @@ router.get(
         meta: { ip, status },
       });
 
+      const { records: page, meta } = paginateRecords(records, pagination);
       res.json({
         wallet,
         status,
         verified: status === VERIFY_STATUS.VALID,
-        records: toPublicRecords(records)
+        records: page,
+        meta
       });
     } catch (err) {
       const errorMessage = resolveContractErrorMessage(err);
@@ -253,6 +334,10 @@ router.get(
  *     description: >
  *       Requires JWT or API key authentication. Returns detailed vaccination records
  *       with additional metadata. Results are cached for 60 seconds.
+ *
+ *       Response size is bounded: at most 100 records are ever returned per call
+ *       (default 50). Longer histories are truncated and reported via `meta.truncated`
+ *       and `meta.next_offset`; page through the remainder with `limit` and `offset`.
  *     tags:
  *       - Verification
  *     security:
@@ -265,6 +350,23 @@ router.get(
  *         schema:
  *           type: string
  *         description: Stellar wallet address to verify
+ *       - in: query
+ *         name: limit
+ *         required: false
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 100
+ *           default: 50
+ *         description: Maximum number of records to return (clamped to 1..100).
+ *       - in: query
+ *         name: offset
+ *         required: false
+ *         schema:
+ *           type: integer
+ *           minimum: 0
+ *           default: 0
+ *         description: Number of records to skip before returning results.
  *     responses:
  *       200:
  *         description: Vaccination status retrieved
@@ -291,10 +393,30 @@ router.get(
  *                     negative (or positive) medical determination.
  *                 record_count:
  *                   type: number
+ *                   description: Number of records returned in this response
  *                 records:
  *                   type: array
  *                   items:
  *                     $ref: '#/components/schemas/VaccinationRecord'
+ *                 meta:
+ *                   type: object
+ *                   description: Pagination/truncation metadata
+ *                   properties:
+ *                     total:
+ *                       type: integer
+ *                     returned:
+ *                       type: integer
+ *                     limit:
+ *                       type: integer
+ *                     offset:
+ *                       type: integer
+ *                     truncated:
+ *                       type: boolean
+ *                     max_limit:
+ *                       type: integer
+ *                     next_offset:
+ *                       type: integer
+ *                       nullable: true
  *       400:
  *         description: Invalid wallet format
  *       401:
@@ -318,25 +440,35 @@ router.get(
   validateStellarPublicKey('params', 'wallet'),
   jwtOrApiKey,
   adaptiveLimiter,
-  async (req, res) => {
+  async (req, res, next) => {
     const { wallet } = req.params;
     const actor = req.verifier ? `apikey:${req.verifier.id}` : (req.user?.wallet ?? 'unknown');
+    const pagination = parsePagination(req.query);
+
+    // Object-level authorization (#45): patients may only verify their own wallet;
+    // issuers, admins, and verifier API-key callers may verify any wallet.
+    if (req.user && req.user.role === 'patient' && req.user.wallet !== wallet) {
+      return next(new AppError('forbidden', 'Patients may only verify their own vaccination status', 403));
+    }
 
     const now = Date.now();
     const cached = verifyCache.get(wallet);
     if (cached && (now - cached.timestamp < CACHE_TTL)) {
+      const { records, meta } = paginateRecords(cached.records, pagination);
       return res.json({
         wallet,
         status: cached.status,
         vaccinated: cached.vaccinated,
         verified: cached.status === VERIFY_STATUS.VALID,
-        record_count: cached.records.length,
-        records: cached.records
+        record_count: records.length,
+        records,
+        meta
       });
     }
 
     try {
-      const { vaccinated, records } = await verifyVaccination(wallet);
+      const { vaccinated, records: rawRecords } = await verifyVaccination(wallet);
+      const records = toApiRecords(rawRecords);
       const status = deriveStatus(vaccinated, records);
 
       verifyCache.set(wallet, {
@@ -354,13 +486,15 @@ router.get(
         meta: req.verifier ? { verifier_label: req.verifier.label, status } : { status },
       });
 
+      const { records: page, meta } = paginateRecords(records, pagination);
       res.json({
         wallet,
         status,
         vaccinated,
         verified: status === VERIFY_STATUS.VALID,
-        record_count: records.length,
-        records
+        record_count: page.length,
+        records: page,
+        meta
       });
     } catch (err) {
       const errorMessage = resolveContractErrorMessage(err);
@@ -383,4 +517,8 @@ router.verifyCache = verifyCache;
 router.toPublicRecord = toPublicRecord;
 router.toPublicRecords = toPublicRecords;
 router.VERIFY_STATUS = VERIFY_STATUS;
+router.MAX_RECORDS_LIMIT = MAX_RECORDS_LIMIT;
+router.DEFAULT_RECORDS_LIMIT = DEFAULT_RECORDS_LIMIT;
+router.parsePagination = parsePagination;
+router.paginateRecords = paginateRecords;
 module.exports = router;
