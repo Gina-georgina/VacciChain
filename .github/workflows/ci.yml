@@ -197,6 +197,10 @@ jobs:
         working-directory: backend
         run: npm run lint
 
+      - name: OpenAPI docs drift check (#43)
+        working-directory: backend
+        run: npm run docs:check
+
       - name: Run tests
         working-directory: backend
         run: npm test
@@ -243,6 +247,10 @@ jobs:
       - name: Lint
         working-directory: frontend
         run: npm run lint
+
+      - name: Check locale key parity
+        working-directory: frontend
+        run: node scripts/check-locale-parity.js
 
       - name: Run tests
         working-directory: frontend

@@ -40,6 +40,41 @@ The backend validates its variables at startup via [Zod](https://zod.dev/). A mi
 - Example (testnet): `STELLAR_NETWORK_PASSPHRASE=Test SDF Network ; September 2015`
 - Example (mainnet): `STELLAR_NETWORK_PASSPHRASE=Public Global Stellar Network ; September 2015`
 
+### `HORIZON_TIMEOUT_MS`
+- Required: no
+- Default: `10000`
+- Format: positive integer (milliseconds)
+- Description: Per-request timeout applied to every Horizon HTTP call. Prevents workers from blocking indefinitely on a slow or unresponsive Horizon endpoint. Exceeding the timeout aborts the request and surfaces a classified `timeout` error.
+- Example: `HORIZON_TIMEOUT_MS=10000`
+
+### `SOROBAN_RPC_TIMEOUT_MS`
+- Required: no
+- Default: `15000`
+- Format: positive integer (milliseconds)
+- Description: Per-request timeout applied to every Soroban RPC call (simulation, submission, and status polling). Exceeding the timeout aborts the request and surfaces a classified `timeout` error.
+- Example: `SOROBAN_RPC_TIMEOUT_MS=15000`
+
+### `SOROBAN_RPC_MAX_RETRIES`
+- Required: no
+- Default: `3`
+- Format: non-negative integer
+- Description: Maximum number of retries for Soroban RPC calls. Only idempotent, read-only operations (e.g. `simulateTransaction`, `getTransaction`) are retried. Transaction submission is never retried automatically — a submission that times out is reported as `indeterminate` so callers can reconcile via transaction hash instead of risking a duplicate submission. When retries are exhausted the call fails with a classified error and a structured correlation identifier.
+- Example: `SOROBAN_RPC_MAX_RETRIES=3`
+
+### `SOROBAN_RPC_RETRY_BASE_DELAY_MS`
+- Required: no
+- Default: `250`
+- Format: positive integer (milliseconds)
+- Description: Base delay for exponential backoff between Soroban RPC retries. The delay for attempt *n* is `SOROBAN_RPC_RETRY_BASE_DELAY_MS * 2^(n-1)`, capped by `SOROBAN_RPC_RETRY_MAX_DELAY_MS`.
+- Example: `SOROBAN_RPC_RETRY_BASE_DELAY_MS=250`
+
+### `SOROBAN_RPC_RETRY_MAX_DELAY_MS`
+- Required: no
+- Default: `4000`
+- Format: positive integer (milliseconds)
+- Description: Upper bound on the backoff delay between Soroban RPC retries.
+- Example: `SOROBAN_RPC_RETRY_MAX_DELAY_MS=4000`
+
 ---
 
 ## Contract
@@ -182,19 +217,79 @@ Public verification endpoints (`GET /verify/:wallet`, batch verification) are bo
 
 ## Rate limiting
 
+Sensitive operations are rate limited per client identity. The client identity is derived from the request using the trusted-proxy configuration below — forwarding headers (`X-Forwarded-For`, `X-Real-IP`) are only honoured when the immediate peer is a trusted proxy, so spoofed headers from untrusted clients are ignored.
+
+### `TRUST_PROXY`
+- Required: no
+- Default: `false`
+- Allowed values: `false` | `true` | positive integer (number of trusted hops) | comma-separated list of trusted proxy IPs/CIDRs
+- Description: Controls how the client IP is resolved. When `false`, the socket peer address is always used and forwarding headers are ignored. When set to a number, that many hops from the right of `X-Forwarded-For` are trusted. When set to a list, only requests whose immediate peer matches a listed proxy have forwarding headers honoured.
+- Example: `TRUST_PROXY=10.0.0.0/8,172.16.0.0/12`
+
 ### `RATE_LIMIT_SEP10`
 - Required: no
 - Default: `10`
 - Format: positive integer
-- Description: Maximum SEP-10 challenge requests per IP per minute. Protects the challenge endpoint from enumeration and DoS.
+- Description: Maximum SEP-10 challenge requests per client per minute. Protects the challenge endpoint from enumeration and DoS.
 - Example: `RATE_LIMIT_SEP10=10`
 
 ### `RATE_LIMIT_VERIFY`
 - Required: no
 - Default: `60`
 - Format: positive integer
-- Description: Maximum public verification requests (`GET /verify/:wallet`) per IP per minute.
+- Description: Maximum public verification requests (`GET /verify/:wallet`) per client per minute.
 - Example: `RATE_LIMIT_VERIFY=60`
+
+### `RATE_LIMIT_ONBOARDING`
+- Required: no
+- Default: `20`
+- Format: positive integer
+- Description: Maximum onboarding requests per client per minute.
+- Example: `RATE_LIMIT_ONBOARDING=20`
+
+### `RATE_LIMIT_BATCH_VERIFY`
+- Required: no
+- Default: `10`
+- Format: positive integer
+- Description: Maximum batch verification requests per client per minute. Batch endpoints are weighted by batch size where applicable.
+- Example: `RATE_LIMIT_BATCH_VERIFY=10`
+
+### `RATE_LIMIT_WINDOW_MS`
+- Required: no
+- Default: `60000`
+- Format: positive integer (milliseconds)
+- Description: Length of the rate-limit window. All per-operation limits above are expressed per this window.
+- Example: `RATE_LIMIT_WINDOW_MS=60000`
+
+### `RATE_LIMIT_STORE`
+- Required: no
+- Default: `memory`
+- Allowed values: `memory` | `redis`
+- Description: Backing store for rate-limit counters. Use `memory` for single-instance deployments. Use `redis` when running multiple backend replicas behind a load balancer so limits are enforced across the whole deployment rather than per instance.
+- Example: `RATE_LIMIT_STORE=redis`
+
+### `REDIS_URL`
+- Required: when `RATE_LIMIT_STORE=redis`
+- Format: valid Redis URL (`redis://` or `rediss://`)
+- Description: Connection string for the shared rate-limit store. All replicas must point at the same Redis instance.
+- Example: `REDIS_URL=redis://redis:6379/0`
+
+### Rate-limit response headers
+
+Every rate-limited response includes standard metadata so clients can back off correctly:
+
+- `RateLimit-Limit` — the configured maximum for the operation in the current window.
+- `RateLimit-Remaining` — requests remaining in the current window.
+- `RateLimit-Reset` — seconds until the window resets.
+- `Retry-After` — seconds to wait before retrying; present on `429 Too Many Requests` responses.
+
+A throttled request returns HTTP `429` with a JSON body of the form `{ "error": "rate_limited", "retryAfter": <seconds> }`.
+
+### Distributed deployment guidance
+
+- Set `TRUST_PROXY` to the exact proxy hops or CIDRs in front of the backend. Never set `TRUST_PROXY=true` on an internet-facing instance without a proxy — it allows clients to spoof their identity via `X-Forwarded-For`.
+- When running more than one backend replica, set `RATE_LIMIT_STORE=redis` and a shared `REDIS_URL` so counters are consistent across instances. With `memory`, each replica enforces its own limit, effectively multiplying the allowed rate by the replica count.
+- Ensure load balancers preserve the original client address (or append to `X-Forwarded-For`) and that the trusted-proxy list matches the load balancer's egress addresses.
 
 ---
 
@@ -255,6 +350,54 @@ Public verification endpoints (`GET /verify/:wallet`, batch verification) are bo
 - Allowed values: `fail-closed` | `fail-open`
 - Description: Behaviour when an audit entry cannot be written (e.g. disk full, permission error). `fail-closed` rejects the originating mint/revoke/consent/admin request so no action goes unrecorded; `fail-open` allows the action and emits a high-severity alert. `fail-closed` is required for production.
 - Example: `AUDIT_LOG_FAILURE_MODE=fail-closed`
+
+---
+
+## Data retention and purge
+
+Retention is enforced by scheduled purge jobs. Each data class has its own retention window; audit and recovery records are protected from deletion.
+
+### `RETENTION_AUDIT_LOG_DAYS`
+- Required: no
+- Default: `365`
+- Format: positive integer (days)
+- Description: Retention window for audit log records. Audit records within this window are never purged. Records older than this window may be archived, but the append-only audit log file itself is never truncated in place — see `AUDIT_LOG_PATH`.
+- Example: `RETENTION_AUDIT_LOG_DAYS=365`
+
+### `RETENTION_INDEXED_RECORDS_DAYS`
+- Required: no
+- Default: `180`
+- Format: positive integer (days)
+- Description: Retention window for off-chain indexed records (e.g. cached vaccination events). Records older than this window are eligible for purge. On-chain data is unaffected.
+- Example: `RETENTION_INDEXED_RECORDS_DAYS=180`
+
+### `RETENTION_OPERATIONAL_DATA_DAYS`
+- Required: no
+- Default: `30`
+- Format: positive integer (days)
+- Description: Retention window for operational data such as request logs, metrics snapshots, and transient job state. Purely diagnostic — safe to purge aggressively.
+- Example: `RETENTION_OPERATIONAL_DATA_DAYS=30`
+
+### `RETENTION_PURGE_SCHEDULE_MINUTES`
+- Required: no
+- Default: `1440` (once per day)
+- Format: positive integer (minutes)
+- Description: How often the retention purge job runs. The job deletes only records past their class-specific retention window and skips any record flagged as required for audit or recovery.
+- Example: `RETENTION_PURGE_SCHEDULE_MINUTES=1440`
+
+### `RETENTION_PURGE_BATCH_SIZE`
+- Required: no
+- Default: `500`
+- Format: positive integer
+- Description: Maximum number of records deleted per batch within a single purge run. Bounds lock time and memory use on large purges.
+- Example: `RETENTION_PURGE_BATCH_SIZE=500`
+
+### `RETENTION_DRY_RUN`
+- Required: no
+- Default: `false`
+- Format: boolean (`true` | `false`)
+- Description: When `true`, the purge job logs what it would delete without deleting anything. Use to validate retention settings before enabling automated deletion.
+- Example: `RETENTION_DRY_RUN=false`
 
 ---
 
@@ -399,7 +542,11 @@ When an anomaly is detected the service POSTs a JSON payload to `ALERT_WEBHOOK_U
 | `STELLAR_NETWORK` | no | Zod (backend) | enum: `testnet` \| `mainnet` |
 | `HORIZON_URL` | yes | Zod (backend) | valid URL |
 | `SOROBAN_RPC_URL` | yes | Zod (backend) | valid URL |
+| `HORIZON_TIMEOUT_MS` | no | Zod (backend) | positive integer (ms), default 10000 |
+| `SOROBAN_RPC_TIMEOUT_MS` | no | Zod (backend) | positive integer (ms), default 15000 |
 | `SOROBAN_RPC_MAX_RETRIES` | no | Zod (backend) | non-negative integer, default 3 |
+| `SOROBAN_RPC_RETRY_BASE_DELAY_MS` | no | Zod (backend) | positive integer (ms), default 250 |
+| `SOROBAN_RPC_RETRY_MAX_DELAY_MS` | no | Zod (backend) | positive integer (ms), default 4000 |
 | `STELLAR_NETWORK_PASSPHRASE` | yes | Zod (backend) | non-empty string |
 | `VACCINATIONS_CONTRACT_ID` | yes | Zod (backend) | non-empty string |
 | `ADMIN_SECRET_KEY` | yes | Zod (backend) | non-empty string |
@@ -415,24 +562,21 @@ When an anomaly is detected the service POSTs a JSON payload to `ALERT_WEBHOOK_U
 | `EVENT_POLL_INTERVAL_MS` | no | Zod (backend) | positive integer (ms), default 15000 |
 | `TRUST_PROXY` | no | Zod (backend) | `false` \| `true` \| named range \| CIDR list \| hop count, default `false` |
 | `DATABASE_PATH` | no | Zod (backend) | file path, default `/data/vaccichain.db` |
-| `DATABASE_URL` | no | Zod (backend) | PostgreSQL URL; enables multi-writer backend |
-| `DATABASE_POOL_SIZE` | no | Zod (backend) | positive integer, default 10 |
-| `DATABASE_BUSY_TIMEOUT_MS` | no | Zod (backend) | positive integer (ms), default 5000 |
-| `DATABASE_BACKUP_PATH` | no | runtime | writable directory; backups disabled if unset |
-| `DATABASE_BACKUP_INTERVAL_MINUTES` | no | runtime | positive integer, default 60 |
-| `VERIFY_MAX_RECORDS` | no | Zod (backend) | positive integer, default 100 |
-| `VERIFY_MAX_BATCH_SIZE` | no | Zod (backend) | positive integer, default 50 |
-| `VERIFY_MAX_PAGE_SIZE` | no | Zod (backend) | positive integer, default 100 |
-| `RATE_LIMIT_SEP10` | no | runtime | parsed as integer, default 10 |
-| `RATE_LIMIT_VERIFY` | no | runtime | parsed as integer, default 60 |
+| `TRUST_PROXY` | no | Zod (backend) | `false` \| `true` \| hop count \| proxy IP/CIDR list, default `false` |
+| `RATE_LIMIT_SEP10` | no | Zod (backend) | positive integer, default 10 |
+| `RATE_LIMIT_VERIFY` | no | Zod (backend) | positive integer, default 60 |
+| `RATE_LIMIT_ONBOARDING` | no | Zod (backend) | positive integer, default 20 |
+| `RATE_LIMIT_BATCH_VERIFY` | no | Zod (backend) | positive integer, default 10 |
+| `RATE_LIMIT_WINDOW_MS` | no | Zod (backend) | positive integer (ms), default 60000 |
+| `RATE_LIMIT_STORE` | no | Zod (backend) | enum: `memory` \| `redis`, default `memory` |
+| `REDIS_URL` | when store=redis | Zod (backend) | valid `redis://` or `rediss://` URL |
 | `AUDIT_LOG_PATH` | no | runtime | writable path, default `./audit.log` |
-| `AUDIT_LOG_MAX_BYTES` | no | runtime | positive integer (bytes), default 10485760 |
-| `AUDIT_LOG_MAX_FILES` | no | runtime | positive integer, default 10 |
-| `AUDIT_LOG_RETENTION_DAYS` | no | runtime | positive integer, default 90 |
-| `AUDIT_LOG_INTEGRITY_KEY` | no | runtime | non-empty string; hash chaining only if unset |
-| `AUDIT_LOG_VERIFY_ON_START` | no | runtime | boolean, default `true` |
-| `AUDIT_LOG_FAIL_ON_INTEGRITY_ERROR` | no | runtime | boolean, default `false` |
-| `AUDIT_LOG_FAILURE_MODE` | no | runtime | enum: `fail-closed` \| `fail-open`, default `fail-closed` |
+| `RETENTION_AUDIT_LOG_DAYS` | no | Zod (backend) | positive integer (days), default 365 |
+| `RETENTION_INDEXED_RECORDS_DAYS` | no | Zod (backend) | positive integer (days), default 180 |
+| `RETENTION_OPERATIONAL_DATA_DAYS` | no | Zod (backend) | positive integer (days), default 30 |
+| `RETENTION_PURGE_SCHEDULE_MINUTES` | no | Zod (backend) | positive integer (minutes), default 1440 |
+| `RETENTION_PURGE_BATCH_SIZE` | no | Zod (backend) | positive integer, default 500 |
+| `RETENTION_DRY_RUN` | no | Zod (backend) | boolean, default `false` |
 | `ANALYTICS_PORT` | no | runtime | positive integer, default 8001 |
 | `BACKEND_URL` | no | runtime | valid URL, default set by Compose |
 | `LOG_LEVEL` | no | runtime | Python logging level, default `INFO` |

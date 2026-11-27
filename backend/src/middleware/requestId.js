@@ -1,4 +1,34 @@
 const { randomUUID } = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
+
+const asyncLocalStorage = new AsyncLocalStorage();
+
+const MAX_REQUEST_ID_LENGTH = 128;
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:\-]+$/;
+
+function sanitizeRequestId(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > MAX_REQUEST_ID_LENGTH) {
+    return null;
+  }
+  if (!REQUEST_ID_PATTERN.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+function getLogger() {
+  try {
+    // Route logging through the redaction-aware logger so sensitive values
+    // (JWTs, secret keys, signed payloads) never reach log records.
+    return require('../lib/logger');
+  } catch (err) {
+    return null;
+  }
+}
 
 // Accept only well-formed, bounded request IDs from clients. Anything else is
 // replaced with a freshly generated UUID so that untrusted input cannot inject
@@ -24,19 +54,25 @@ function normalizeHeaderValue(value) {
 }
 
 module.exports = function requestId(req, res, next) {
-  const provided = normalizeHeaderValue(req.headers['x-request-id']);
-  const id = isValidRequestId(provided) ? provided : randomUUID();
-
-  // Expose the request ID to downstream middleware (including audit logging)
-  // and to route handlers for correlation.
+  const incoming = sanitizeRequestId(req.headers['x-request-id']);
+  const id = incoming || randomUUID();
   req.requestId = id;
   req.id = id;
 
   // Echo the sanitized ID back so clients can correlate their requests.
   res.setHeader('X-Request-ID', id);
 
+  const logger = getLogger();
+  if (logger && typeof logger.debug === 'function') {
+    try {
+      logger.debug({ requestId: id }, 'request received');
+    } catch (err) {
+      // Logging must never break request handling.
+    }
+  }
+
   next();
 };
 
-module.exports.isValidRequestId = isValidRequestId;
+module.exports.sanitizeRequestId = sanitizeRequestId;
 module.exports.MAX_REQUEST_ID_LENGTH = MAX_REQUEST_ID_LENGTH;

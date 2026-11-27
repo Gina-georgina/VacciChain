@@ -2,303 +2,201 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { createLogger, format, transports } = require('winston');
+const { AsyncLocalStorage } = require('async_hooks');
 
 const isProd = process.env.NODE_ENV === 'production';
 
-/**
- * Audit logging notes (see docs/audit-logging.md):
- *
- * - Every audit entry carries: actor, requestId, action, outcome, timestamp.
- * - Entries are tamper-evident via a hash chain: each entry stores `prevHash`
- *   (the hash of the previous audit entry) and `hash` (sha256 over the
- *   canonicalized entry payload + prevHash). Any modification or deletion of
- *   an entry breaks the chain and is detectable by `verifyAuditChain`.
- * - Rotation is handled by the file transport (maxsize/maxFiles) and by
- *   `rotateAuditLog`. The chain state (last hash + sequence) is persisted to a
- *   sidecar state file so it survives rotation and process restarts.
- * - Retention: old rotated files are pruned according to AUDIT_RETENTION_DAYS.
- * - Failure handling: if the audit sink fails, the error is surfaced via the
- *   `auditFailureHandler` (defaults to logging to stderr) and the audit write
- *   is reported as failed so callers can fail closed if required.
- */
+const REDACTED = '[REDACTED]';
 
-const AUDIT_LOG_DIR = process.env.AUDIT_LOG_DIR || path.join(process.cwd(), 'logs');
-const AUDIT_LOG_FILE = process.env.AUDIT_LOG_FILE || path.join(AUDIT_LOG_DIR, 'audit.log');
-const AUDIT_STATE_FILE =
-  process.env.AUDIT_STATE_FILE || path.join(AUDIT_LOG_DIR, 'audit.state.json');
-const AUDIT_MAX_SIZE = parseInt(process.env.AUDIT_MAX_SIZE || String(10 * 1024 * 1024), 10);
-const AUDIT_MAX_FILES = parseInt(process.env.AUDIT_MAX_FILES || '10', 10);
-const AUDIT_RETENTION_DAYS = parseInt(process.env.AUDIT_RETENTION_DAYS || '90', 10);
+// Header names whose values must never reach logs.
+const SENSITIVE_HEADERS = new Set([
+  'authorization',
+  'proxy-authorization',
+  'cookie',
+  'set-cookie',
+  'x-api-key',
+  'api-key',
+  'apikey',
+  'x-auth-token',
+  'x-access-token',
+  'x-secret',
+  'x-secret-key',
+  'secret-key',
+  'x-csrf-token',
+  'x-xsrf-token',
+]);
 
-const GENESIS_HASH = '0'.repeat(64);
+// Object keys whose values must never reach logs.
+const SENSITIVE_KEYS = new Set([
+  'authorization',
+  'proxyauthorization',
+  'cookie',
+  'setcookie',
+  'password',
+  'passwd',
+  'pwd',
+  'secret',
+  'secretkey',
+  'clientsecret',
+  'apikey',
+  'api_key',
+  'accesstoken',
+  'access_token',
+  'refreshtoken',
+  'refresh_token',
+  'idtoken',
+  'id_token',
+  'token',
+  'jwt',
+  'bearer',
+  'privatekey',
+  'private_key',
+  'signingkey',
+  'signing_key',
+  'mnemonic',
+  'seed',
+  'seedphrase',
+  'xdr',
+  'signedxdr',
+  'signed_xdr',
+  'signedtransaction',
+  'signed_transaction',
+  'signedpayload',
+  'signed_payload',
+  'transactionenvelope',
+  'transaction_envelope',
+  'envelope',
+  'signature',
+  'signatures',
+  'credential',
+  'credentials',
+  'auth',
+  'session',
+  'sessionid',
+  'session_id',
+]);
 
-function ensureDir(dir) {
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-  } catch (err) {
-    if (err.code !== 'EEXIST') throw err;
-  }
+// Health-related fields that are unnecessary in logs.
+const HEALTH_KEYS = new Set([
+  'health',
+  'healthcheck',
+  'health_check',
+  'healthinfo',
+  'health_info',
+  'healthdetails',
+  'health_details',
+  'diagnostics',
+  'vitals',
+  'uptime',
+  'memoryusage',
+  'memory_usage',
+  'cpuusage',
+  'cpu_usage',
+  'freememory',
+  'free_memory',
+  'totalmemory',
+  'total_memory',
+  'loadaverage',
+  'load_average',
+]);
+
+// Patterns for inline secrets embedded in strings.
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\b/g;
+const BEARER_PATTERN = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi;
+const API_KEY_PATTERN = /\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{8,}\b/g;
+const SIGNED_XDR_PATTERN = /\b(?:AAAAA[A-Za-z0-9+/=]{20,}|[A-Za-z0-9+/=]{100,})\b/g;
+
+function normalizeKey(key) {
+  return String(key).toLowerCase().replace(/[-_\s]/g, '');
 }
 
-function canonicalize(value) {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value);
+function isSensitiveKey(key) {
+  const normalized = normalizeKey(key);
+  return (
+    SENSITIVE_KEYS.has(normalized) ||
+    SENSITIVE_HEADERS.has(String(key).toLowerCase()) ||
+    HEALTH_KEYS.has(normalized)
+  );
+}
+
+function redactString(value) {
+  if (typeof value !== 'string') return value;
+  return value
+    .replace(BEARER_PATTERN, (match, scheme) => `${scheme} ${REDACTED}`)
+    .replace(JWT_PATTERN, REDACTED)
+    .replace(API_KEY_PATTERN, REDACTED)
+    .replace(SIGNED_XDR_PATTERN, REDACTED);
+}
+
+function redactSensitive(value, seen = new WeakSet()) {
+  if (value === null || value === undefined) return value;
+
+  if (typeof value === 'string') {
+    return redactString(value);
   }
+
+  if (typeof value !== 'object') {
+    return value;
+  }
+
+  if (seen.has(value)) {
+    return '[Circular]';
+  }
+  seen.add(value);
+
   if (Array.isArray(value)) {
-    return `[${value.map(canonicalize).join(',')}]`;
+    return value.map((item) => redactSensitive(item, seen));
   }
-  const keys = Object.keys(value).sort();
-  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalize(value[k])}`).join(',')}}`;
-}
 
-function sha256(input) {
-  return crypto.createHash('sha256').update(input).digest('hex');
-}
-
-function readAuditState() {
-  try {
-    const raw = fs.readFileSync(AUDIT_STATE_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-    return {
-      lastHash: typeof parsed.lastHash === 'string' ? parsed.lastHash : GENESIS_HASH,
-      sequence: Number.isInteger(parsed.sequence) ? parsed.sequence : 0,
+  if (value instanceof Error) {
+    const redactedError = {
+      name: value.name,
+      message: redactString(value.message),
     };
-  } catch (err) {
-    if (err.code === 'ENOENT') {
-      return { lastHash: GENESIS_HASH, sequence: 0 };
+    if (value.stack) {
+      redactedError.stack = redactString(value.stack);
     }
-    throw err;
-  }
-}
-
-function writeAuditState(state) {
-  ensureDir(path.dirname(AUDIT_STATE_FILE));
-  const tmp = `${AUDIT_STATE_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
-  fs.renameSync(tmp, AUDIT_STATE_FILE);
-}
-
-let auditState = null;
-
-function getAuditState() {
-  if (!auditState) {
-    ensureDir(AUDIT_LOG_DIR);
-    auditState = readAuditState();
-  }
-  return auditState;
-}
-
-function defaultAuditFailureHandler(err, entry) {
-  // Fail loudly but do not crash the process by default.
-  // eslint-disable-next-line no-console
-  console.error('[audit] failed to persist audit entry', {
-    error: err && err.message,
-    action: entry && entry.action,
-    requestId: entry && entry.requestId,
-  });
-}
-
-let auditFailureHandler = defaultAuditFailureHandler;
-
-function setAuditFailureHandler(handler) {
-  auditFailureHandler = typeof handler === 'function' ? handler : defaultAuditFailureHandler;
-}
-
-/**
- * Append a tamper-evident audit entry.
- *
- * @param {object} entry
- * @param {string} entry.action - e.g. 'mint', 'revoke', 'consent', 'admin'
- * @param {string} entry.outcome - e.g. 'success', 'failure', 'denied'
- * @param {string} [entry.actor] - actor identifier (user id, service, etc.)
- * @param {string} [entry.requestId] - correlation id for the request
- * @param {object} [entry.details] - additional non-sensitive structured data
- * @returns {{ok: boolean, hash?: string, sequence?: number, error?: Error}}
- */
-function audit(entry) {
-  const base = entry && typeof entry === 'object' ? entry : {};
-  const state = getAuditState();
-
-  const timestamp = new Date().toISOString();
-  const sequence = state.sequence + 1;
-
-  const payload = {
-    sequence,
-    timestamp,
-    action: base.action || 'unknown',
-    outcome: base.outcome || 'unknown',
-    actor: base.actor || 'anonymous',
-    requestId: base.requestId || null,
-    details: base.details || {},
-  };
-
-  const prevHash = state.lastHash;
-  const hash = sha256(`${prevHash}:${canonicalize(payload)}`);
-
-  const record = { ...payload, prevHash, hash };
-
-  try {
-    ensureDir(path.dirname(AUDIT_LOG_FILE));
-    fs.appendFileSync(AUDIT_LOG_FILE, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-    auditState = { lastHash: hash, sequence };
-    writeAuditState(auditState);
-    return { ok: true, hash, sequence };
-  } catch (err) {
-    try {
-      auditFailureHandler(err, record);
-    } catch (handlerErr) {
-      // eslint-disable-next-line no-console
-      console.error('[audit] failure handler threw', handlerErr);
+    for (const key of Object.keys(value)) {
+      if (key === 'name' || key === 'message' || key === 'stack') continue;
+      redactedError[key] = isSensitiveKey(key)
+        ? REDACTED
+        : redactSensitive(value[key], seen);
     }
-    return { ok: false, error: err };
-  }
-}
-
-/**
- * Verify the integrity of an audit log file (or the default one).
- * Returns { ok, entries, brokenAt }.
- */
-function verifyAuditChain(filePath = AUDIT_LOG_FILE) {
-  let raw;
-  try {
-    raw = fs.readFileSync(filePath, 'utf8');
-  } catch (err) {
-    if (err.code === 'ENOENT') {
-      return { ok: true, entries: 0, brokenAt: null };
-    }
-    throw err;
+    return redactedError;
   }
 
-  const lines = raw.split('\n').filter((l) => l.trim().length > 0);
-  let prevHash = GENESIS_HASH;
-  let expectedSequence = 1;
-
-  for (let i = 0; i < lines.length; i += 1) {
-    let record;
-    try {
-      record = JSON.parse(lines[i]);
-    } catch (err) {
-      return { ok: false, entries: i, brokenAt: i, reason: 'invalid-json' };
-    }
-
-    const { prevHash: recordPrev, hash: recordHash, ...payload } = record;
-
-    if (recordPrev !== prevHash) {
-      return { ok: false, entries: i, brokenAt: i, reason: 'prev-hash-mismatch' };
-    }
-    if (payload.sequence !== expectedSequence) {
-      return { ok: false, entries: i, brokenAt: i, reason: 'sequence-mismatch' };
-    }
-
-    const expectedHash = sha256(`${prevHash}:${canonicalize(payload)}`);
-    if (expectedHash !== recordHash) {
-      return { ok: false, entries: i, brokenAt: i, reason: 'hash-mismatch' };
-    }
-
-    prevHash = recordHash;
-    expectedSequence += 1;
-  }
-
-  return { ok: true, entries: lines.length, brokenAt: null };
-}
-
-/**
- * Rotate the audit log. The current file is renamed with a timestamp suffix
- * and a fresh file is started. The hash chain state is preserved so the chain
- * continues across rotated files.
- */
-function rotateAuditLog() {
-  try {
-    if (!fs.existsSync(AUDIT_LOG_FILE)) {
-      return { ok: true, rotated: false };
-    }
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const rotatedPath = `${AUDIT_LOG_FILE}.${stamp}`;
-    fs.renameSync(AUDIT_LOG_FILE, rotatedPath);
-    pruneAuditLogs();
-    return { ok: true, rotated: true, path: rotatedPath };
-  } catch (err) {
-    try {
-      auditFailureHandler(err, { action: 'rotate' });
-    } catch (handlerErr) {
-      // eslint-disable-next-line no-console
-      console.error('[audit] failure handler threw', handlerErr);
-    }
-    return { ok: false, error: err };
-  }
-}
-
-/**
- * Prune rotated audit logs older than AUDIT_RETENTION_DAYS.
- */
-function pruneAuditLogs() {
-  const dir = path.dirname(AUDIT_LOG_FILE);
-  const base = path.basename(AUDIT_LOG_FILE);
-  const cutoff = Date.now() - AUDIT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
-  let removed = 0;
-
-  let files;
-  try {
-    files = fs.readdirSync(dir);
-  } catch (err) {
-    return { ok: false, removed, error: err };
-  }
-
-  for (const file of files) {
-    if (!file.startsWith(`${base}.`)) continue;
-    const full = path.join(dir, file);
-    try {
-      const stat = fs.statSync(full);
-      if (stat.mtimeMs < cutoff) {
-        fs.unlinkSync(full);
-        removed += 1;
-      }
-    } catch (err) {
-      // Ignore individual file errors; continue pruning others.
-    }
-  }
-
-  return { ok: true, removed };
-}
-
-/**
- * Winston format that injects request ID and actor context into every log
- * entry, and forwards audit-relevant entries to the tamper-evident sink.
- */
-const contextFormat = format((info) => {
-  const store = logger.contextStore;
-  if (store) {
-    if (store.requestId && !info.requestId) info.requestId = store.requestId;
-    if (store.actor && !info.actor) info.actor = store.actor;
-  }
-  return info;
-});
-
-const auditFormat = format((info) => {
-  if (info.audit === true) {
-    const result = audit({
-      action: info.action || info.message,
-      outcome: info.outcome || 'unknown',
-      actor: info.actor,
-      requestId: info.requestId,
-      details: info.details || {},
-    });
-    if (!result.ok) {
-      info.auditPersisted = false;
+  const result = {};
+  for (const key of Object.keys(value)) {
+    if (isSensitiveKey(key)) {
+      result[key] = REDACTED;
     } else {
-      info.auditPersisted = true;
-      info.auditHash = result.hash;
-      info.auditSequence = result.sequence;
+      result[key] = redactSensitive(value[key], seen);
     }
   }
-  return info;
+  return result;
+}
+
+// Winston format that redacts sensitive data from every emitted record.
+const redactFormat = format((info) => {
+  const redacted = redactSensitive(info);
+  // Preserve level/symbol properties required by winston.
+  if (info.level !== undefined) redacted.level = info.level;
+  if (info[Symbol.for('level')] !== undefined) {
+    redacted[Symbol.for('level')] = info[Symbol.for('level')];
+  }
+  if (info[Symbol.for('message')] !== undefined) {
+    redacted[Symbol.for('message')] = info[Symbol.for('message')];
+  }
+  if (info[Symbol.for('splat')] !== undefined) {
+    redacted[Symbol.for('splat')] = redactSensitive(info[Symbol.for('splat')]);
+  }
+  return redacted;
 });
 
 const logger = createLogger({
   level: process.env.LOG_LEVEL || 'info',
   format: format.combine(
-    contextFormat(),
-    auditFormat(),
+    redactFormat(),
     format.timestamp(),
     format.errors({ stack: !isProd }),
     format.json()
@@ -307,24 +205,7 @@ const logger = createLogger({
   transports: [new transports.Console()],
 });
 
-/**
- * Run a function with an ambient request/actor context so that all logs
- * emitted within it automatically include requestId and actor.
- */
-logger.withContext = function withContext(context, fn) {
-  const previous = logger.contextStore;
-  logger.contextStore = { ...(previous || {}), ...(context || {}) };
-  try {
-    return fn();
-  } finally {
-    logger.contextStore = previous;
-  }
-};
-
-logger.audit = audit;
-logger.verifyAuditChain = verifyAuditChain;
-logger.rotateAuditLog = rotateAuditLog;
-logger.pruneAuditLogs = pruneAuditLogs;
-logger.setAuditFailureHandler = setAuditFailureHandler;
-
 module.exports = logger;
+module.exports.redactSensitive = redactSensitive;
+module.exports.redactString = redactString;
+module.exports.REDACTED = REDACTED;
