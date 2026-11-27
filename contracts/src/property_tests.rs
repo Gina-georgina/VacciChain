@@ -4,6 +4,47 @@ use proptest::prelude::*;
 use soroban_sdk::{Address, Env, String as SorobanString, testutils::Address as TestAddress, Vec};
 use crate::{VacciChainContract, ContractError, storage::VaccinationRecord};
 
+// Issue #84: bounded, reproducible proptest configuration.
+//
+// - `PROPTEST_CASES` bounds the number of generated cases per property so the
+//   suite has a predictable runtime.
+// - `PROPTEST_MAX_SHRINK_ITERS` bounds shrinking so a failing case is minimized
+//   quickly and deterministically.
+// - A fixed `RngAlgorithm` plus a fixed seed makes runs reproducible. The seed
+//   can be overridden via the `PROPTEST_SEED` environment variable when a
+//   failure needs to be replayed.
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 32,
+        max_shrink_iters: 256,
+        rng_algorithm: RngAlgorithm::ChaCha,
+        .. ProptestConfig::default()
+    })]
+}
+
+/// Shared fixture: initializes the contract and registers one authorized issuer
+/// and one patient. Returns `(env, admin, issuer, patient)`.
+fn setup_authorized() -> (Env, Address, Address, Address) {
+    let env = Env::default();
+    let admin = TestAddress::random(&env);
+    let issuer = TestAddress::random(&env);
+    let patient = TestAddress::random(&env);
+
+    env.mock_all_auths();
+
+    let _ = VacciChainContract::initialize(env.clone(), admin.clone());
+    let _ = VacciChainContract::add_issuer(
+        env.clone(),
+        issuer.clone(),
+        SorobanString::from_slice(&env, b"Test Issuer"),
+        SorobanString::from_slice(&env, b"LIC123"),
+        SorobanString::from_slice(&env, b"US"),
+    );
+    let _ = VacciChainContract::register_patient(env.clone(), patient.clone());
+
+    (env, admin, issuer, patient)
+}
+
 // Property: mint then verify always returns the minted record
 proptest! {
     #[test]

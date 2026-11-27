@@ -119,6 +119,14 @@ pub fn mint_vaccination(
         return Err(ContractError::RecordLimitExceeded);
     }
 
+    // Issue #88: validate the ledger timestamp before persisting it. A zero
+    // timestamp indicates an unset/invalid ledger time assumption, and a
+    // timestamp earlier than the current ledger time would be inconsistent.
+    let timestamp = env.ledger().timestamp();
+    if timestamp == 0 {
+        return Err(ContractError::InvalidTimestamp);
+    }
+
     // Build the vaccination record and persist it under DataKey::Token(token_id).
     //
     // Field policy (privacy-safe on-chain schema): only the fields below are
@@ -131,7 +139,7 @@ pub fn mint_vaccination(
         vaccine_name: vaccine_name.clone(),
         date_administered,
         issuer: issuer.clone(),
-        timestamp: env.ledger().timestamp(),
+        timestamp,
         schema_version: 1,
         revoked: false,
         dose_number,
@@ -142,7 +150,9 @@ pub fn mint_vaccination(
     env.storage().persistent().set(&DataKey::Token(token_id), &record);
     extend_token_ttl(env, token_id);
 
-    // Append the minted token to the patient's token list and extend its TTL.
+    // Append the minted token to the patient's token list. The length was
+    // already checked above with checked_add, so this push cannot overflow.
+    // Also extend the patient token list TTL.
     let mut patient_tokens = tokens;
     patient_tokens.push_back(token_id);
     env.storage().persistent().set(&DataKey::PatientTokens(patient.clone()), &patient_tokens);
@@ -151,4 +161,96 @@ pub fn mint_vaccination(
     events::emit_minted(env, token_id, &patient, &vaccine_name, &issuer);
 
     Ok(token_id)
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::{Env, String};
+
+    fn setup(env: &Env) -> (Address, Address) {
+        let patient = Address::generate(env);
+        let issuer = Address::generate(env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PatientAllowlist(patient.clone()), &true);
+        env.storage().persistent().set(
+            &DataKey::Issuer(issuer.clone()),
+            &IssuerRecord { authorized: true },
+        );
+        (patient, issuer)
+    }
+
+    #[test]
+    fn record_limit_boundary_is_enforced_without_overflow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (patient, issuer) = setup(&env);
+
+        // Cap of 1: first mint succeeds, second must be rejected.
+        env.storage()
+            .persistent()
+            .set(&DataKey::PatientRecordLimit, &1u32);
+
+        let first = mint_vaccination(
+            &env,
+            patient.clone(),
+            String::from_str(&env, "VaxA"),
+            String::from_str(&env, "2024-01-01"),
+            issuer.clone(),
+            Some(1),
+            Some(2),
+        );
+        assert!(first.is_ok());
+
+        let second = mint_vaccination(
+            &env,
+            patient.clone(),
+            String::from_str(&env, "VaxB"),
+            String::from_str(&env, "2024-02-01"),
+            issuer,
+            Some(2),
+            Some(2),
+        );
+        assert_eq!(second, Err(ContractError::RecordLimitExceeded));
+    }
+
+    #[test]
+    fn zero_timestamp_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (patient, issuer) = setup(&env);
+        env.ledger().set_timestamp(0);
+
+        let result = mint_vaccination(
+            &env,
+            patient,
+            String::from_str(&env, "VaxA"),
+            String::from_str(&env, "2024-01-01"),
+            issuer,
+            None,
+            None,
+        );
+        assert_eq!(result, Err(ContractError::InvalidTimestamp));
+    }
+
+    #[test]
+    fn max_u64_timestamp_is_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (patient, issuer) = setup(&env);
+        env.ledger().set_timestamp(u64::MAX);
+
+        let result = mint_vaccination(
+            &env,
+            patient,
+            String::from_str(&env, "VaxA"),
+            String::from_str(&env, "2024-01-01"),
+            issuer,
+            None,
+            None,
+        );
+        assert!(result.is_ok());
+    }
 }

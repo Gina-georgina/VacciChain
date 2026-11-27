@@ -50,6 +50,7 @@ Complete these steps before touching any infrastructure.
 - [ ] Domain DNS configured and propagated
 - [ ] AWS account limits reviewed (ECS tasks, ECR storage, Secrets Manager)
 - [ ] Mainnet launch checklist reviewed: [`docs/mainnet-launch.md`](./mainnet-launch.md)
+- [ ] Multisig signer set and threshold agreed with key custodians and documented in [`docs/admin-multisig.md`](./admin-multisig.md) (see [section 13](#13-multisig-admin-configuration))
 
 ---
 
@@ -339,7 +340,7 @@ These are safe to set directly in the ECS task definition (not in Secrets Manage
 | `RATE_LIMIT_SEP10` | `10` | Adjust based on expected traffic |
 | `RATE_LIMIT_VERIFY` | `60` | Adjust based on expected traffic |
 | `SOROBAN_FEE` | `1000` | Higher fee for mainnet priority |
-| `MULTISIG_THRESHOLD` | `2` | Require 2 approvals for admin ops |
+| `MULTISIG_THRESHOLD` | `2` | Require 2 approvals for admin ops — must equal the on-chain threshold documented in [`docs/admin-multisig.md`](./admin-multisig.md) |
 
 ### 5.3 Production Task Definition
 
@@ -668,6 +669,31 @@ The automated staging gate in [Section 9.0](#90-staging-smoke-test-gate) must pa
 3. As an authorized issuer, issue a test vaccination record
 4. Navigate to the patient dashboard and confirm the record appears
 5. Use the public verify endpoint to confirm the record is on-chain
+
+### 9.7 Multisig Admin Configuration Verification
+
+Confirm the on-chain admin signer set and threshold match the values documented in [`docs/admin-multisig.md`](./admin-multisig.md). This is the post-deploy check required by issue #83.
+
+```bash
+# Read the on-chain admin configuration (signers + threshold)
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet \
+  --network-passphrase "Public Global Stellar Network ; September 2015" \
+  --rpc-url https://mainnet.sorobanrpc.com \
+  -- get_admin_config
+```
+
+Verify all of the following before signing off:
+
+- [ ] Every signer returned on-chain is listed in the documented signer set, and no extra signers are present
+- [ ] The on-chain threshold equals `MULTISIG_THRESHOLD` in the task definition and the documented threshold
+- [ ] Each signer's key custody matches the documented custodian (hardware wallet / air-gapped machine)
+- [ ] The documented approval procedure (who signs, in what order, where approvals are recorded) is current
+- [ ] A testnet drill has demonstrated both normal administration and signer-unavailable recovery (see [`docs/admin-multisig.md`](./admin-multisig.md))
+
+If any value differs, **stop** and reconcile the runbook and contract configuration before proceeding.
 
 ---
 
@@ -1138,6 +1164,24 @@ aws ecs describe-services \
 ```
 
 Cleanup jobs run in dry-run mode first and log every candidate for deletion; any candidate matching a protected digest is skipped and reported.
+
+---
+
+## 13. Multisig Admin Configuration
+
+On-chain admin operations are protected by a multisignature policy. The authoritative record of the signer set, threshold, key custody, and approval procedures lives in [`docs/admin-multisig.md`](./admin-multisig.md) (issue #83).
+
+**Deployment runbook and contract configuration must agree on:**
+
+- **Signer set** — the exact public keys authorized to approve admin operations, and the custodian responsible for each
+- **Threshold** — the minimum number of signatures required, which must match `MULTISIG_THRESHOLD` in the task definition (see [section 5.2](#52-non-secret-environment-variables))
+- **Approval procedure** — how approvals are requested, collected, and recorded for each admin operation
+
+Before deploying, confirm the documented signer set and threshold are current. After deploying, complete the verification in [section 9.7](#97-multisig-admin-configuration-verification).
+
+### 13.1 Signer-Unavailable Recovery
+
+If a signer key is lost or a custodian is unavailable, follow the recovery procedure in [`docs/admin-multisig.md`](./admin-multisig.md). Recovery must be rehearsed on testnet before mainnet launch, demonstrating both normal administration and signer-unavailable recovery.
 
 ---
 

@@ -83,6 +83,23 @@ pub struct DoseStatus {
     pub complete: bool,
 }
 
+/// Explicit outcome of a verification call.
+///
+/// Only `Valid` indicates an active vaccination record. Callers must never
+/// treat `Revoked`, `Absent`, or `Unavailable` as a positive result.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VerificationStatus {
+    /// At least one active (non-revoked) record exists.
+    Valid,
+    /// Records exist but all are revoked.
+    Revoked,
+    /// No records exist for the wallet.
+    Absent,
+    /// The data could not be read; must NOT be treated as a positive result.
+    Unavailable,
+}
+
 /// Batch verify vaccination status for multiple wallets.
 ///
 /// This function is an optimized convenience wrapper for `verify_vaccination`.
@@ -110,6 +127,8 @@ pub fn batch_verify(
     }
 
     let mut results: Vec<(Address, VerificationStatus, Vec<VaccinationRecord>)> = Vec::new(env);
+    // Iteration is bounded by `wallets.len()`, which is <= MAX_BATCH_SIZE, so
+    // the loop counter cannot overflow and the result vec stays small.
     for i in 0..wallets.len() {
         let wallet = wallets.get(i).unwrap();
         let (status, records, _) = verify_vaccination(env, wallet.clone());
@@ -180,6 +199,8 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (VerificationStatus, Ve
                 } else {
                     has_active = true;
                     records.push_back(record);
+                } else {
+                    has_revoked = true;
                 }
             }
             None => {
@@ -197,6 +218,9 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (VerificationStatus, Ve
 
     for i in 0..records.len() {
         let rec = records.get(i).unwrap();
+        // Missing dose metadata is treated as 0 (no doses recorded). Values are
+        // only ever compared and stored verbatim; no arithmetic is performed on
+        // them, so there is no overflow risk even at u32::MAX.
         let dn = rec.dose_number.unwrap_or(0);
         let ds = rec.dose_series.unwrap_or(0);
 
@@ -205,12 +229,10 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (VerificationStatus, Ve
             if vaccine_names.get(j).unwrap() == rec.vaccine_name {
                 let prev_dn = doses_received.get(j).unwrap();
                 let prev_ds = doses_required.get(j).unwrap();
-                if dn > prev_dn {
-                    doses_received.set(j, dn);
-                }
-                if ds > prev_ds {
-                    doses_required.set(j, ds);
-                }
+                // Use max() instead of manual comparison to make the
+                // non-arithmetic, overflow-free intent explicit.
+                doses_received.set(j, dn.max(prev_dn));
+                doses_required.set(j, ds.max(prev_ds));
                 found = true;
                 break;
             }
@@ -226,6 +248,8 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (VerificationStatus, Ve
     for i in 0..vaccine_names.len() {
         let dr = doses_received.get(i).unwrap();
         let dq = doses_required.get(i).unwrap();
+        // Completion is a pure comparison (no subtraction), so it is safe for
+        // any u32 values including 0 and u32::MAX.
         dose_statuses.push_back(DoseStatus {
             vaccine_name: vaccine_names.get(i).unwrap(),
             doses_received: dr,
