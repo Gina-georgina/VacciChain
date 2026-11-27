@@ -308,6 +308,191 @@ Revoked records are excluded and never counted as valid; see Revocation semantic
 
 > **Rule:** An RPC or contract failure MUST NOT be collapsed into a positive verification result. When data cannot be retrieved, the endpoint returns `status: "unavailable"` with `verified: false`; it never returns `verified: true` for missing, revoked, or unavailable data. This endpoint reports record state only and is not a medical determination.
 
+Public verification never returns prohibited fields. The following are omitted from
+`/verify/:wallet` responses regardless of consent state:
+- `metadata` (free-form issuer metadata, e.g. lot numbers)
+- `batch`
+- `patient_wallet` linkage beyond the queried wallet itself
+- any internal `contract_tx` or storage keys
+
+Only `vaccine`, `date`, and `issuer` are exposed per record. Public-chain data is
+not private; this endpoint only limits what the API surfaces.
+
+---
+
+## Consent & Allowlist Semantics
+
+Issuance requires the patient wallet to be allowlisted and consent to be granted.
+Consent state transitions and API behavior:
+
+| Consent state | Issuance (`POST /vaccination/issue`) | Verification (`GET /verify/:wallet`) |
+|---------------|--------------------------------------|--------------------------------------|
+| Absent        | 422 `CONSENT_ABSENT`                 | Records hidden; `verified: false`    |
+| Granted       | 201 (allowed)                        | Records returned (public fields only)|
+| Revoked       | 422 `CONSENT_REVOKED`                | Records hidden; `verified: false`    |
+| Changed       | 422 `CONSENT_CHANGED` (re-consent required) | Reflects latest granted scope |
+
+An unauthorized issuance (issuer not allowlisted or consent not granted) is
+rejected before any contract call is made.
+
+---
+
+## Contract Function & Error-Code Compatibility
+
+Contract function arguments and error codes are versioned for stable caller semantics.
+
+- Public contract methods: `issue`, `revoke`, `verify`, `get_record`.
+- Authorization: only allowlisted issuers may call `issue`/`revoke`; `verify`/`get_record` are read-only.
+- Error codes are stable; new codes may be added but existing codes never change meaning.
+
+Backend maps contract errors to stable API responses:
+
+| Contract error | HTTP status | API error code        |
+|----------------|-------------|-----------------------|
+| `Unauthorized` | 403         | `ISSUER_UNAUTHORIZED` |
+| `Duplicate`    | 409         | `DUPLICATE_RECORD`    |
+| `ConsentAbsent`| 422         | `CONSENT_ABSENT`      |
+| `ConsentRevoked`| 422        | `CONSENT_REVOKED`     |
+| `ConsentChanged`| 422        | `CONSENT_CHANGED`     |
+| `InvalidArgs`  | 400         | `VALIDATION_ERROR`    |
+| `NotFound`     | 404         | `NOT_FOUND`           |
+
+Version-specific behavior is documented alongside each contract release; callers
+should rely on the API error codes above rather than raw contract error strings.
+
+---
+
+## Verifier API Keys
+
+Third-party verifiers authenticate with an API key instead of a JWT. Keys are
+provisioned by an admin, individually scoped, rotatable, and revocable.
+
+### Key format and storage
+
+- Keys are returned **once** at creation time in the form `vck_<prefix>_<secret>`.
+- Only a verifiable hash of the secret is stored server-side; the plaintext key is
+  never persisted or retrievable again.
+- The `<prefix>` portion is stored in clear text so keys can be identified in
+  audit logs without exposing the secret.
+
+### Header contract
+
+Send the key on every verifier request:
+
+```
+X-API-Key: vck_<prefix>_<secret>
+```
+
+Errors:
+- 401: missing, malformed, unknown, revoked, or expired key
+- 403: key is valid but lacks the scope required by the endpoint
+
+### Scopes
+
+Each key is created with an explicit list of scopes. Supported scopes:
+
+| Scope | Grants access to |
+| --- | --- |
+| `verify:read` | `GET /verify/:wallet` |
+| `records:read` | `GET /vaccination/:wallet` |
+| `records:write` | `POST /vaccination/issue` (issuer keys only) |
+
+Requests to endpoints outside the key's scopes return `403`.
+
+### Lifecycle
+
+1. **Provision** — an admin creates a key with a label and scopes. The plaintext
+   key is returned in the response and must be stored by the verifier.
+2. **Rotate** — an admin rotates a key, producing a new secret. The previous
+   secret remains valid until the end of the configured grace period (default
+   24 hours), after which it stops authenticating.
+3. **Revoke** — an admin revokes a key immediately. Revoked keys fail with `401`
+   and cannot be reactivated; provision a new key instead.
+
+### Audit events
+
+Every lifecycle action and authentication failure is recorded with the key
+prefix, actor, timestamp, and outcome. Emitted events:
+
+- `api_key.created`
+- `api_key.rotated`
+- `api_key.revoked`
+- `api_key.auth_failed` (reason: `unknown`, `revoked`, `expired`, `scope_denied`)
+
+---
+
+## POST /admin/api-keys
+
+Provision a new verifier API key. Admin-only.
+
+Headers:
+- `Authorization: Bearer <admin_jwt>`
+
+Request:
+```json
+{
+  "label": "Clinic A verifier",
+  "scopes": ["verify:read", "records:read"]
+}
+```
+
+Response (201):
+```json
+{
+  "id": "key_01H...",
+  "prefix": "vck_ab12cd",
+  "api_key": "vck_ab12cd_<secret>",
+  "scopes": ["verify:read", "records:read"],
+  "created_at": "2026-05-01T12:34:56Z"
+}
+```
+
+Errors:
+- 400: missing label or unknown scope
+- 403: caller is not an admin
+
+---
+
+## POST /admin/api-keys/:id/rotate
+
+Rotate the secret for an existing key. Admin-only.
+
+Headers:
+- `Authorization: Bearer <admin_jwt>`
+
+Request:
+```json
+{ "grace_period_seconds": 86400 }
+```
+
+Response (200):
+```json
+{
+  "id": "key_01H...",
+  "prefix": "vck_ab12cd",
+  "api_key": "vck_ab12cd_<new_secret>",
+  "previous_valid_until": "2026-05-02T12:34:56Z"
+}
+```
+
+Errors:
+- 404: key not found
+- 409: key is revoked
+
+---
+
+## DELETE /admin/api-keys/:id
+
+Revoke a key immediately. Admin-only.
+
+Headers:
+- `Authorization: Bearer <admin_jwt>`
+
+Response (204): no body.
+
+Errors:
+- 404: key not found
+
 ---
 
 ## Analytics (Python service)

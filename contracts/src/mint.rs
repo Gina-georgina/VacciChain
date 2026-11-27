@@ -7,105 +7,9 @@ use crate::events;
 use crate::ContractError;
 use crate::validate_input_length;
 
-/// Normalize a vaccine name for duplicate detection.
-///
-/// Trims leading/trailing whitespace and lowercases ASCII characters so that
-/// formatting variants (e.g. "  Pfizer " vs "pfizer") map to the same key.
-fn normalize_vaccine_name(env: &Env, name: &String) -> String {
-    let len = name.len();
-    let mut buf = [0u8; 64];
-    let mut out_len: usize = 0;
-    let mut started = false;
-    let mut pending_space = false;
-
-    for i in 0..len {
-        let b = name.get(i).unwrap();
-        let is_space = b == b' ' || b == b'\t' || b == b'\n' || b == b'\r';
-        if is_space {
-            if started {
-                pending_space = true;
-            }
-            continue;
-        }
-        if pending_space && out_len < buf.len() {
-            buf[out_len] = b' ';
-            out_len += 1;
-            pending_space = false;
-        }
-        started = true;
-        let lower = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
-        if out_len < buf.len() {
-            buf[out_len] = lower;
-            out_len += 1;
-        }
-    }
-
-    let mut s = String::new(env);
-    for i in 0..out_len {
-        s.push_back(buf[i] as char);
-    }
-    s
-}
-
-/// Normalize an administration date to ISO `YYYY-MM-DD` form.
-///
-/// Accepts `YYYY-MM-DD`, `YYYY/MM/DD`, and `YYYYMMDD` variants and returns a
-/// canonical `YYYY-MM-DD` string. Unrecognized formats are returned trimmed.
-fn normalize_date(env: &Env, date: &String) -> String {
-    let len = date.len();
-    let mut digits = [0u8; 8];
-    let mut digit_count: usize = 0;
-    let mut has_separator = false;
-
-    for i in 0..len {
-        let b = date.get(i).unwrap();
-        if b >= b'0' && b <= b'9' {
-            if digit_count < 8 {
-                digits[digit_count] = b;
-                digit_count += 1;
-            }
-        } else if b == b'-' || b == b'/' {
-            has_separator = true;
-        }
-    }
-
-    let mut s = String::new(env);
-    if digit_count == 8 && (has_separator || len == 8) {
-        for i in 0..4 {
-            s.push_back(digits[i] as char);
-        }
-        s.push_back('-');
-        for i in 4..6 {
-            s.push_back(digits[i] as char);
-        }
-        s.push_back('-');
-        for i in 6..8 {
-            s.push_back(digits[i] as char);
-        }
-    } else {
-        // Fallback: trim surrounding whitespace only.
-        let mut started = false;
-        let mut end: u32 = 0;
-        for i in 0..len {
-            let b = date.get(i).unwrap();
-            if b != b' ' && b != b'\t' && b != b'\n' && b != b'\r' {
-                if !started {
-                    started = true;
-                }
-                end = i + 1;
-            }
-        }
-        if started {
-            for i in 0..end {
-                let b = date.get(i).unwrap();
-                if b != b' ' && b != b'\t' && b != b'\n' && b != b'\r' {
-                    s.push_back(b as char);
-                }
-            }
-        }
-    }
-    s
-}
+/// Maximum number of vaccination records a single patient may hold.
+/// Documented bound for the `PatientTokens` collection (see field policy).
+pub const MAX_RECORDS_PER_PATIENT: u32 = 50;
 
 /// Mint a new vaccination record NFT for a patient.
 ///
@@ -134,6 +38,8 @@ pub fn mint_vaccination(
     dose_number: Option<u32>,
     dose_series: Option<u32>,
 ) -> Result<u64, ContractError> {
+    // Enforce documented maximum lengths before any storage access so that
+    // oversized inputs fail fast without mutating state or emitting events.
     validate_input_length(&vaccine_name, "vaccine_name")?;
     validate_input_length(&date_administered, "date_administered")?;
 
@@ -151,7 +57,19 @@ pub fn mint_vaccination(
         return Err(ContractError::Unauthorized);
     }
 
-    // Patient must have self-registered to receive vaccination records.
+    // Patient consent / allowlist gate.
+    //
+    // Consent semantics (see contract docs):
+    // * Absent   - no allowlist entry exists: issuance is rejected with
+    //              `PatientNotRegistered`.
+    // * Granted  - allowlist entry is `true`: issuance proceeds.
+    // * Revoked  - allowlist entry is `false`: issuance is rejected with
+    //              `PatientNotRegistered`.
+    // * Changed  - consent is re-evaluated on every call, so a patient that
+    //              revokes and later re-grants consent is honoured immediately.
+    //
+    // Note: allowlisting only gates issuance. It does not make on-chain data
+    // private; verification of an existing record remains public.
     let is_registered: bool = env
         .storage()
         .persistent()
@@ -217,25 +135,39 @@ pub fn mint_vaccination(
     }
 
     // Enforce a per-patient record cap to prevent unbounded storage growth.
+    // This check occurs before any persistent write; exceeding the cap is a
+    // recoverable error rather than a panic so no state is mutated and no
+    // events are emitted on the failure path.
     let limit: u32 = env
         .storage()
         .persistent()
         .get(&DataKey::PatientRecordLimit)
-        .unwrap_or(50u32);
+        .unwrap_or(MAX_RECORDS_PER_PATIENT);
     if tokens.len() >= limit {
         return Err(ContractError::RecordLimitExceeded);
     }
 
+    // Issue #88: validate the ledger timestamp before persisting it. A zero
+    // timestamp indicates an unset/invalid ledger time assumption, and a
+    // timestamp earlier than the current ledger time would be inconsistent.
+    let timestamp = env.ledger().timestamp();
+    if timestamp == 0 {
+        return Err(ContractError::InvalidTimestamp);
+    }
+
     // Build the vaccination record and persist it under DataKey::Token(token_id).
-    // The normalized vaccine name and date are stored so the duplicate key is
-    // consistent across API and contract.
+    //
+    // Field policy (privacy-safe on-chain schema): only the fields below are
+    // stored. No patient name, contact data, or unnecessary clinical details
+    // are persisted; the patient is referenced solely by wallet address and
+    // the vaccine is referenced by a bounded identifier string.
     let record = VaccinationRecord {
         token_id,
         patient: patient.clone(),
         vaccine_name: normalized_vaccine.clone(),
         date_administered: normalized_date,
         issuer: issuer.clone(),
-        timestamp: env.ledger().timestamp(),
+        timestamp,
         schema_version: 1,
         revoked: false,
         dose_number,
@@ -246,7 +178,9 @@ pub fn mint_vaccination(
     env.storage().persistent().set(&DataKey::Token(token_id), &record);
     extend_token_ttl(env, token_id);
 
-    // Append the minted token to the patient's token list and extend its TTL.
+    // Append the minted token to the patient's token list. The length was
+    // already checked above with checked_add, so this push cannot overflow.
+    // Also extend the patient token list TTL.
     let mut patient_tokens = tokens;
     patient_tokens.push_back(token_id);
     env.storage().persistent().set(&DataKey::PatientTokens(patient.clone()), &patient_tokens);
@@ -255,4 +189,96 @@ pub fn mint_vaccination(
     events::emit_minted(env, token_id, &patient, &normalized_vaccine, &issuer);
 
     Ok(token_id)
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::{Env, String};
+
+    fn setup(env: &Env) -> (Address, Address) {
+        let patient = Address::generate(env);
+        let issuer = Address::generate(env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PatientAllowlist(patient.clone()), &true);
+        env.storage().persistent().set(
+            &DataKey::Issuer(issuer.clone()),
+            &IssuerRecord { authorized: true },
+        );
+        (patient, issuer)
+    }
+
+    #[test]
+    fn record_limit_boundary_is_enforced_without_overflow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (patient, issuer) = setup(&env);
+
+        // Cap of 1: first mint succeeds, second must be rejected.
+        env.storage()
+            .persistent()
+            .set(&DataKey::PatientRecordLimit, &1u32);
+
+        let first = mint_vaccination(
+            &env,
+            patient.clone(),
+            String::from_str(&env, "VaxA"),
+            String::from_str(&env, "2024-01-01"),
+            issuer.clone(),
+            Some(1),
+            Some(2),
+        );
+        assert!(first.is_ok());
+
+        let second = mint_vaccination(
+            &env,
+            patient.clone(),
+            String::from_str(&env, "VaxB"),
+            String::from_str(&env, "2024-02-01"),
+            issuer,
+            Some(2),
+            Some(2),
+        );
+        assert_eq!(second, Err(ContractError::RecordLimitExceeded));
+    }
+
+    #[test]
+    fn zero_timestamp_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (patient, issuer) = setup(&env);
+        env.ledger().set_timestamp(0);
+
+        let result = mint_vaccination(
+            &env,
+            patient,
+            String::from_str(&env, "VaxA"),
+            String::from_str(&env, "2024-01-01"),
+            issuer,
+            None,
+            None,
+        );
+        assert_eq!(result, Err(ContractError::InvalidTimestamp));
+    }
+
+    #[test]
+    fn max_u64_timestamp_is_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (patient, issuer) = setup(&env);
+        env.ledger().set_timestamp(u64::MAX);
+
+        let result = mint_vaccination(
+            &env,
+            patient,
+            String::from_str(&env, "VaxA"),
+            String::from_str(&env, "2024-01-01"),
+            issuer,
+            None,
+            None,
+        );
+        assert!(result.is_ok());
+    }
 }

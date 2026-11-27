@@ -35,7 +35,7 @@ export function ToastProvider({ children }) {
   const [toasts, setToasts] = useState([]);
   const prefersReducedMotion = usePrefersReducedMotion();
 
-  const toast = useCallback((message, type = 'info') => {
+  const toast = useCallback((message, type = 'info', options = {}) => {
     const id = ++_id;
     setToasts((t) => [...t, { id, message, type }]);
     // Auto-dismiss timing is the same regardless of reduced-motion preference.
@@ -94,6 +94,30 @@ function ToastList({ toasts, prefersReducedMotion, onDismiss }) {
         >
           <Icon type={t.type} />
           <span style={{ flex: 1 }}>{t.message}</span>
+          {t.action && typeof t.action.onClick === 'function' ? (
+            <button
+              onClick={() => {
+                try {
+                  t.action.onClick();
+                } finally {
+                  onDismiss(t.id);
+                }
+              }}
+              style={{
+                background: 'rgba(255,255,255,0.18)',
+                border: '1px solid rgba(255,255,255,0.5)',
+                color: '#fff',
+                cursor: 'pointer',
+                fontSize: '0.85rem',
+                fontWeight: 600,
+                padding: '0.2rem 0.5rem',
+                borderRadius: 6,
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {t.action.label || 'Retry'}
+            </button>
+          ) : null}
           <button
             onClick={() => onDismiss(t.id)}
             aria-label="Dismiss"

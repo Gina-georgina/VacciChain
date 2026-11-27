@@ -15,7 +15,46 @@ use crate::errors::ContractError;
 ///
 /// This bound keeps per-invocation resource usage (storage reads, CPU and
 /// memory) predictable. It is validated before any storage access occurs.
+/// Passing more than this many wallets fails with
+/// `ContractError::BatchTooLarge` and performs no storage reads or writes.
 pub const MAX_BATCH_SIZE: u32 = 100;
+
+/// Public, privacy-preserving projection of a vaccination record.
+///
+/// This is the only record shape exposed by public verification entry points
+/// (`verify_vaccination` and `batch_verify`). It deliberately omits prohibited
+/// fields such as the patient wallet, issuer identity, provider notes, and any
+/// free-form metadata. Public-chain data is not private: only the fields below
+/// are ever revealed, and nothing here should be treated as confidential.
+#[contracttype]
+#[derive(Clone)]
+pub struct PublicVaccinationRecord {
+    /// Opaque token id for the record (not linkable to patient identity off-chain).
+    pub token_id: u64,
+    /// The vaccine name for this dose.
+    pub vaccine_name: String,
+    /// Dose number within the series, if recorded.
+    pub dose_number: Option<u32>,
+    /// Total doses in the series, if recorded.
+    pub dose_series: Option<u32>,
+    /// Ledger timestamp at which the record was issued.
+    pub issued_at: u64,
+}
+
+/// Project a stored record into the public, allowlisted field set.
+///
+/// Only the fields present on `PublicVaccinationRecord` are copied. Any other
+/// data held in `VaccinationRecord` (e.g. issuer, notes, patient address) is
+/// intentionally dropped and must never be returned by verification.
+fn to_public_record(token_id: u64, record: &VaccinationRecord) -> PublicVaccinationRecord {
+    PublicVaccinationRecord {
+        token_id,
+        vaccine_name: record.vaccine_name.clone(),
+        dose_number: record.dose_number,
+        dose_series: record.dose_series,
+        issued_at: record.issued_at,
+    }
+}
 
 /// Storage lifecycle assumptions for verification.
 ///
@@ -81,16 +120,31 @@ pub struct DoseStatus {
     pub complete: bool,
 }
 
+/// Explicit outcome of a verification call.
+///
+/// Only `Valid` indicates an active vaccination record. Callers must never
+/// treat `Revoked`, `Absent`, or `Unavailable` as a positive result.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VerificationStatus {
+    /// At least one active (non-revoked) record exists.
+    Valid,
+    /// Records exist but all are revoked.
+    Revoked,
+    /// No records exist for the wallet.
+    Absent,
+    /// The data could not be read; must NOT be treated as a positive result.
+    Unavailable,
+}
+
 /// Batch verify vaccination status for multiple wallets.
 ///
 /// This function is an optimized convenience wrapper for `verify_vaccination`.
 /// It succeeds for up to `MAX_BATCH_SIZE` wallets and returns a tuple for each wallet:
 /// `(wallet, status, records)`.
 ///
-/// Revocation semantics: revocation is **record-level** and **irreversible**.
-/// A revoked record is never returned in the active records list and never
-/// contributes to dose status, so a wallet with one revoked record among
-/// several still verifies as vaccinated based on its remaining active records.
+/// The returned records are `PublicVaccinationRecord` projections: only the
+/// allowlisted public fields are revealed. Revoked records are excluded.
 ///
 /// # Arguments
 /// * `env` - The Soroban environment.
@@ -103,6 +157,7 @@ pub struct DoseStatus {
 /// * `Err(ContractError::BatchTooLarge)` when `wallets.len() > MAX_BATCH_SIZE`.
 ///
 /// The batch size is validated before any storage access is performed.
+/// This function is read-only: it never mutates storage and never emits events.
 pub fn batch_verify(
     env: &Env,
     wallets: Vec<Address>,
@@ -112,6 +167,8 @@ pub fn batch_verify(
     }
 
     let mut results: Vec<(Address, VerificationStatus, Vec<VaccinationRecord>)> = Vec::new(env);
+    // Iteration is bounded by `wallets.len()`, which is <= MAX_BATCH_SIZE, so
+    // the loop counter cannot overflow and the result vec stays small.
     for i in 0..wallets.len() {
         let wallet = wallets.get(i).unwrap();
         let (status, records, _) = verify_vaccination(env, wallet.clone());
@@ -122,15 +179,15 @@ pub fn batch_verify(
 
 /// Verify vaccination status for a single wallet.
 ///
-/// Returns an explicit `VerificationStatus`, the list of active (non-revoked)
-/// vaccination records, and a per-vaccine dose completion summary.
+/// Returns whether the wallet has at least one active (non-revoked) record, the
+/// list of active vaccination records projected to the public field set, and a
+/// per-vaccine dose completion summary.
 ///
-/// The status distinguishes:
-/// * `Valid` - at least one active record exists.
-/// * `Revoked` - records exist but all are revoked.
-/// * `Absent` - no records exist for the wallet.
-/// * `Unavailable` - the data could not be read; callers must NOT treat this
-///   as a positive verification result.
+/// Consent and allowlisting semantics: verification only reads records that are
+/// present and not revoked. Absent consent yields no records; revoked consent
+/// (revoked records) is excluded from both the record list and dose summaries.
+/// Because this is a public-chain read, callers must assume the returned fields
+/// are publicly visible; prohibited fields are never included.
 ///
 /// Revocation semantics: revocation applies to an individual vaccination record
 /// only (not to the wallet as a whole and not to the issuer's permission to
@@ -144,10 +201,15 @@ pub fn batch_verify(
 /// * `wallet` - The wallet address to check.
 ///
 /// # Returns
-/// * `(VerificationStatus, Vec<VaccinationRecord>, Vec<DoseStatus>)`
-///   - VerificationStatus: explicit outcome (never collapse failures into Valid)
-///   - Vec<VaccinationRecord>: active vaccination records
+/// * `(bool, Vec<PublicVaccinationRecord>, Vec<DoseStatus>)`
+///   - bool: wallet has at least one active record
+///   - Vec<PublicVaccinationRecord>: active records, public fields only
 ///   - Vec<DoseStatus>: per-vaccine dose completion summary
+///
+/// # Read-only guarantee
+/// This function only reads persistent storage. It never writes storage, never
+/// emits events, and therefore cannot alter token ownership or any other state.
+/// Soulbound enforcement is unaffected by verification calls.
 pub fn verify_vaccination(env: &Env, wallet: Address) -> (VerificationStatus, Vec<VaccinationRecord>, Vec<DoseStatus>) {
     // Missing or expired patient index: treat as "no records". This is a
     // non-authorized result and must never be interpreted as authorized.
@@ -161,16 +223,14 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (VerificationStatus, Ve
     };
 
     if tokens.is_empty() {
-        return (VerificationStatus::Absent, Vec::new(env), Vec::new(env));
+        return (false, Vec::new(env), Vec::new(env));
     }
 
-    let mut records: Vec<VaccinationRecord> = Vec::new(env);
+    let mut records: Vec<PublicVaccinationRecord> = Vec::new(env);
     let mut has_active = false;
-    let mut has_revoked = false;
 
-    // Load all active (non-revoked) records for the wallet.
-    // Revocation is record-level and irreversible: revoked records are skipped
-    // entirely and never surface in the active records list or dose status.
+    // Load all active (non-revoked) records for the wallet, projecting each to
+    // the public field set so prohibited fields are never returned.
     // Missing or expired token entries are skipped explicitly: they are never
     // counted as active records, so authorization cannot fail open.
     for i in 0..tokens.len() {
@@ -186,12 +246,15 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (VerificationStatus, Ve
                 } else {
                     has_active = true;
                     records.push_back(record);
+                } else {
+                    has_revoked = true;
                 }
             }
             None => {
                 // Token entry absent or expired; skip without granting access.
             }
         }
+        // Token entry absent or expired; skip without granting access.
     }
 
     // Build per-vaccine dose status from active records only.
@@ -205,6 +268,9 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (VerificationStatus, Ve
 
     for i in 0..records.len() {
         let rec = records.get(i).unwrap();
+        // Missing dose metadata is treated as 0 (no doses recorded). Values are
+        // only ever compared and stored verbatim; no arithmetic is performed on
+        // them, so there is no overflow risk even at u32::MAX.
         let dn = rec.dose_number.unwrap_or(0);
         let ds = rec.dose_series.unwrap_or(0);
 
@@ -213,12 +279,10 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (VerificationStatus, Ve
             if vaccine_names.get(j).unwrap() == rec.vaccine_name {
                 let prev_dn = doses_received.get(j).unwrap();
                 let prev_ds = doses_required.get(j).unwrap();
-                if dn > prev_dn {
-                    doses_received.set(j, dn);
-                }
-                if ds > prev_ds {
-                    doses_required.set(j, ds);
-                }
+                // Use max() instead of manual comparison to make the
+                // non-arithmetic, overflow-free intent explicit.
+                doses_received.set(j, dn.max(prev_dn));
+                doses_required.set(j, ds.max(prev_ds));
                 found = true;
                 break;
             }
@@ -234,6 +298,8 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (VerificationStatus, Ve
     for i in 0..vaccine_names.len() {
         let dr = doses_received.get(i).unwrap();
         let dq = doses_required.get(i).unwrap();
+        // Completion is a pure comparison (no subtraction), so it is safe for
+        // any u32 values including 0 and u32::MAX.
         dose_statuses.push_back(DoseStatus {
             vaccine_name: vaccine_names.get(i).unwrap(),
             doses_received: dr,
@@ -242,15 +308,114 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (VerificationStatus, Ve
         });
     }
 
-    let status = if has_active {
-        VerificationStatus::Valid
-    } else if has_revoked {
-        VerificationStatus::Revoked
-    } else {
-        VerificationStatus::Absent
-    };
+    (has_active, records, dose_statuses)
+}
 
-    (status, records, dose_statuses)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::String;
+
+    fn make_record(env: &Env, vaccine: &str, revoked: bool) -> VaccinationRecord {
+        VaccinationRecord {
+            vaccine_name: String::from_str(env, vaccine),
+            dose_number: Some(1),
+            dose_series: Some(2),
+            issued_at: 100,
+            revoked,
+        }
+    }
+
+    fn store_record(env: &Env, wallet: &Address, tid: u64, record: VaccinationRecord) {
+        env.storage().persistent().set(&DataKey::Token(tid), &record);
+        let mut tokens: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PatientTokens(wallet.clone()))
+            .unwrap_or(Vec::new(env));
+        tokens.push_back(tid);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PatientTokens(wallet.clone()), &tokens);
+    }
+
+    #[test]
+    fn verify_returns_public_fields_only() {
+        let env = Env::default();
+        let wallet = Address::generate(&env);
+        store_record(&env, &wallet, 1, make_record(&env, "COVID", false));
+
+        let (vaccinated, records, statuses) = verify_vaccination(&env, wallet);
+        assert!(vaccinated);
+        assert_eq!(records.len(), 1);
+        assert_eq!(statuses.len(), 1);
+
+        let rec = records.get(0).unwrap();
+        // Public projection exposes only allowlisted fields.
+        assert_eq!(rec.token_id, 1);
+        assert_eq!(rec.vaccine_name, String::from_str(&env, "COVID"));
+        assert_eq!(rec.dose_number, Some(1));
+        assert_eq!(rec.dose_series, Some(2));
+        assert_eq!(rec.issued_at, 100);
+    }
+
+    #[test]
+    fn verify_excludes_revoked_records() {
+        let env = Env::default();
+        let wallet = Address::generate(&env);
+        store_record(&env, &wallet, 1, make_record(&env, "COVID", false));
+        store_record(&env, &wallet, 2, make_record(&env, "Flu", true));
+
+        let (vaccinated, records, statuses) = verify_vaccination(&env, wallet);
+        assert!(vaccinated);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records.get(0).unwrap().token_id, 1);
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses.get(0).unwrap().vaccine_name, String::from_str(&env, "COVID"));
+    }
+
+    #[test]
+    fn verify_absent_consent_returns_empty() {
+        let env = Env::default();
+        let wallet = Address::generate(&env);
+
+        let (vaccinated, records, statuses) = verify_vaccination(&env, wallet);
+        assert!(!vaccinated);
+        assert_eq!(records.len(), 0);
+        assert_eq!(statuses.len(), 0);
+    }
+
+    #[test]
+    fn verify_all_revoked_returns_empty() {
+        let env = Env::default();
+        let wallet = Address::generate(&env);
+        store_record(&env, &wallet, 1, make_record(&env, "COVID", true));
+
+        let (vaccinated, records, statuses) = verify_vaccination(&env, wallet);
+        assert!(!vaccinated);
+        assert_eq!(records.len(), 0);
+        assert_eq!(statuses.len(), 0);
+    }
+
+    #[test]
+    fn batch_verify_returns_public_fields_only() {
+        let env = Env::default();
+        let wallet = Address::generate(&env);
+        store_record(&env, &wallet, 1, make_record(&env, "COVID", false));
+        store_record(&env, &wallet, 2, make_record(&env, "Flu", true));
+
+        let mut wallets: Vec<Address> = Vec::new(&env);
+        wallets.push_back(wallet.clone());
+        let results = batch_verify(&env, wallets);
+
+        assert_eq!(results.len(), 1);
+        let (w, vaccinated, records) = results.get(0).unwrap();
+        assert_eq!(w, wallet);
+        assert!(vaccinated);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records.get(0).unwrap().token_id, 1);
+    }
 }
 
 #[cfg(test)]

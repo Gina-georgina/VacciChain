@@ -7,6 +7,7 @@
  */
 
 const express = require('express');
+const { ERROR_CODES, sendError } = require('../errors');
 const crypto = require('crypto');
 const authMiddleware = require('../middleware/auth');
 const validate = require('../middleware/validate');
@@ -54,6 +55,8 @@ function adminOnly(req, res, next) {
   }
   next();
 }
+
+/**
  * Any authenticated user can submit an onboarding request.
  */
 router.post('/apply', applyLimiter, authMiddleware, validate(applySchema), async (req, res) => {
@@ -107,7 +110,7 @@ router.post('/applications/:id/review', reviewLimiter, authMiddleware, adminOnly
     try {
       await addIssuer(application.wallet);
     } catch (err) {
-      return res.status(502).json({ error: `Contract call failed: ${err.message}` });
+      return sendError(req, res, 502, ERROR_CODES.RPC_ERROR, 'Contract call failed');
     }
   }
 

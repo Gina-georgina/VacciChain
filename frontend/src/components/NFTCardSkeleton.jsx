@@ -13,7 +13,15 @@ const card = {
   marginBottom: '1rem',
 };
 
-export default function NFTCardSkeleton({ count = 3 }) {
+export default function NFTCardSkeleton({
+  count = 3,
+  label = 'Loading…',
+  ariaLabel,
+  role = 'status',
+}) {
+  const safeCount = Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
+  const accessibleLabel = ariaLabel || label;
+
   return (
     <>
       <style>{`

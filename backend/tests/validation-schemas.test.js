@@ -143,6 +143,12 @@ describe('Request Body Validation Schemas', () => {
         expect(result.success).toBe(false);
       });
 
+      it('should reject dose_number greater than dose_series', () => {
+        expect(issueSchema.safeParse({
+          patient_address: 'GABC', vaccine_name: 'MMR', date_administered: '2024-01-15', dose_number: 3, dose_series: 2,
+        }).success).toBe(false);
+      });
+
       it('should allow optional dose fields', () => {
         const result = issueSchema.safeParse({
           patient_address: 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF',

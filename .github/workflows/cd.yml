@@ -6,6 +6,16 @@ on:
       - main
     paths:
       - "contracts/**"
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Stellar network to deploy to (explicitly required)"
+        type: choice
+        required: true
+        default: testnet
+        options:
+          - testnet
+          - mainnet
 
 jobs:
   deploy:
@@ -15,6 +25,22 @@ jobs:
         working-directory: contracts
 
     steps:
+      - name: Validate network input
+        run: |
+          NETWORK="${{ github.event.inputs.network }}"
+          if [ -z "$NETWORK" ]; then
+            echo "::error::An explicit network (testnet or mainnet) must be provided."
+            exit 1
+          fi
+          case "$NETWORK" in
+            testnet|mainnet) ;;
+            *)
+              echo "::error::Unsupported network '$NETWORK'. Expected testnet or mainnet."
+              exit 1
+              ;;
+          esac
+          echo "NETWORK=$NETWORK" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - name: Install Rust
@@ -81,6 +107,18 @@ jobs:
             --network testnet)
           echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
 
+      - name: Smoke test deployed contract
+        env:
+          ADMIN_SECRET_KEY: ${{ secrets.ADMIN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          make smoke-test \
+            NETWORK="$NETWORK" \
+            CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}" \
+            EXPECTED_CONTRACT_ID="$EXPECTED_CONTRACT_ID" \
+            RPC_URL="$RPC_URL" \
+            NETWORK_PASSPHRASE="$NETWORK_PASSPHRASE"
+
       - name: Store contract ID as secret
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
@@ -90,7 +128,7 @@ jobs:
             --repo "${{ github.repository }}"
 
       - name: Print contract ID
-        run: echo "Deployed contract ID ${{ steps.deploy.outputs.contract_id }}"
+        run: echo "Deployed contract ID ${{ steps.deploy.outputs.contract_id }} on $NETWORK"
 
   restore-drill:
     # Scheduled restore drills are defined in .github/workflows/restore-drill.yml

@@ -2,6 +2,41 @@
 
 VacciChain uses Soroban's native WASM upgrade mechanism. The contract's storage and address remain unchanged — only the executable code is replaced.
 
+## Supported toolchain policy
+
+The contract is built and tested against the following pinned versions. These are declared in `contracts/rust-toolchain.toml`, `contracts/Cargo.toml`, and the CI workflow; CI fails if the local toolchain does not match.
+
+| Component | Supported version | Declared in |
+|-----------|-------------------|-------------|
+| Rust | pinned stable channel (see `rust-toolchain.toml`) | `contracts/rust-toolchain.toml` |
+| `soroban-sdk` | version pinned in `contracts/Cargo.toml` | `contracts/Cargo.toml` |
+| Stellar CLI (`soroban`) | version pinned in CI workflow | `.github/workflows/` |
+
+CI verifies the declared toolchain on every push and runs `cargo audit` (or equivalent advisory check) against the locked dependency graph. A failing advisory check blocks merge.
+
+### Dependency upgrade procedure
+
+Any change to Rust, `soroban-sdk`, or the Stellar CLI version must go through a dedicated PR that:
+
+1. **Passes all tests** — unit tests, integration tests, and the full contract test suite must be green.
+2. **Compares resources** — record CPU instructions and memory usage for the key entry points (`verify_vaccination`, `mint`, `upgrade`) before and after the bump, and include the comparison in the PR description. Significant regressions must be justified.
+3. **Updates release notes** — add an entry to `CHANGELOG.md` describing the version change and any behavioral impact.
+4. **Updates this document** — keep the toolchain table above in sync with the pinned versions.
+
+Dependency upgrades are reviewed by at least one maintainer with contracts experience before merge.
+
+## Version-specific behavior and compatibility
+
+The contract exposes a stable public interface. Callers can rely on the following guarantees across upgrades:
+
+- **Function signatures** — public method names and argument types are treated as stable. Removing or renaming a public method, or changing an argument's type, is a breaking change and requires a major version bump plus a migration note in the release notes.
+- **Authorization** — the auth model (admin-gated `upgrade`, issuer-gated `mint`, public `verify_vaccination`) is part of the contract's contract. Changes to who may call a method are breaking changes.
+- **Error codes** — error variants are stable identifiers. New variants may be added, but existing variants must not be renumbered or repurposed. The backend maps each contract error to a stable API response; see the backend mapping tests for the authoritative mapping.
+- **Storage layout** — existing storage keys and value shapes are preserved across upgrades. Any layout change must include a migration path documented in the release notes.
+- **Events** — event topics and payload fields are additive-only; existing fields are not removed or reordered.
+
+Behavior that differs between contract versions is documented in `CHANGELOG.md` under the corresponding version heading.
+
 ## How it works
 
 The `upgrade(new_wasm_hash)` function:
@@ -92,11 +127,25 @@ must perform another upgrade to a previously reviewed WASM hash, which means:
 
 ### 1. Build the new WASM
 
+The WASM must be built from the audited, pinned source revision recorded in the security audit (see [security-audit.md](./security-audit.md)). Do not upgrade from an unreviewed branch or working tree.
+
 ```bash
 cd contracts
+git checkout <AUDITED_COMMIT_SHA>   # pinned, audited revision
 make build
 # outputs: target/wasm32-unknown-unknown/release/vacci_chain.wasm
 ```
+
+Record the SHA-256 hash of the built artifact and confirm it matches the audited WASM hash:
+
+```bash
+sha256sum target/wasm32-unknown-unknown/release/vacci_chain.wasm
+# compare against the audited WASM hash in docs/security-audit.md
+```
+
+If the hash does not match the audited artifact, stop — the build is not the audited code.
+
+> **Re-audit required:** Any upgrade that changes contract code after the audit must trigger a re-audit of the changed code (authorization, storage, lifecycle, upgrade, and privacy properties) before mainnet deployment. Record the new findings and pinned revision in [security-audit.md](./security-audit.md).
 
 ### 2. Upload the WASM to the network (testnet first)
 
@@ -224,7 +273,9 @@ If an unsupported upgrade is attempted or detected:
 
 ## Security checklist
 
-- [ ] New WASM built from a tagged, reviewed commit
+- [ ] New WASM built from the audited, pinned commit (recorded in `docs/security-audit.md`)
+- [ ] Built WASM SHA-256 hash matches the audited WASM hash
+- [ ] Any post-audit code change has been re-audited and findings recorded
 - [ ] PR approved by at least two maintainers (no self-approval by key holder)
 - [ ] Built WASM hash matches the reviewed commit and the uploaded hash
 - [ ] Storage migration (if any) documented and backward compatible

@@ -1,4 +1,5 @@
 const logger = require('../logger');
+const { errorBody } = require('../errors');
 
 /**
  * Patterns that match sensitive values which must never reach logs.
@@ -51,26 +52,23 @@ function redactSensitive(value) {
 }
 
 /**
- * Global error handler middleware.
+ * Global error handler middleware (#42 — see docs/api-errors.md).
  *
  * Operational errors (statusCode 4xx set on the error object) are returned
- * with their message. Unexpected errors (5xx) log the full stack but only
- * return a generic message so internals are never exposed in production.
+ * with their message and stable `code`. Unexpected errors (5xx) log the full
+ * stack but only return a generic message, so internals are never exposed.
  *
  * Sensitive values (JWTs, secret keys, signed payloads) are redacted from the
  * logged message and stack. Raw request headers and bodies are never logged.
  *
- * @param {Error} err
- * @param {import('express').Request} req
- * @param {import('express').Response} res
- * @param {import('express').NextFunction} _next
+ * Operational errors (4xx) return their safe message. Unexpected errors
+ * (5xx) return a generic message; the full stack is logged server-side and
+ * never leaked to the client.
  */
 function errorHandler(err, req, res, _next) {
-  const statusCode = Number.isInteger(err.statusCode) && err.statusCode >= 400 && err.statusCode < 600
-    ? err.statusCode
-    : 500;
-
-  const isOperational = statusCode >= 400 && statusCode < 500;
+  // express.json() parse failures and body-limit errors carry `status`.
+  const raw = Number.isInteger(err.statusCode) ? err.statusCode : err.status;
+  const statusCode = Number.isInteger(raw) && raw >= 400 && raw < 600 ? raw : 500;
 
   logger.error('unhandled error', {
     requestId: req.requestId,
@@ -79,12 +77,8 @@ function errorHandler(err, req, res, _next) {
     statusCode,
   });
 
-  const body = {
-    error: isOperational ? err.message : 'Internal Server Error',
-    requestId: req.requestId,
-  };
-
-  res.status(statusCode).json(body);
+  const code = typeof err.code === 'string' && /^[A-Z_]+$/.test(err.code) ? err.code : undefined;
+  res.status(statusCode).json(errorBody(req, statusCode, code, err.message, err.details));
 }
 
 module.exports = errorHandler;

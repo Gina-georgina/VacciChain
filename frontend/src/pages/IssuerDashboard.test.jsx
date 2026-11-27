@@ -134,6 +134,22 @@ describe('IssuerDashboard', () => {
       expect(screen.getByText('Minting…')).toBeInTheDocument();
     });
 
+    it('validates and submits dose metadata', async () => {
+      mockIssueVaccination.mockResolvedValue(null);
+      render(<IssuerDashboard />);
+      const number = await screen.findByLabelText('Dose Number (optional)');
+      fireEvent.change(number, { target: { value: '3' } });
+      fireEvent.change(screen.getByLabelText('Doses in Series (optional)'), { target: { value: '2' } });
+      expect(number).toHaveAttribute('aria-invalid', 'true');
+      fireEvent.submit(screen.getByRole('form'));
+      expect(mockIssueVaccination).not.toHaveBeenCalled();
+      fireEvent.change(number, { target: { value: '1' } });
+      fireEvent.submit(screen.getByRole('form'));
+      await waitFor(() => expect(mockIssueVaccination).toHaveBeenCalledWith(
+        expect.objectContaining({ dose_number: 1, dose_series: 2 })
+      ));
+    });
+
     const fillValidForm = () => {
       fireEvent.change(screen.getByLabelText('Patient Stellar Address'), {
         target: { value: 'G12345678901234567890123456789012345678901234567890123456' }

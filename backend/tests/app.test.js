@@ -5,6 +5,11 @@ const rateLimit = require('../src/rateLimit');
 const logger = require('../src/logger');
 
 describe('Health check', () => {
+  afterEach(() => {
+    health.setSorobanHealthy(true);
+    health.setDatabaseHealthy(true);
+  });
+
   it('GET /health returns ok', async () => {
     const res = await request(app).get('/health');
     expect(res.status).toBe(200);
@@ -22,42 +27,97 @@ describe('Health check', () => {
     expect(res.body.uptime).toBeGreaterThanOrEqual(0);
     health.setSorobanHealthy(true);
   });
+
+  it('GET /health/live returns 200 while the process is running', async () => {
+    health.setSorobanHealthy(false);
+    health.setDatabaseHealthy(false);
+    const res = await request(app).get('/health/live');
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(typeof res.body.uptime).toBe('number');
+    expect(res.body.uptime).toBeGreaterThanOrEqual(0);
+  });
+
+  it('GET /health/ready returns 200 when dependencies are healthy', async () => {
+    const res = await request(app).get('/health/ready');
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(res.body.checks).toEqual(
+      expect.objectContaining({ database: 'ok', soroban: 'ok' })
+    );
+  });
+
+  it('GET /health/ready returns 503 when Soroban is unavailable', async () => {
+    health.setSorobanHealthy(false);
+    const res = await request(app).get('/health/ready');
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.checks).toEqual(
+      expect.objectContaining({ database: 'ok', soroban: 'unavailable' })
+    );
+  });
+
+  it('GET /health/ready returns 503 when the database is unavailable', async () => {
+    health.setDatabaseHealthy(false);
+    const res = await request(app).get('/health/ready');
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.checks).toEqual(
+      expect.objectContaining({ database: 'unavailable', soroban: 'ok' })
+    );
+  });
+
+  it('health responses do not disclose secrets or raw errors', async () => {
+    health.setSorobanHealthy(false);
+    health.setDatabaseHealthy(false);
+    const endpoints = ['/health', '/health/live', '/health/ready'];
+    for (const endpoint of endpoints) {
+      const res = await request(app).get(endpoint);
+      const body = JSON.stringify(res.body);
+      expect(body).not.toMatch(/secret/i);
+      expect(body).not.toMatch(/password/i);
+      expect(body).not.toMatch(/stack/i);
+      expect(body).not.toMatch(/error/i);
+      expect(res.body).not.toHaveProperty('error');
+      expect(res.body).not.toHaveProperty('details');
+    }
+  });
 });
 
 describe('Auth routes', () => {
   it('POST /auth/sep10 requires public_key', async () => {
-    const res = await request(app).post('/auth/sep10').send({});
+    const res = await request(app).post('/v1/auth/sep10').send({});
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('Validation failed');
     expect(JSON.stringify(res.body.details)).toMatch(/public_key/);
   });
 
   it('POST /auth/sep10 rejects invalid key', async () => {
-    const res = await request(app).post('/auth/sep10').send({ public_key: 'not-a-key' });
+    const res = await request(app).post('/v1/auth/sep10').send({ public_key: 'not-a-key' });
     expect(res.status).toBe(400);
   });
 
   it('POST /auth/verify requires transaction and nonce', async () => {
-    const res = await request(app).post('/auth/verify').send({});
+    const res = await request(app).post('/v1/auth/verify').send({});
     expect(res.status).toBe(400);
   });
 });
 
 describe('Vaccination routes', () => {
   it('POST /vaccination/issue requires auth', async () => {
-    const res = await request(app).post('/vaccination/issue').send({});
+    const res = await request(app).post('/v1/vaccination/issue').send({});
     expect(res.status).toBe(401);
   });
 
   it('GET /vaccination/:wallet requires auth', async () => {
-    const res = await request(app).get('/vaccination/GABC');
+    const res = await request(app).get('/v1/vaccination/GABC');
     expect(res.status).toBe(401);
   });
 });
 
 describe('Verify route', () => {
   it('GET /verify/:wallet rejects invalid address', async () => {
-    const res = await request(app).get('/verify/invalid-address');
+    const res = await request(app).get('/v1/verify/invalid-address');
     expect(res.status).toBe(400);
   });
 });

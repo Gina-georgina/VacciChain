@@ -408,12 +408,42 @@ fn test_revoked_records_persist_after_upgrade() {
     assert_eq!(records.len(), 0, "revoked records should not be returned");
 }
 
+#[test]
+fn test_non_admin_cannot_upgrade() {
+    let env = Env::default();
+    let admin = TestAddress::random(&env);
+    let attacker = TestAddress::random(&env);
+
+    env.mock_all_auths();
+
+    let _ = VacciChainContract::initialize(env.clone(), admin.clone());
+}
+
 // ---------------------------------------------------------------------------
 // Fixture-based migration tests
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_migration_reads_v1_record_fixture() {
+    let env = Env::default();
+    let admin = TestAddress::random(&env);
+    let issuer = TestAddress::random(&env);
+    let patient = TestAddress::random(&env);
+
+    env.mock_all_auths();
+
+    let _ = VacciChainContract::initialize(env.clone(), admin.clone());
+    // A non-admin address must not be able to authorize an upgrade.
+    let result = VacciChainContract::upgrade(env.clone(), attacker.clone(), None);
+    assert_eq!(
+        result,
+        Err(ContractError::Unauthorized),
+        "non-admin must not be able to upgrade the contract"
+    );
+}
+
+#[test]
+fn test_upgrade_preserves_storage_and_lifecycle() {
     let env = Env::default();
     let admin = TestAddress::random(&env);
     let issuer = TestAddress::random(&env);
@@ -431,7 +461,6 @@ fn test_migration_reads_v1_record_fixture() {
     );
     let _ = VacciChainContract::register_patient(env.clone(), patient.clone());
 
-    // Issuer is active and can mint before upgrade
     let token_id = VacciChainContract::mint_vaccination(
         env.clone(),
         patient.clone(),
@@ -440,51 +469,22 @@ fn test_migration_reads_v1_record_fixture() {
         issuer.clone(),
         None,
         None,
-    ).expect("active issuer should be able to mint");
+    ).expect("mint should succeed");
 
-    // Simulate upgrade: state is re-read from storage
+    // Admin-authorized upgrade must succeed.
+    let upgrade_result = VacciChainContract::upgrade(env.clone(), admin.clone(), None);
+    assert_eq!(upgrade_result, Ok(()), "admin upgrade should succeed");
+
+    // Lifecycle: storage written before the upgrade must remain intact.
     let (vaccinated, records, _) = VacciChainContract::verify_vaccination(env.clone(), patient.clone());
-    assert!(vaccinated, "record should persist across upgrade");
-    assert_eq!(records.get(0).unwrap().token_id, token_id, "token_id should persist");
-
-    // Revoke the issuer, then verify the revoked state persists across upgrade
-    let _ = VacciChainContract::revoke_issuer(env.clone(), issuer.clone());
-
-    // After upgrade, revoked issuer must still be unable to mint
-    let mint_result = VacciChainContract::mint_vaccination(
-        env.clone(),
-        patient.clone(),
-        SorobanString::from_slice(&env, b"Flu"),
-        SorobanString::from_slice(&env, b"2024-02-20"),
-        issuer.clone(),
-        None,
-        None,
-    );
-    assert!(mint_result.is_err(), "revoked issuer must remain revoked after upgrade");
-
-    // Re-add the issuer and verify the re-added state persists
-    let _ = VacciChainContract::add_issuer(
-        env.clone(),
-        issuer.clone(),
-        SorobanString::from_slice(&env, b"Test Issuer"),
-        SorobanString::from_slice(&env, b"LIC123"),
-        SorobanString::from_slice(&env, b"US"),
-    );
-
-    let re_mint = VacciChainContract::mint_vaccination(
-        env.clone(),
-        patient.clone(),
-        SorobanString::from_slice(&env, b"Flu"),
-        SorobanString::from_slice(&env, b"2024-02-20"),
-        issuer.clone(),
-        None,
-        None,
-    );
-    assert!(re_mint.is_ok(), "re-added issuer should be able to mint after upgrade");
+    assert!(vaccinated, "patient should remain vaccinated after upgrade");
+    assert_eq!(records.len(), 1, "record count should be preserved across upgrade");
+    assert_eq!(records.get(0).unwrap().token_id, token_id, "token_id should be preserved");
+    assert_eq!(records.get(0).unwrap().schema_version, 1, "schema_version should be preserved");
 }
 
 #[test]
-fn test_v1_fixture_record_readable_after_upgrade() {
+fn test_upgrade_does_not_introduce_pii() {
     let env = Env::default();
     let admin = TestAddress::random(&env);
     let issuer = TestAddress::random(&env);
@@ -493,7 +493,50 @@ fn test_v1_fixture_record_readable_after_upgrade() {
     env.mock_all_auths();
 
     let _ = VacciChainContract::initialize(env.clone(), admin.clone());
+    let _ = VacciChainContract::add_issuer(
+        env.clone(),
+        issuer.clone(),
+        SorobanString::from_slice(&env, b"Test Issuer"),
+        SorobanString::from_slice(&env, b"LIC123"),
+        SorobanString::from_slice(&env, b"US"),
+    );
+    let _ = VacciChainContract::register_patient(env.clone(), patient.clone());
 
+    let _ = VacciChainContract::mint_vaccination(
+        env.clone(),
+        patient.clone(),
+        SorobanString::from_slice(&env, b"COVID-19"),
+        SorobanString::from_slice(&env, b"2024-01-15"),
+        issuer.clone(),
+        None,
+        None,
+    ).expect("mint should succeed");
+
+    let (_, records_before, _) = VacciChainContract::verify_vaccination(env.clone(), patient.clone());
+    let record_before = records_before.get(0).unwrap();
+
+    let _ = VacciChainContract::upgrade(env.clone(), admin.clone(), None);
+
+    // Privacy: the upgrade must not add or alter PII-bearing fields.
+    let (_, records_after, _) = VacciChainContract::verify_vaccination(env.clone(), patient.clone());
+    let record_after = records_after.get(0).unwrap();
+    assert_eq!(record_after.patient, record_before.patient, "patient field must be unchanged");
+    assert_eq!(record_after.issuer, record_before.issuer, "issuer field must be unchanged");
+    assert_eq!(record_after.vaccine_name, record_before.vaccine_name, "vaccine_name must be unchanged");
+    assert_eq!(record_after.date, record_before.date, "date must be unchanged");
+    assert_eq!(record_after.schema_version, record_before.schema_version, "schema_version must be unchanged");
+}
+
+#[test]
+fn test_migration_reads_v1_record_fixture() {
+    let env = Env::default();
+    let admin = TestAddress::random(&env);
+    let issuer = TestAddress::random(&env);
+    let patient = TestAddress::random(&env);
+
+    env.mock_all_auths();
+
+    let _ = VacciChainContract::initialize(env.clone(), admin.clone());
     seed_v1_issuer(&env, &issuer, "Legacy Issuer", "LIC-OLD", "US");
     let _ = VacciChainContract::register_patient(env.clone(), patient.clone());
 

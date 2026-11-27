@@ -61,46 +61,35 @@ async function resolveIssuerState(wallet) {
  */
 async function issuerMiddleware(req, res, next) {
   if (req.user?.role !== 'issuer') {
-    return res.status(403).json({ error: 'Issuer role required' });
+    return res.status(403).json({
+      error: 'Issuer role required',
+      code: 'ISSUER_ROLE_REQUIRED',
+    });
   }
 
   const wallet = req.user.wallet || req.user.publicKey;
   if (!wallet) {
-    return res.status(401).json({ error: 'Wallet address missing in token' });
+    return res.status(401).json({
+      error: 'Wallet address missing in token',
+      code: 'ISSUER_WALLET_MISSING',
+    });
   }
 
   try {
-    const state = await resolveIssuerState(wallet);
-
-    switch (state) {
-      case ISSUER_STATE.ACTIVE:
-        return next();
-
-      case ISSUER_STATE.REVOKED:
-        logger.warn('Revoked issuer attempt', { wallet, state });
-        return res.status(403).json({
-          error: 'Issuer authorization has been revoked',
-          code: 'ISSUER_REVOKED',
-        });
-
-      case ISSUER_STATE.PENDING_READD:
-        logger.warn('Pending re-add issuer attempt', { wallet, state });
-        return res.status(403).json({
-          error: 'Issuer authorization is pending re-approval',
-          code: 'ISSUER_PENDING_READD',
-        });
-
-      case ISSUER_STATE.UNKNOWN:
-      default:
-        logger.warn('Unauthorized issuer attempt', { wallet, state });
-        return res.status(403).json({
-          error: 'Issuer authorization revoked or not found on-chain',
-          code: 'ISSUER_NOT_AUTHORIZED',
-        });
+    const isAuthorized = await isAuthorizedIssuer(wallet);
+    if (!isAuthorized) {
+      logger.warn('Unauthorized issuer attempt', { wallet });
+      return res.status(403).json({
+        error: 'Issuer authorization revoked or not found on-chain',
+        code: 'ISSUER_NOT_AUTHORIZED',
+      });
     }
   } catch (error) {
     logger.error('Error verifying issuer allowlist', { wallet, error: error.message });
-    res.status(500).json({ error: 'Failed to verify issuer authorization' });
+    res.status(500).json({
+      error: 'Failed to verify issuer authorization',
+      code: 'ISSUER_AUTHORIZATION_CHECK_FAILED',
+    });
   }
 }
 

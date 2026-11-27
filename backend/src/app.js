@@ -6,8 +6,9 @@ const cors = require('cors');
 const swaggerUi = require('swagger-ui-express');
 const logger = require('./logger');
 const { initDb } = require('./indexer/db');
-const { startPoller, stopPoller } = require('./indexer/poller');
+const { startPoller, stopPoller, getPollerStatus } = require('./indexer/poller');
 const swaggerSpec = require('./swagger');
+const { getJobStatus } = require('./jobs/status');
 
 const authRoutes = require('./routes/auth');
 const vaccinationRoutes = require('./routes/vaccination');
@@ -29,6 +30,7 @@ const { sanitizeInputs } = require('./middleware/sanitize');
 const errorHandler = require('./middleware/errorHandler');
 const { onboardingLimiter, batchVerifyLimiter } = require('./middleware/rateLimit');
 const idempotency = require('./middleware/idempotency');
+const auditLog = require('./middleware/auditLog');
 
 const app = express();
 // Trust only the configured number of proxy hops so client identity (and thus
@@ -116,6 +118,7 @@ app.use((req, res, next) => {
 // ---------------------------------------------------------------------------
 
 app.use(cors({
+  exposedHeaders: ['API-Version', 'Deprecation', 'Link'],
   origin: (origin, callback) => {
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin || allowedOrigins.includes(origin)) {
@@ -131,9 +134,14 @@ app.use(cors({
 }));
 app.use(securityHeaders);
 app.use(express.json({ limit: config.BODY_LIMIT }));
+// Request ID must be assigned before audit logging so every audit entry
+// can be correlated with the originating request.
 app.use(requestId);
 // Sanitize all string inputs at the API boundary (strips HTML tags, control chars, null bytes)
 app.use(sanitizeInputs);
+// Tamper-evident audit logging for issuer actions (mint, revoke, consent,
+// administrative changes). Records actor, request ID, outcome, timestamp.
+app.use(auditLog);
 
 app.use((req, res, next) => {
   const start = Date.now();
@@ -151,16 +159,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Idempotency for mint (issue) requests — runs after auth so the issuer wallet
-// is available for key scoping. Only applies to POST /vaccination/issue.
-app.use('/vaccination/issue', idempotency);
-
-app.use('/auth', authRoutes);
-app.use('/vaccination', vaccinationRoutes);
-app.use('/verify', verifyRoutes);
-app.use('/admin', adminRoutes);
-app.use('/events', eventsRoutes);
-
 // v1 routes — all API endpoints are versioned under /v1/
 const v1 = express.Router();
 v1.use(apiVersion);
@@ -177,10 +175,23 @@ v1.use('/verify/batch', batchVerifyLimiter);
 v1.use('/analytics', analyticsProxyRoutes);
 app.use('/v1', v1);
 
-// Legacy unversioned routes — 308 redirect to /v1/ with Deprecation header
-app.use(['/auth', '/vaccination', '/verify', '/admin', '/patient', '/events'], (req, res) => {
-  res.setHeader('Deprecation', 'true');
-  res.redirect(308, `/v1${req.originalUrl}`);
+// Legacy unversioned routes: 308 (method and body preserved) to /v1. No handlers are
+// mounted here, so both forms always reach the same code. See docs/api-routes.md.
+app.use(
+  ['/auth', '/vaccination', '/verify', '/admin', '/patient', '/events', '/onboarding'],
+  apiVersion,
+  (req, res) => {
+    const target = `/v1${req.originalUrl}`;
+    res.setHeader('Deprecation', 'true');
+    res.setHeader('Link', `<${encodeURI(target)}>; rel="successor-version"`);
+    res.redirect(308, target);
+  }
+);
+
+// Observable background job status (indexer poller + offloaded batch verification).
+// Heavy work is executed by background workers, never synchronously in handlers.
+app.get('/admin/jobs/status', (_req, res) => {
+  res.json(getJobStatus({ poller: getPollerStatus() }));
 });
 
 // Global error handler — must be registered after all routes
@@ -188,11 +199,38 @@ app.use(errorHandler);
 
 
 /**
- * Health check endpoint.
+ * Liveness probe — reports only whether the process is running.
+ * Never depends on the database or RPC, so orchestrators restart
+ * crashed processes without cycling on temporary dependency outages.
+ *
+ * @route GET /health/live
+ * @returns {Object} 200 - { status: "ok", uptime }
+ */
+app.get('/health/live', (_req, res) => {
+  res.status(200).json(getLivenessStatus());
+});
+
+/**
+ * Readiness probe — reports whether required dependencies (database and
+ * required RPC) are available. Returns 503 when any dependency is down.
+ * Responses contain only status booleans and uptime; no secrets or raw
+ * error messages are disclosed.
+ *
+ * @route GET /health/ready
+ * @returns {Object} 200 - { status: "ok", uptime, checks: { database, rpc } }
+ * @returns {Object} 503 - { status: "degraded", uptime, checks: { database, rpc } }
+ */
+app.get('/health/ready', async (_req, res) => {
+  const body = await getReadinessStatus();
+  res.status(body.status === 'ok' ? 200 : 503).json(body);
+});
+
+/**
+ * Backwards-compatible alias for the readiness probe.
  *
  * @route GET /health
- * @returns {Object} 200 - { status: "ok", uptime }
- * @returns {Object} 503 - { status: "degraded", uptime }
+ * @returns {Object} 200 - { status: "ok", uptime, checks: { database, rpc } }
+ * @returns {Object} 503 - { status: "degraded", uptime, checks: { database, rpc } }
  */
 app.get('/health', async (_req, res) => {
   const body = getHealthStatus();

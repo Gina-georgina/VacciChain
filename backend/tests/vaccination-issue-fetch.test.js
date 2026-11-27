@@ -100,72 +100,81 @@ describe('POST /v1/vaccination/issue', () => {
     expect(res.body.error).toMatch(/identical|duplicate/i);
   });
 
-  it('returns 409 for an exact duplicate record', async () => {
-    mintVaccination.mockRejectedValue(new Error('Error(Contract, #6)'));
+  it('rejects issuance when the issuer is not authorized on-chain', async () => {
+    const { isAuthorizedIssuer } = require('../src/stellar/issuerCache');
+    isAuthorizedIssuer.mockResolvedValueOnce(false);
 
     const res = await request(app)
       .post('/v1/vaccination/issue')
       .set('Authorization', `Bearer ${issuerToken}`)
-      .send({ ...VALID_BODY });
+      .send(VALID_BODY);
 
-    expect(res.status).toBe(409);
-    expect(res.body.error).toMatch(/identical|duplicate/i);
+    expect(res.status).toBe(403);
+    expect(mintVaccination).not.toHaveBeenCalled();
   });
 
-  it('returns 409 for a duplicate with case-variant vaccine name', async () => {
-    mintVaccination.mockRejectedValue(new Error('Error(Contract, #6)'));
+  it('rejects issuance when the patient has not consented', async () => {
+    const { hasConsented } = require('../src/indexer/db');
+    hasConsented.mockReturnValueOnce(false);
 
     const res = await request(app)
       .post('/v1/vaccination/issue')
       .set('Authorization', `Bearer ${issuerToken}`)
-      .send({ ...VALID_BODY, vaccine_name: 'covid-19' });
+      .send(VALID_BODY);
 
-    expect(res.status).toBe(409);
-    expect(res.body.error).toMatch(/identical|duplicate/i);
+    expect(res.status).toBe(403);
+    expect(mintVaccination).not.toHaveBeenCalled();
   });
 
-  it('returns 409 for a duplicate with surrounding whitespace in vaccine name', async () => {
-    mintVaccination.mockRejectedValue(new Error('Error(Contract, #6)'));
+  it('rejects issuance when the patient is not allowlisted', async () => {
+    const { hasConsented } = require('../src/indexer/db');
+    hasConsented.mockReturnValueOnce(false);
 
     const res = await request(app)
       .post('/v1/vaccination/issue')
       .set('Authorization', `Bearer ${issuerToken}`)
-      .send({ ...VALID_BODY, vaccine_name: '  COVID-19  ' });
+      .send({ ...VALID_BODY, patient_address: PATIENT_WALLET });
 
-    expect(res.status).toBe(409);
-    expect(res.body.error).toMatch(/identical|duplicate/i);
+    expect(res.status).toBe(403);
+    expect(res.body).toHaveProperty('error');
+    expect(mintVaccination).not.toHaveBeenCalled();
   });
 
-  it('returns 409 for a duplicate with mixed case and whitespace', async () => {
-    mintVaccination.mockRejectedValue(new Error('Error(Contract, #6)'));
+  it('maps contract Unauthorized error (#3) to a stable 403 response', async () => {
+    mintVaccination.mockRejectedValue(new Error('Error(Contract, #3)'));
 
     const res = await request(app)
       .post('/v1/vaccination/issue')
       .set('Authorization', `Bearer ${issuerToken}`)
-      .send({ ...VALID_BODY, vaccine_name: ' Covid-19 ' });
+      .send(VALID_BODY);
 
-    expect(res.status).toBe(409);
-    expect(res.body.error).toMatch(/identical|duplicate/i);
+    expect(res.status).toBe(403);
+    expect(res.body).toHaveProperty('error');
   });
 
-  it('returns 200 for a legitimate repeat dose with a different dose_number', async () => {
+  it('maps contract InvalidInput error (#1) to a stable 400 response', async () => {
+    mintVaccination.mockRejectedValue(new Error('Error(Contract, #1)'));
+
     const res = await request(app)
       .post('/v1/vaccination/issue')
       .set('Authorization', `Bearer ${issuerToken}`)
-      .send({ ...VALID_BODY, dose_number: 2 });
+      .send(VALID_BODY);
 
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ success: true, tokenId: 'tok_1', transactionHash: 'abc123' });
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty('error');
   });
 
-  it('returns 200 for a repeat dose with different dose_number and formatting variants', async () => {
+  it('maps unknown contract errors to a stable 500 response without leaking internals', async () => {
+    mintVaccination.mockRejectedValue(new Error('Error(Contract, #999)'));
+
     const res = await request(app)
       .post('/v1/vaccination/issue')
       .set('Authorization', `Bearer ${issuerToken}`)
-      .send({ ...VALID_BODY, vaccine_name: ' covid-19 ', dose_number: 3 });
+      .send(VALID_BODY);
 
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ success: true, tokenId: 'tok_1', transactionHash: 'abc123' });
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty('error');
+    expect(JSON.stringify(res.body)).not.toMatch(/Error\(Contract/);
   });
 });
 

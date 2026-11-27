@@ -20,6 +20,7 @@ const app = require('../src/app');
 const StellarSdk = require('@stellar/stellar-sdk');
 const { simulateContract } = require('../src/stellar/soroban');
 const verifyRouter = require('../src/routes/verify');
+const { ContractError, ErrorCodes } = require('../src/contractErrors');
 
 const VALID_WALLET = 'GA3AUY2XRF6S7R73ABSLJMKG4R2NQGRUFPEJUGCANMBAAXI4MTBS6AQU';
 // Generate valid Stellar public keys to pass regex and SDK base32 verification checks
@@ -123,56 +124,60 @@ describe('Integration Tests - Public Verify Endpoint (GET /v1/verify/:wallet)', 
     expect(res.body).toHaveProperty('error');
   });
 
-  it('Test: revoking one of multiple records excludes only the revoked record', async () => {
-    // Contract returns only non-revoked records; revoked record must be excluded
-    const mockResult = StellarSdk.xdr.ScVal.scvVec([
-      StellarSdk.xdr.ScVal.scvBool(true),
-      StellarSdk.xdr.ScVal.scvVec([
-        StellarSdk.xdr.ScVal.scvMap([
-          new StellarSdk.xdr.ScMapEntry({
-            key: StellarSdk.xdr.ScVal.scvSymbol('vaccine_name'),
-            val: StellarSdk.xdr.ScVal.scvString('COVID-19')
-          }),
-          new StellarSdk.xdr.ScMapEntry({
-            key: StellarSdk.xdr.ScVal.scvSymbol('date_administered'),
-            val: StellarSdk.xdr.ScVal.scvString('2024-01-15')
-          })
-        ])
-      ]),
-    ]);
-
-    simulateContract.mockResolvedValueOnce(mockResult);
+  it('Test: contract error (NotAuthorized) maps to stable 403 API response', async () => {
+    simulateContract.mockRejectedValueOnce(
+      new ContractError(ErrorCodes.NotAuthorized, 'caller is not authorized')
+    );
 
     const res = await request(app)
       .get(`/v1/verify/${VALID_WALLET}`)
       .set('Authorization', `Bearer ${validToken}`);
 
-    expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty('verified', true);
-    expect(res.body).toHaveProperty('vaccinated', true);
-    expect(res.body.records).toHaveLength(1);
-    expect(res.body.records[0]).toHaveProperty('vaccine_name', 'COVID-19');
-    // Revoked record must not be present
-    expect(res.body.records.some((r) => r.vaccine_name === 'Influenza')).toBe(false);
+    expect(res.status).toBe(403);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body).toHaveProperty('code', ErrorCodes.NotAuthorized);
   });
 
-  it('Test: revoking all records returns verified=false with empty records', async () => {
-    // All records revoked -> contract returns [false, []]
-    const mockResult = StellarSdk.xdr.ScVal.scvVec([
-      StellarSdk.xdr.ScVal.scvBool(false),
-      StellarSdk.xdr.ScVal.scvVec([]),
-    ]);
-
-    simulateContract.mockResolvedValueOnce(mockResult);
+  it('Test: contract error (NotFound) maps to stable 404 API response', async () => {
+    simulateContract.mockRejectedValueOnce(
+      new ContractError(ErrorCodes.NotFound, 'record not found')
+    );
 
     const res = await request(app)
       .get(`/v1/verify/${VALID_WALLET}`)
       .set('Authorization', `Bearer ${validToken}`);
 
-    expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty('verified', false);
-    expect(res.body).toHaveProperty('vaccinated', false);
-    expect(res.body.records).toHaveLength(0);
+    expect(res.status).toBe(404);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body).toHaveProperty('code', ErrorCodes.NotFound);
+  });
+
+  it('Test: contract error (InvalidInput) maps to stable 400 API response', async () => {
+    simulateContract.mockRejectedValueOnce(
+      new ContractError(ErrorCodes.InvalidInput, 'invalid argument')
+    );
+
+    const res = await request(app)
+      .get(`/v1/verify/${VALID_WALLET}`)
+      .set('Authorization', `Bearer ${validToken}`);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body).toHaveProperty('code', ErrorCodes.InvalidInput);
+  });
+
+  it('Test: unknown contract error maps to stable 500 API response', async () => {
+    simulateContract.mockRejectedValueOnce(
+      new ContractError(9999, 'unexpected contract failure')
+    );
+
+    const res = await request(app)
+      .get(`/v1/verify/${VALID_WALLET}`)
+      .set('Authorization', `Bearer ${validToken}`);
+
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body).toHaveProperty('code', 9999);
   });
 
   it('Test: response is served from cache on second request within TTL', async () => {

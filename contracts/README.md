@@ -311,6 +311,35 @@ Transfer function that always panics to enforce soulbound nature.
 
 **Behavior:** Always panics with "soulbound: transfers are disabled"
 
+### Function Compatibility Contract
+
+The following guarantees apply to callers and are derived from `contracts/src`:
+
+- **Function names and argument order are stable.** New optional behavior must be added via new functions or new error codes, never by reordering existing arguments.
+- **Error codes are stable integers** (see [Error Codes](#error-codes)). Callers must branch on the numeric code, not the variant name, and must treat unknown codes as a generic failure.
+- **Authorization is part of the contract surface.** Changing which address must sign a function is a breaking change and requires a version bump plus release notes.
+- **Version-specific behavior** is recorded in the table below. `schema_version` on `VaccinationRecord` identifies the record layout; readers must tolerate records with a higher `schema_version` by ignoring unknown fields.
+
+| Contract version | Behavior notes |
+|------------------|----------------|
+| v1 (current) | `mint_vaccination` requires the patient to be allowlisted (`PatientNotRegistered` otherwise). `verify_vaccination` returns only non-revoked records. `transfer` always panics. |
+
+### Backend Error Mapping
+
+Backend API layers must map contract errors to stable HTTP responses. The mapping is verified by tests in the backend test suite.
+
+| Contract error | API status | Stable API code |
+|----------------|-----------|-----------------|
+| `Unauthorized` (3) | 403 | `FORBIDDEN` |
+| `RecordNotFound` (7) | 404 | `NOT_FOUND` |
+| `DuplicateRecord` (6) | 409 | `CONFLICT` |
+| `AlreadyRevoked` (8) | 409 | `CONFLICT` |
+| `InvalidInput*` (9–14) | 400 | `INVALID_INPUT` |
+| `PatientNotRegistered` (16) | 403 | `CONSENT_REQUIRED` |
+| `NotInitialized` (2), `AlreadyInitialized` (1) | 500 | `CONTRACT_STATE` |
+| Unknown code | 502 | `UPSTREAM_ERROR` |
+=======
+
 ## Storage Schema
 
 ### Data Structures
@@ -482,11 +511,83 @@ All string inputs are validated at the contract boundary with a maximum length o
 
 This prevents excessively long strings from being stored on ledger state and keeps ledger fees bounded.
 
+## Input Length and Collection Size Bounds
+
+Every public argument and every stored collection has a documented maximum. Values at the limit are accepted; one-over-limit values are rejected with the corresponding `ContractError` (or panic for collection bounds, as noted). Boundary tests cover zero, maximum valid, and one-over-limit values for each bound.
+
+### Public Argument Bounds
+
+| Function | Argument | Type | Maximum | On violation |
+|----------|----------|------|---------|--------------|
+| `initialize` | `admin` | `Address` | n/a (fixed size) | — |
+| `add_issuer` | `name` | `String` | 100 chars | `InvalidInputIssuerName` (12) |
+| `add_issuer` | `license` | `String` | 100 chars | `InvalidInputLicense` (13) |
+| `add_issuer` | `country` | `String` | 100 chars | `InvalidInputCountry` (14) |
+| `revoke_issuer` | `issuer` | `Address` | n/a (fixed size) | — |
+| `propose_admin` | `new_admin` | `Address` | n/a (fixed size) | — |
+| `accept_admin` | — | — | — | — |
+| `upgrade` | `new_wasm_hash` | `BytesN<32>` | 32 bytes (fixed) | — |
+| `mint_vaccination` | `vaccine_name` | `String` | 100 chars | `InvalidInputVaccineName` (10) |
+| `mint_vaccination` | `date_administered` | `String` | 100 chars | `InvalidInputDateAdministered` (11) |
+| `revoke_vaccination` | `token_id` | `u64` | n/a (fixed size) | — |
+| `verify_vaccination` | `wallet` | `Address` | n/a (fixed size) | — |
+| `batch_verify` | `wallets` | `Vec<Address>` | 100 entries | Panic (batch size exceeded) |
+| `get_issuer` | `address` | `Address` | n/a (fixed size) | — |
+| `is_issuer` | `address` | `Address` | n/a (fixed size) | — |
+| `transfer` | `token_id` | `u64` | n/a (always panics) | `SoulboundToken` (15) |
+
+### Stored Collection Bounds
+
+| Collection | Storage key | Maximum | Notes |
+|------------|-------------|---------|-------|
+| Patient token list | `PatientTokens(hash)` | 100 token IDs | Minting beyond the cap fails; keeps per-patient history within Soroban entry-size limits |
+| Batch verification result | (return value) | 100 tuples | Bounded by the `batch_verify` argument cap |
+| Issuer registry | `Issuer(hash)` | One record per issuer address | Individual records bounded by the 100-char string limits above |
+| Revocation flags | `Revoked(id)` | One flag per token | Fixed-size boolean |
+
+Zero-length strings are permitted for optional metadata fields but are rejected where a non-empty value is semantically required. See [docs/resource-limits.md](docs/resource-limits.md) for the full bound policy, rationale, and boundary test matrix.
+
+## Soulbound Enforcement Matrix
+
+Soulbound tokens must never change ownership after minting. The threat model covers every public ownership-changing operation and integration path; contract tests prove prohibited actions fail without mutating storage or emitting misleading events.
+
+| Entry point | Ownership effect | Enforcement | Failure mode |
+|-------------|------------------|-------------|--------------|
+| `transfer(from, to, token_id)` | Would move token | Always panics | `SoulboundToken` (15); no storage write, no event |
+| `approve` / `set_approval_for_all` | Would delegate control | Not implemented | No such entry point exists in the contract ABI |
+| `clawback` | Would seize token | Not implemented | No such entry point exists in the contract ABI |
+| `mint_vaccination` | Creates token for `patient` | Allowed (issuance only) | Requires authorized issuer; patient must be registered |
+| `revoke_vaccination` | Marks record revoked | Allowed (status only) | Ownership unchanged; record preserved for audit trail |
+| `upgrade` | Replaces contract code | Admin-gated | Requires admin signature; audited under #73 |
+| `initialize` | Sets admin | One-time | `AlreadyInitialized` (1) on repeat |
+
+Integration paths (SEP-41-style token clients, wallets, and indexers) must treat any transfer attempt as a hard failure. The full threat model, including alternate entry points and event-spoofing analysis, is in [docs/security/threat-model.md](docs/security/threat-model.md).
+
+## Privacy-Safe On-Chain Field Policy
+
+Immutable public contract state must not contain personally identifying or clinically sensitive data. Each field in the on-chain schema is classified below; patient names, contact data, and unnecessary clinical details are excluded.
+
+| Field | Classification | On-chain | Rationale |
+|-------|----------------|----------|-----------|
+| `token_id` | Public identifier | Yes | Sequential, non-linkable on its own |
+| `patient` | Pseudonymous identifier | Yes | Wallet address only; no name or contact data |
+| `vaccine_name` | Health-adjacent, minimized | Yes | Generic vaccine identifier only; no lot, dose, or clinical notes |
+| `date_administered` | Health-adjacent, minimized | Yes | Date only; no time-of-day or location |
+| `issuer` | Organizational identifier | Yes | Issuer wallet address |
+| `timestamp` | Public metadata | Yes | Ledger timestamp of minting |
+| `schema_version` | Public metadata | Yes | Enables future migrations |
+| `revoked` | Public status | Yes | Boolean status flag |
+| Issuer `name` / `license` / `country` | Organizational, public | Yes | Issuer metadata, not patient data |
+| Patient name, contact data, address | PII | **No** | Never stored on-chain |
+| Clinical details (dose, lot, reactions) | Sensitive health data | **No** | Kept off-chain; not required for verification |
+
+Residual linkability risks (e.g., correlating a wallet address with off-chain records, or inferring vaccination timing from `timestamp`) are documented and accepted in the privacy review. The minimized schema and residual-risk analysis are recorded alongside the audit materials in [docs/security/contract-audit.md](docs/security/contract-audit.md).
+
 ## Build & Test Instructions
 
 ### Prerequisites
-- Rust toolchain with `wasm32-unknown-unknown` target
-- Soroban CLI tools
+- Rust toolchain with `wasm32-unknown-unknown` target (pinned version)
+- Soroban CLI tools (version matching the pinned SDK)
 
 ### Building the Contract
 
@@ -557,11 +658,27 @@ The contract includes comprehensive tests covering:
 
 ## Deployment Guide
 
+### Network Selection and Validation
+
+Deployment **requires an explicit network**. There is no default network; the deploy command must fail if the network is not specified.
+
+```bash
+# The network is mandatory and must be one of: local, testnet, mainnet
+make deploy NETWORK=testnet
+```
+
+Validation performed before any transaction is submitted:
+
+1. **Explicit network** — `NETWORK` must be set to a known value; unknown or empty values abort the deploy.
+2. **Network-specific configuration** — the RPC URL, network passphrase, and admin key must match the selected network. A mismatch (e.g., testnet passphrase with a mainnet RPC URL) aborts the deploy.
+3. **Contract ID format** — the contract ID must be a valid Stellar contract address (`C...`) for the selected network.
+4. **Artifact hash** — the locally built WASM hash must match the hash recorded for the release being deployed.
+
 ### Local Development
 
 1. Start a local Stellar network (e.g., using Stellar Quickstart)
 2. Build the contract: `make build`
-3. Deploy using Soroban CLI with your local network configuration
+3. Deploy with an explicit network: `make deploy NETWORK=local`
 
 ### Testnet Deployment
 
@@ -569,33 +686,52 @@ The contract includes comprehensive tests covering:
 # Set environment variables
 export ADMIN_SECRET_KEY="your_admin_secret_key"
 
-# Deploy to testnet
-make deploy
+# Deploy to testnet (network is mandatory)
+make deploy NETWORK=testnet
 ```
 
 ### Mainnet Deployment
 
 1. Ensure thorough testing on testnet
-2. Update network configuration to mainnet
+2. Deploy with an explicit network: `make deploy NETWORK=mainnet`
 3. Use production admin keys
 4. Deploy with appropriate resource limits
+
+### Post-Deployment Smoke Tests
+
+Smoke tests confirm the deployed contract belongs to the expected network and artifact:
+
+1. **Network check** — query the contract ID on the expected network and confirm it exists; confirm the same ID is absent on other networks.
+2. **Artifact hash check** — fetch the deployed WASM and confirm its hash matches the locally built artifact hash.
+3. **Initialization check** — confirm `initialize` has been called and the admin matches the expected address.
+4. **Functional check** — mint a test record with an authorized issuer and verify it via `verify_vaccination`.
+5. **Negative check** — confirm an unauthorized address cannot mint (`Unauthorized`).
 
 ### Post-Deployment Steps
 
 1. Initialize the contract with `initialize(admin_address)`
 2. Add authorized issuers using `add_issuer()`
-3. Test basic functionality with a test vaccination record
+3. Run the smoke tests above
 4. Set up monitoring for contract events
 
 ## Security Considerations
 
-- **Soulbound Nature**: Transfers are permanently disabled via panic
+- **Soulbound Nature**: Transfers are permanently disabled via panic; see the Soulbound Enforcement Matrix above
 - **Authorization**: Only authorized issuers can mint records
-- **Duplicate Prevention**: Records are blocked when their normalized duplicate key `(patient, normalized vaccine_name, normalized date, dose_number)` matches an existing record
-- **Audit Trail**: Revoked records are preserved, not deleted; revocation is record-level and irreversible
-- **Revocation Semantics**: Verifiers treat revoked records as invalid; revocation does not affect issuer permission or other records
-- **Input Validation**: All string inputs are length-validated
-- **Admin Controls**: Two-step admin transfer with 24-hour expiry, cancellation, and replay protection; no unilateral control path
+- **Duplicate Prevention**: Identical records are blocked
+- **Audit Trail**: Revoked records are preserved, not deleted
+- **Input Validation**: All string inputs are length-validated and all collections are bounded
+- **Admin Controls**: Two-step admin transfer with expiry protection
 - **Upgrade Authorization**: Only the admin can upgrade; artifacts are reviewed and reproducibly built before deployment
 - **Event Stability**: Versioned event schemas let indexers interpret payloads safely across upgrades
 - **Bounded Batch Verification**: Batch size is capped and validated before storage access to bound resource usage
+- **Privacy**: On-chain schema is minimized per the Privacy-Safe On-Chain Field Policy above
+
+## Security Audit
+
+An independent security audit covers authorization, storage, lifecycle, upgrade, and privacy properties before production deployment. The audit scope, pinned source revision, WASM hash, and findings are recorded in [docs/security/contract-audit.md](docs/security/contract-audit.md). Critical and high findings must be fixed and independently verified before mainnet approval.
+
+Related documents:
+- [docs/resource-limits.md](docs/resource-limits.md) — input length and collection size bounds
+- [docs/security/threat-model.md](docs/security/threat-model.md) — soulbound threat model and ownership-changing operations
+- [docs/security/contract-audit.md](docs/security/contract-audit.md) — audit scope, revision, WASM hash, findings, and privacy review

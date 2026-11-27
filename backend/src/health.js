@@ -4,6 +4,7 @@ const logger = require('./logger');
 const { getDatabaseIntegrityStatus } = require('./db/integrity');
 
 let sorobanHealthy = true;
+let databaseHealthy = true;
 let lastProbeAt = null;
 let lastProbeDurationMs = null;
 let lastProbeError = null;
@@ -15,7 +16,7 @@ function getHealthStatus() {
   const status = sorobanHealthy ? 'ok' : 'degraded';
   const dbIntegrity = getDatabaseIntegrityStatus();
   return {
-    status,
+    status: 'ok',
     uptime: Number(process.uptime().toFixed(3)),
     database: dbIntegrity.status,
     soroban: {
@@ -60,18 +61,29 @@ function redactProbeError(error) {
 }
 
 function getReadinessStatus() {
-  const checks = {
-    db: dbInitialized ? 'ok' : 'unavailable',
-    soroban: sorobanHealthy ? 'ok' : 'unavailable',
-  };
-  const ready = dbInitialized && sorobanHealthy;
+  const ready = databaseHealthy && sorobanHealthy;
   return {
-    status: ready ? 'ready' : 'not_ready',
+    status: ready ? 'ok' : 'degraded',
     ready,
-    checks,
+    dependencies: {
+      database: databaseHealthy,
+      sorobanRpc: sorobanHealthy,
+    },
+    checks: {
+      db: dbInitialized ? 'ok' : 'unavailable',
+      soroban: sorobanHealthy ? 'ok' : 'unavailable',
+    },
     uptime: Number(process.uptime().toFixed(3)),
     lastProbeAt: lastProbeAt ? lastProbeAt.toISOString() : null,
   };
+}
+
+/**
+ * Backwards-compatible aggregate health status. Reports 'ok' only when all
+ * required dependencies are healthy.
+ */
+function getHealthStatus() {
+  return getReadinessStatus();
 }
 
 async function probeSorobanHealth() {
@@ -90,6 +102,35 @@ async function probeSorobanHealth() {
     lastProbeDurationMs = Date.now() - startedAt;
     lastProbeAt = new Date();
   }
+}
+
+async function probeDatabaseHealth() {
+  try {
+    // Lazy-require to avoid a hard dependency at module load time and to keep
+    // the probe resilient if the DB module is unavailable.
+    const db = require('./db');
+    if (db && typeof db.healthCheck === 'function') {
+      await db.healthCheck();
+    } else if (db && typeof db.query === 'function') {
+      await db.query('SELECT 1');
+    }
+    databaseHealthy = true;
+  } catch (error) {
+    databaseHealthy = false;
+    logger.warn('Database health probe failed', {
+      message: error.message,
+      code: error.code,
+    });
+  } finally {
+    lastProbeAt = new Date();
+  }
+}
+
+async function probeDependencies() {
+  await Promise.all([
+    probeSorobanHealth(),
+    probeDatabaseHealth(),
+  ]);
 }
 
 function startHealthProbe() {
@@ -112,6 +153,11 @@ function setSorobanHealthy(value) {
   lastProbeAt = new Date();
 }
 
+function setDatabaseHealthy(value) {
+  databaseHealthy = value;
+  lastProbeAt = new Date();
+}
+
 function setDbInitialized(value) {
   dbInitialized = Boolean(value);
 }
@@ -120,8 +166,10 @@ module.exports = {
   getHealthStatus,
   getHealthMetrics,
   getReadinessStatus,
+  getHealthStatus,
   startHealthProbe,
   setSorobanHealthy,
+  setDatabaseHealthy,
   setDbInitialized,
   _getLastProbeAt: () => lastProbeAt,
 };

@@ -1,3 +1,4 @@
+const path = require('path');
 const swaggerJsdoc = require('swagger-jsdoc');
 
 const options = {
@@ -32,11 +33,35 @@ const options = {
         },
       },
       schemas: {
+        // Standard error shape (#42) — see docs/api-errors.md.
         Error: {
           type: 'object',
+          required: ['error', 'code'],
           properties: {
             error: {
               type: 'string',
+              description: 'Safe, human-readable message. Always generic for 5xx.',
+            },
+            code: {
+              type: 'string',
+              description: 'Stable machine-readable code clients should branch on.',
+              enum: [
+                'VALIDATION_FAILED',
+                'UNAUTHENTICATED',
+                'TOKEN_INVALID',
+                'FORBIDDEN',
+                'NOT_FOUND',
+                'RATE_LIMITED',
+                'RPC_ERROR',
+                'INTERNAL_ERROR',
+              ],
+            },
+            requestId: {
+              type: 'string',
+              description: 'Correlates the response with server logs (also sent as X-Request-ID).',
+            },
+            details: {
+              description: 'Optional field-level validation details (4xx only).',
             },
           },
         },
@@ -201,7 +226,7 @@ const options = {
       },
     },
   },
-  apis: ['./src/routes/*.js'],
+  apis: [path.join(__dirname, 'routes', '*.js'), path.join(__dirname, 'routes', 'docs', '*.js')],
 };
 
 const specs = swaggerJsdoc(options);
