@@ -5,6 +5,7 @@ const logger = require('./logger');
 let sorobanHealthy = true;
 let databaseHealthy = true;
 let lastProbeAt = null;
+let dbInitialized = false;
 
 /**
  * Liveness status.
@@ -39,7 +40,12 @@ function getReadinessStatus() {
       database: databaseHealthy,
       sorobanRpc: sorobanHealthy,
     },
+    checks: {
+      db: dbInitialized ? 'ok' : 'unavailable',
+      soroban: sorobanHealthy ? 'ok' : 'unavailable',
+    },
     uptime: Number(process.uptime().toFixed(3)),
+    lastProbeAt: lastProbeAt ? lastProbeAt.toISOString() : null,
   };
 }
 
@@ -120,6 +126,10 @@ function setDatabaseHealthy(value) {
   lastProbeAt = new Date();
 }
 
+function setDbInitialized(value) {
+  dbInitialized = Boolean(value);
+}
+
 module.exports = {
   getLivenessStatus,
   getReadinessStatus,
@@ -127,5 +137,6 @@ module.exports = {
   startHealthProbe,
   setSorobanHealthy,
   setDatabaseHealthy,
+  setDbInitialized,
   _getLastProbeAt: () => lastProbeAt,
 };
