@@ -15,6 +15,8 @@ use crate::errors::ContractError;
 ///
 /// This bound keeps per-invocation resource usage (storage reads, CPU and
 /// memory) predictable. It is validated before any storage access occurs.
+/// Passing more than this many wallets fails with
+/// `ContractError::BatchTooLarge` and performs no storage reads or writes.
 pub const MAX_BATCH_SIZE: u32 = 100;
 
 /// Storage lifecycle assumptions for verification.
@@ -98,6 +100,7 @@ pub struct DoseStatus {
 /// * `Err(ContractError::BatchTooLarge)` when `wallets.len() > MAX_BATCH_SIZE`.
 ///
 /// The batch size is validated before any storage access is performed.
+/// This function is read-only: it never mutates storage and never emits events.
 pub fn batch_verify(
     env: &Env,
     wallets: Vec<Address>,
@@ -136,6 +139,11 @@ pub fn batch_verify(
 ///   - VerificationStatus: explicit outcome (never collapse failures into Valid)
 ///   - Vec<VaccinationRecord>: active vaccination records
 ///   - Vec<DoseStatus>: per-vaccine dose completion summary
+///
+/// # Read-only guarantee
+/// This function only reads persistent storage. It never writes storage, never
+/// emits events, and therefore cannot alter token ownership or any other state.
+/// Soulbound enforcement is unaffected by verification calls.
 pub fn verify_vaccination(env: &Env, wallet: Address) -> (VerificationStatus, Vec<VaccinationRecord>, Vec<DoseStatus>) {
     // Missing or expired patient index: treat as "no records". This is a
     // non-authorized result and must never be interpreted as authorized.

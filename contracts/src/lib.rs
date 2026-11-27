@@ -114,7 +114,28 @@ pub enum ContractError {
     UnsupportedSchemaVersion = 19,
 }
 
-const MAX_STRING_LENGTH: u32 = 100;
+// ---------------------------------------------------------------------------
+// Input bounds (Backlog #77)
+//
+// Every public argument and stored collection has an explicit, documented
+// maximum so that oversized inputs can never exceed Soroban resource limits.
+// All bounds are enforced *before* any storage read/write or event emission.
+// ---------------------------------------------------------------------------
+
+/// Maximum byte length of a vaccine name (public argument + stored field).
+pub const MAX_VACCINE_NAME_LEN: u32 = 100;
+/// Maximum byte length of a date string (public argument + stored field).
+pub const MAX_DATE_LEN: u32 = 100;
+/// Maximum byte length of an issuer name (public argument + stored field).
+pub const MAX_ISSUER_NAME_LEN: u32 = 100;
+/// Maximum byte length of an issuer license identifier (public argument + stored field).
+pub const MAX_LICENSE_LEN: u32 = 100;
+/// Maximum byte length of an issuer country (public argument + stored field).
+pub const MAX_COUNTRY_LEN: u32 = 100;
+/// Maximum number of vaccination records retained per patient.
+pub const MAX_PATIENT_RECORDS: u32 = 100;
+/// Maximum number of wallets accepted by `batch_verify` in a single call.
+pub const MAX_BATCH_SIZE: u32 = 100;
 
 /// Validates that a string field does not exceed the maximum allowed length.
 ///
@@ -135,15 +156,26 @@ const MAX_STRING_LENGTH: u32 = 100;
 /// - `InvalidInputCountry` if field_name is "country"
 /// - `InvalidInput` for unknown field names
 pub(crate) fn validate_input_length(field: &String, field_name: &str) -> Result<(), ContractError> {
-    if field.len() > MAX_STRING_LENGTH {
-        return Err(match field_name {
-            "vaccine_name" => ContractError::InvalidInputVaccineName,
-            "date_administered" => ContractError::InvalidInputDateAdministered,
-            "name" => ContractError::InvalidInputIssuerName,
-            "license" => ContractError::InvalidInputLicense,
-            "country" => ContractError::InvalidInputCountry,
-            _ => ContractError::InvalidInput,
-        });
+    let (max, err) = match field_name {
+        "vaccine_name" => (MAX_VACCINE_NAME_LEN, ContractError::InvalidInputVaccineName),
+        "date_administered" => (MAX_DATE_LEN, ContractError::InvalidInputDateAdministered),
+        "name" => (MAX_ISSUER_NAME_LEN, ContractError::InvalidInputIssuerName),
+        "license" => (MAX_LICENSE_LEN, ContractError::InvalidInputLicense),
+        "country" => (MAX_COUNTRY_LEN, ContractError::InvalidInputCountry),
+        _ => (MAX_VACCINE_NAME_LEN, ContractError::InvalidInput),
+    };
+    if field.len() > max {
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Validates that a collection size does not exceed the given maximum.
+///
+/// Returns `ContractError::InvalidInput` when the bound is exceeded.
+pub(crate) fn validate_collection_size(len: u32, max: u32) -> Result<(), ContractError> {
+    if len > max {
+        return Err(ContractError::InvalidInput);
     }
     Ok(())
 }
@@ -562,6 +594,48 @@ impl VacciChainContract {
         Err(ContractError::SoulboundToken)
     }
 
+    /// Approve is permanently blocked — soulbound enforcement.
+    ///
+    /// No approval mechanism exists for soulbound vaccination records. This entry point
+    /// exists only to reject any attempt to grant transfer authority.
+    ///
+    /// # Returns
+    /// * `Err(ContractError::SoulboundToken)` - Always
+    pub fn approve(
+        _env: Env,
+        _owner: Address,
+        _spender: Address,
+        _token_id: u64,
+    ) -> Result<(), ContractError> {
+        Err(ContractError::SoulboundToken)
+    }
+
+    /// Clawback is permanently blocked — soulbound enforcement.
+    ///
+    /// Ownership of a vaccination record can never be changed by clawback. Records are
+    /// only ever marked revoked via `revoke_vaccination`, which preserves ownership.
+    ///
+    /// # Returns
+    /// * `Err(ContractError::SoulboundToken)` - Always
+    pub fn clawback(
+        _env: Env,
+        _admin: Address,
+        _from: Address,
+        _token_id: u64,
+    ) -> Result<(), ContractError> {
+        Err(ContractError::SoulboundToken)
+    }
+
+    /// Burn is permanently blocked — soulbound enforcement.
+    ///
+    /// Vaccination records are never deleted; the audit trail is preserved via revocation.
+    ///
+    /// # Returns
+    /// * `Err(ContractError::SoulboundToken)` - Always
+    pub fn burn(_env: Env, _from: Address, _token_id: u64) -> Result<(), ContractError> {
+        Err(ContractError::SoulboundToken)
+    }
+
     /// Verify vaccination status for a wallet.
     ///
     /// Returns whether the wallet has any valid (non-revoked) vaccination records and a list
@@ -620,7 +694,9 @@ impl VacciChainContract {
         env: Env,
         wallets: Vec<Address>,
     ) -> Result<Vec<(Address, bool, Vec<VaccinationRecord>)>, ContractError> {
-        verify::batch_verify(&env, wallets)
+        // Bound the collection before any storage access.
+        validate_collection_size(wallets.len(), MAX_BATCH_SIZE)?;
+        Ok(verify::batch_verify(&env, wallets))
     }
 
     /// Check if an address is an authorized issuer.
@@ -1053,7 +1129,7 @@ mod tests {
             wallets.push_back(patient);
         }
 
-        let results = client.batch_verify(&wallets);
+        let results = client.batch_verify(&wallets).unwrap();
         assert_eq!(results.len(), 5);
         for i in 0..5 {
             let (_, vaccinated, _) = results.get(i).unwrap();
@@ -1149,6 +1225,37 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_verify_at_limit_accepted() {
+        let (env, client, _admin) = setup_env();
+        let mut wallets = Vec::new(&env);
+        for _ in 0..verify::MAX_BATCH_SIZE {
+            wallets.push_back(Address::generate(&env));
+        }
+        let results = client.batch_verify(&wallets).unwrap();
+        assert_eq!(results.len(), verify::MAX_BATCH_SIZE);
+    }
+
+    #[test]
+    fn test_batch_verify_zero_accepted() {
+        let (env, client, _admin) = setup_env();
+        let wallets = Vec::new(&env);
+        let results = client.batch_verify(&wallets).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_alternate_ownership_entry_points_blocked() {
+        let (env, client, _admin) = setup_env();
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+
+        assert_eq!(client.try_transfer(&a, &b, &1u64), Err(Ok(ContractError::SoulboundToken)));
+        assert_eq!(client.try_approve(&a, &b, &1u64), Err(Ok(ContractError::SoulboundToken)));
+        assert_eq!(client.try_clawback(&a, &b, &1u64), Err(Ok(ContractError::SoulboundToken)));
+        assert_eq!(client.try_burn(&a, &1u64), Err(Ok(ContractError::SoulboundToken)));
+    }
+
+    #[test]
     fn test_input_validation() {
         let (env, client, _admin) = setup_env();
         let issuer = Address::generate(&env);
@@ -1157,6 +1264,39 @@ mod tests {
         let result = client.try_add_issuer(
             &issuer,
             &long_name,
+            &String::from_str(&env, "LIC"),
+            &String::from_str(&env, "USA"),
+        );
+        assert_eq!(result, Err(Ok(ContractError::InvalidInputIssuerName)));
+    }
+
+    #[test]
+    fn test_input_validation_boundaries() {
+        let (env, client, _admin) = setup_env();
+        let issuer = Address::generate(&env);
+
+        // Zero-length issuer name is accepted (no minimum bound).
+        client.add_issuer(
+            &issuer,
+            &String::from_str(&env, ""),
+            &String::from_str(&env, "LIC"),
+            &String::from_str(&env, "USA"),
+        ).unwrap();
+
+        // Exactly at the maximum is accepted.
+        let max_name = String::from_str(&env, &"A".repeat(MAX_ISSUER_NAME_LEN as usize));
+        client.add_issuer(
+            &issuer,
+            &max_name,
+            &String::from_str(&env, "LIC"),
+            &String::from_str(&env, "USA"),
+        ).unwrap();
+
+        // One over the limit is rejected.
+        let over_name = String::from_str(&env, &"A".repeat(MAX_ISSUER_NAME_LEN as usize + 1));
+        let result = client.try_add_issuer(
+            &issuer,
+            &over_name,
             &String::from_str(&env, "LIC"),
             &String::from_str(&env, "USA"),
         );
