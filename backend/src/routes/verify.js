@@ -65,6 +65,25 @@ function paginateRecords(records, { limit, offset }) {
 }
 
 /**
+ * Revocation semantics (Backlog 079):
+ * - Revocation is per-record and irreversible; a revoked record can never be
+ *   un-revoked or re-issued under the same record id.
+ * - Revoking a record does NOT revoke the wallet or the issuer's permission.
+ * - Verifiers must treat revoked records as invalid: they are excluded from
+ *   results, and a wallet is only `verified` if at least one non-revoked
+ *   record remains.
+ */
+function isRevokedRecord(record) {
+  if (!record || typeof record !== 'object') return false;
+  return record.revoked === true || record.is_revoked === true || record.status === 'revoked';
+}
+
+function filterActiveRecords(records) {
+  if (!Array.isArray(records)) return [];
+  return records.filter((record) => !isRevokedRecord(record));
+}
+
+/**
  * Verification status values. These are the only values a caller may rely on:
  * - valid:       records exist and are currently valid
  * - revoked:     records exist but have been revoked
@@ -289,7 +308,7 @@ router.get(
       verifyCache.set(wallet, {
         status,
         vaccinated,
-        records,
+        records: activeRecords,
         timestamp: now
       });
 
@@ -480,7 +499,7 @@ router.get(
       verifyCache.set(wallet, {
         status,
         vaccinated,
-        records,
+        records: activeRecords,
         timestamp: now
       });
 

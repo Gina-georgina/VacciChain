@@ -528,6 +528,16 @@ fn fuzz_smoke_corpus() {
 }
 
 // Fuzz test: duplicate mint detection
+//
+// Duplicate key definition (documented, normalized consistently across API and contract):
+// A vaccination record is a duplicate when the tuple
+// (patient, issuer, normalized vaccine name, normalized date) matches an existing record.
+// Normalization applied before comparison:
+//   - vaccine name: trimmed of leading/trailing whitespace, internal whitespace collapsed
+//     to a single space, and lowercased (case-insensitive).
+//   - date: trimmed of leading/trailing whitespace.
+// Legitimate repeat doses are distinguished by a different date (or different issuer),
+// so they are NOT treated as duplicates.
 proptest! {
     #[test]
     fn fuzz_duplicate_mint_detection(

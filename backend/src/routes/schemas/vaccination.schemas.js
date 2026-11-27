@@ -6,6 +6,17 @@ const { issueRequestV1 } = require('../../schemas/vaccinationRecord');
  * Validation schemas for vaccination routes.
  * Co-located with vaccination.js for easy maintenance.
  *
+ * Duplicate key definition (must match the on-chain contract):
+ * A vaccination record is considered a duplicate when the normalized tuple
+ * (patient_address, vaccine_name, date_administered, dose_number) matches an
+ * existing record. Normalization rules:
+ *   - patient_address: trimmed (case preserved; Stellar addresses are case-sensitive)
+ *   - vaccine_name: trimmed and lowercased
+ *   - date_administered: strict YYYY-MM-DD calendar date (timezone-independent)
+ *   - dose_number: defaults to 1 when omitted
+ * Legitimate repeat doses are distinguished by a different dose_number, so the
+ * same vaccine on the same date with a different dose is NOT a duplicate.
+ *
  * Date & timezone semantics
  * -------------------------
  * Two distinct kinds of temporal values are accepted:
@@ -65,6 +76,18 @@ function isValidCalendarDate(year, month, day) {
   ];
 
   return day <= daysInMonth[month - 1];
+}
+
+/**
+ * Normalize a date string to a canonical ISO-8601 UTC representation.
+ * Returns the original value if it cannot be parsed (validation handles errors).
+ */
+function normalizeDate(val) {
+  const parsed = Date.parse(val);
+  if (isNaN(parsed)) {
+    return val;
+  }
+  return new Date(parsed).toISOString();
 }
 
 /**
@@ -173,22 +196,26 @@ const isoUtcTimestampSchema = z
 const issueSchema = z.object({
   patient_address: z.string()
     .min(1, 'patient_address is required')
-    .describe('Stellar address of patient'),
+    .transform((val) => val.trim())
+    .describe('Stellar address of patient (trimmed; part of duplicate key)'),
   vaccine_name: z.string()
     .min(1, 'vaccine_name is required')
     .max(256, 'vaccine_name must not exceed 256 characters')
-    .describe('Name of the vaccine'),
+    .transform((val) => val.trim().toLowerCase())
+    .describe('Name of the vaccine (trimmed and lowercased; part of duplicate key)'),
   date_administered: dateOnlySchema
     .describe(
       'Date-only value (YYYY-MM-DD) of when the vaccine was administered. ' +
-        'Timezone-independent; timestamps and offsets are rejected.'
+        'Timezone-independent; timestamps and offsets are rejected. ' +
+        'Part of duplicate key.'
     ),
   dose_number: z.number()
     .int('dose_number must be an integer')
     .min(1, 'dose_number must be at least 1')
     .max(4294967295, 'dose_number must fit in an unsigned 32-bit integer')
     .optional()
-    .describe('Dose number in series'),
+    .transform((val) => (val === undefined ? 1 : val))
+    .describe('Dose number in series (defaults to 1; part of duplicate key so repeat doses are distinct)'),
   dose_series: z.number()
     .int('dose_series must be an integer')
     .min(1, 'dose_series must be at least 1')
@@ -367,6 +394,7 @@ module.exports = {
   issueSchema: issueRequestV1,
   revokeSchema,
   dateOnlySchema,
+  normalizeDate,
   isoUtcTimestampSchema,
   paginationQuerySchema,
   idempotencyKeySchema,

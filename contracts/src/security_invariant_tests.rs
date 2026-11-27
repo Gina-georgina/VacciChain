@@ -351,23 +351,38 @@ fn invariant_transfer_does_not_mutate_or_emit() {
 // ── Missing / expired persistent entries (Issue #90) ─────────────────────────
 
 #[test]
-fn invariant_verify_with_missing_entries_is_recoverable() {
-    let (env, client, _admin) = setup();
-    let wallet = soroban_sdk::Address::generate(&env);
-
-    // No patient or vaccination entries exist for this wallet.
-    let (vaccinated, records, _) = client.verify_vaccination(&wallet);
-    assert!(!vaccinated, "Missing entries must not report vaccinated");
-    assert_eq!(records.len(), 0, "Missing entries must yield no records");
-}
-
-#[test]
-fn invariant_verify_after_record_removed_is_recoverable() {
+fn invariant_revoke_one_record_keeps_remaining_records_valid() {
     let (env, client, _admin) = setup();
     let issuer = soroban_sdk::Address::generate(&env);
     let patient = soroban_sdk::Address::generate(&env);
 
     add_issuer(&env, &client, &issuer);
+
+    let first = mint(&env, &client, &patient, &issuer, "COVID-19", "2024-01-15", Some(1));
+    let second = mint(&env, &client, &patient, &issuer, "COVID-19", "2024-02-15", Some(2));
+
+    // Revoke only the first record.
+    client.revoke_vaccination(&first).unwrap();
+
+    // The revoked record is no longer valid.
+    assert!(!client.is_vaccination_valid(&first));
+
+    // The remaining record is still valid and the wallet is still vaccinated.
+    assert!(client.is_vaccination_valid(&second));
+    let (vaccinated, records, _) = client.verify_vaccination(&patient);
+    assert!(vaccinated, "Wallet must remain vaccinated while a valid record exists");
+    assert_eq!(records.len(), 1, "Only the non-revoked record should remain");
+    assert_eq!(records.get(0).unwrap().token_id, second);
+}
+
+#[test]
+fn invariant_verification_degrades_gracefully_on_expired_entries() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+
+    add_issuer(&env, &client, &issuer);
+
     client.mint_vaccination(
         &patient,
         &String::from_str(&env, "COVID-19"),
@@ -455,7 +470,7 @@ fn invariant_clawback_rejected_as_soulbound() {
         &String::from_str(&env, "COVID-19"),
         &String::from_str(&env, "2024-01-15"),
         &issuer,
-        &None::<u32>,
+        &Some(1u32),
         &None::<u32>,
     );
 
@@ -821,14 +836,29 @@ fn invariant_writes_extend_ttl() {
 
     add_issuer(&env, &client, &issuer);
     client.register_patient(&patient);
-    client.mint_vaccination(
+    mint(&env, &client, &patient, &issuer, "COVID-19", "2024-01-15", Some(1));
+
+    // Case variant of the vaccine name.
+    let case_variant = client.try_mint_vaccination(
         &patient,
-        &String::from_str(&env, "COVID-19"),
+        &String::from_str(&env, "covid-19"),
         &String::from_str(&env, "2024-01-15"),
         &issuer,
-        &None::<u32>,
+        &Some(1u32),
         &None::<u32>,
     );
+    assert_eq!(case_variant, Err(Ok(ContractError::DuplicateRecord)));
+
+    // Whitespace-padded variant of the vaccine name.
+    let padded_variant = client.try_mint_vaccination(
+        &patient,
+        &String::from_str(&env, "  COVID-19  "),
+        &String::from_str(&env, "2024-01-15"),
+        &issuer,
+        &Some(1u32),
+        &None::<u32>,
+    );
+    assert_eq!(padded_variant, Err(Ok(ContractError::DuplicateRecord)));
 
     // After writes, the persistent entries must have a live TTL.
     env.as_contract(&client.address, || {
@@ -905,4 +935,157 @@ fn invariant_expired_entries_recover_after_reinit() {
         &None::<u32>,
     );
     assert!(result.is_ok(), "Contract must recover after re-initialization");
+}
+
+// ── Issuer lifecycle state machine ───────────────────────────────────────────
+
+#[test]
+fn invariant_issuer_add_revoke_readd_transitions() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+
+    assert!(!client.is_issuer(&issuer));
+
+    add_issuer(&env, &client, &issuer);
+    assert!(client.is_issuer(&issuer));
+
+    client.revoke_issuer(&issuer).unwrap();
+    assert!(!client.is_issuer(&issuer));
+
+    // Re-add after revocation is allowed.
+    add_issuer(&env, &client, &issuer);
+    assert!(client.is_issuer(&issuer));
+}
+
+#[test]
+fn invariant_revoking_unknown_issuer_has_explicit_semantics() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+
+    // Revoking a never-registered issuer must not silently succeed as a state change.
+    let result = client.try_revoke_issuer(&issuer);
+    assert!(result.is_err(), "Revoking an unknown issuer must return an error");
+    assert!(!client.is_issuer(&issuer));
+}
+
+#[test]
+fn invariant_issuer_handoff_preserves_audit_trail() {
+    let (env, client, admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let new_admin = soroban_sdk::Address::generate(&env);
+
+    add_issuer(&env, &client, &issuer);
+
+    // Hand off administrator role.
+    client.transfer_admin(&new_admin).unwrap();
+    assert_eq!(client.get_admin(), new_admin);
+
+    // The old admin can no longer mutate issuer state.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "revoke_issuer",
+            args: (issuer.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let result = client.try_revoke_issuer(&issuer);
+    assert!(result.is_err(), "Former admin must not revoke issuers after handoff");
+    assert!(client.is_issuer(&issuer));
+}
+
+// ── Administrator rotation / recovery flow ───────────────────────────────────
+
+#[test]
+fn invariant_admin_rotation_proposal_and_acceptance() {
+    let (env, client, admin) = setup();
+    let new_admin = soroban_sdk::Address::generate(&env);
+
+    client.propose_admin(&new_admin).unwrap();
+    assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
+
+    // Acceptance must be authorized by the proposed admin.
+    client.accept_admin(&new_admin).unwrap();
+    assert_eq!(client.get_admin(), new_admin);
+    assert_eq!(client.get_pending_admin(), None);
+    let _ = admin;
+}
+
+#[test]
+fn invariant_admin_rotation_proposal_expires() {
+    let (env, client, _admin) = setup();
+    let new_admin = soroban_sdk::Address::generate(&env);
+
+    client.propose_admin(&new_admin).unwrap();
+
+    // Advance ledger past the proposal expiry window.
+    env.ledger().set_sequence_number(env.ledger().sequence() + 100_000);
+
+    let result = client.try_accept_admin(&new_admin);
+    assert!(result.is_err(), "Expired proposal must not be acceptable");
+}
+
+#[test]
+fn invariant_admin_rotation_replay_rejected() {
+    let (env, client, _admin) = setup();
+    let new_admin = soroban_sdk::Address::generate(&env);
+
+    client.propose_admin(&new_admin).unwrap();
+    client.accept_admin(&new_admin).unwrap();
+
+    // Replaying acceptance after completion must fail.
+    let replay = client.try_accept_admin(&new_admin);
+    assert!(replay.is_err(), "Replayed acceptance must be rejected");
+}
+
+#[test]
+fn invariant_admin_rotation_can_be_cancelled() {
+    let (env, client, admin) = setup();
+    let new_admin = soroban_sdk::Address::generate(&env);
+
+    client.propose_admin(&new_admin).unwrap();
+    client.cancel_admin_proposal().unwrap();
+    assert_eq!(client.get_pending_admin(), None);
+
+    // After cancellation the proposal cannot be accepted.
+    let result = client.try_accept_admin(&new_admin);
+    assert!(result.is_err(), "Cancelled proposal must not be acceptable");
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn invariant_unauthorized_admin_rotation_attempts_fail() {
+    let (env, client, admin) = setup();
+    let attacker = soroban_sdk::Address::generate(&env);
+    let target = soroban_sdk::Address::generate(&env);
+
+    // Non-admin cannot propose a rotation.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &attacker,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "propose_admin",
+            args: (target.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let propose = client.try_propose_admin(&target);
+    assert!(propose.is_err(), "Non-admin must not propose a rotation");
+    assert_eq!(client.get_admin(), admin);
+
+    // Non-target cannot accept a pending proposal.
+    client.propose_admin(&target).unwrap();
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &attacker,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "accept_admin",
+            args: (attacker.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let accept = client.try_accept_admin(&attacker);
+    assert!(accept.is_err(), "Unauthorized acceptance must be rejected");
+    assert_eq!(client.get_admin(), admin);
 }

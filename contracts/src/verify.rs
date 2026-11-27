@@ -189,6 +189,13 @@ pub fn batch_verify(
 /// Because this is a public-chain read, callers must assume the returned fields
 /// are publicly visible; prohibited fields are never included.
 ///
+/// Revocation semantics: revocation applies to an individual vaccination record
+/// only (not to the wallet as a whole and not to the issuer's permission to
+/// issue). It is irreversible: once `record.revoked` is set, the record is
+/// permanently excluded from verification results. Revoked records are filtered
+/// out before both the active records list and the dose status summary are
+/// computed, so they can never be interpreted as valid vaccination evidence.
+///
 /// # Arguments
 /// * `env` - The Soroban environment.
 /// * `wallet` - The wallet address to check.
@@ -250,7 +257,9 @@ pub fn verify_vaccination(env: &Env, wallet: Address) -> (VerificationStatus, Ve
         // Token entry absent or expired; skip without granting access.
     }
 
-    // Build per-vaccine dose status.
+    // Build per-vaccine dose status from active records only.
+    // Revoked records were already excluded above, so they cannot inflate dose
+    // counts or mark a series complete.
     // We track highest dose_number and highest dose_series seen for each vaccine.
     // Parallel vecs are used because a no_std map implementation is unavailable.
     let mut vaccine_names: Vec<String> = Vec::new(env);

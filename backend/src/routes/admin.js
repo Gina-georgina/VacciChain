@@ -7,7 +7,12 @@ const { adminAuthMiddleware } = require('../middleware/auth');
 const { queryAuditLog, audit } = require('../middleware/auditLog');
 const { insertApiKey, listApiKeys, revokeApiKey, updateApiKeyScopes } = require('../indexer/db');
 const { rotateKey, reloadFromEnv } = require('../jwtKeys');
-const { approveProposal, getProposal } = require('../middleware/multiSig');
+const {
+  approveProposal,
+  getProposal,
+  createProposal,
+  cancelProposal,
+} = require('../middleware/multiSig');
 const { isValidStellarPublicKey } = require('../middleware/wallet');
 const { addIssuer, revokeIssuer, simulateContract } = require('../stellar/soroban');
 const { isAuthorizedIssuer, invalidateCache } = require('../stellar/issuerCache');
@@ -92,15 +97,29 @@ function adminOnly(req, res, next) {
  * POST /admin/issuers
  * Body: { address: string }
  * Authorizes a new issuer on-chain via add_issuer contract call.
+ *
+ * Idempotency: re-adding an already-authorized issuer is a no-op that returns
+ * 200 with `already_authorized: true` (the contract call is not re-submitted).
  */
 router.post('/issuers', adminAuthMiddleware, adminOnly, validate(addIssuerSchema), async (req, res) => {
   const { address } = req.body;
 
   try {
+    const alreadyAuthorized = await isAuthorizedIssuer(address);
+    if (alreadyAuthorized) {
+      audit({
+        actor: req.user.wallet,
+        action: 'admin.add_issuer',
+        result: 'noop',
+        meta: { address, reason: 'already_authorized' },
+      });
+      return res.status(200).json({ address, authorized: true, already_authorized: true });
+    }
+
     const result = await addIssuer(address);
     invalidateCache(address);
-    audit({ actor: req.user.wallet, action: 'admin.add_issuer', result: 'success', meta: { address } });
-    res.status(201).json({ address, authorized: true, hash: result.hash });
+    audit({ actor: req.user.wallet, action: 'admin.add_issuer', result: 'success', meta: { address, hash: result.hash } });
+    res.status(201).json({ address, authorized: true, already_authorized: false, hash: result.hash });
   } catch (err) {
     audit({ actor: req.user.wallet, action: 'admin.add_issuer', result: 'failure', meta: { address, error: err.message } });
     sendError(req, res, 500, ERROR_CODES.INTERNAL_ERROR, err.message);
@@ -110,6 +129,10 @@ router.post('/issuers', adminAuthMiddleware, adminOnly, validate(addIssuerSchema
 /**
  * DELETE /admin/issuers/:wallet
  * Revokes an issuer on-chain via revoke_issuer contract call.
+ *
+ * Idempotency: revoking an issuer that is not currently authorized is a no-op
+ * that returns 200 with `already_revoked: true` (the contract call is not
+ * re-submitted).
  */
 router.delete('/issuers/:wallet', adminAuthMiddleware, adminOnly, async (req, res) => {
   const { wallet } = req.params;
@@ -120,13 +143,20 @@ router.delete('/issuers/:wallet', adminAuthMiddleware, adminOnly, async (req, re
   try {
     const authorized = await isAuthorizedIssuer(wallet);
     if (!authorized) {
-      return res.status(404).json({ error: 'Issuer not found' });
+      audit({
+        actor: req.user.wallet,
+        action: 'admin.revoke_issuer',
+        target: wallet,
+        result: 'noop',
+        meta: { reason: 'not_authorized' },
+      });
+      return res.status(200).json({ wallet, authorized: false, already_revoked: true });
     }
 
     const result = await revokeIssuer(wallet);
     invalidateCache(wallet);
     audit({ actor: req.user.wallet, action: 'admin.revoke_issuer', target: wallet, result: 'success', meta: { hash: result.hash } });
-    res.json({ wallet, authorized: false, hash: result.hash });
+    res.json({ wallet, authorized: false, already_revoked: false, hash: result.hash });
   } catch (err) {
     audit({ actor: req.user.wallet, action: 'admin.revoke_issuer', target: wallet, result: 'failure', meta: { error: err.message } });
     sendError(req, res, 500, ERROR_CODES.INTERNAL_ERROR, err.message);

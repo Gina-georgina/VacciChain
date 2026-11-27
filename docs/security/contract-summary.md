@@ -71,8 +71,9 @@ and border agencies can verify vaccination status on-chain without a central dat
 |---|---|
 | `initialize(admin)` | One-time setup. Sets admin address. Guarded by `AlreadyInitialized`. |
 | `add_issuer(issuer, name, license, country)` | Authorizes a healthcare provider. Stores `IssuerRecord`. Emits `iss_add`. |
-| `revoke_issuer(issuer)` | Sets `IssuerRecord.authorized = false`. Record preserved for audit. |
-| `propose_admin(new_admin)` | Two-step admin transfer. Sets pending admin with 24-hour expiry. |
+| `revoke_issuer(issuer)` | Sets `IssuerRecord.authorized = false`. Record preserved for audit. Emits `iss_rev`. Idempotent: revoking an already-revoked issuer is a no-op that still emits the event. |
+| `propose_admin(new_admin)` | Two-step admin transfer. Sets pending admin with 24-hour expiry. Emits `adm_prop`. |
+| `accept_admin(new_admin)` | Second step of admin transfer. Requires pending admin's `require_auth()`, must be within expiry window. Emits `adm_acc`. |
 | `upgrade(new_wasm_hash)` | Replaces contract WASM. Requires current admin `require_auth()`; the new WASM hash must be reviewed and approved per the upgrade policy (see §7.1). Emits `upgraded` (schema v1). |
 
 ### Issuer functions (require issuer `require_auth()` + issuer allowlist check)
@@ -154,6 +155,51 @@ appended only. The backend maps each variant to a stable HTTP response (see
 - Function argument evolution: new optional arguments are added as new functions
   (e.g. `mint_vaccination_v2`) rather than changing existing signatures, so existing
   callers keep working. Deprecations are announced one release ahead.
+
+---
+
+## 4a. Revocation Semantics
+
+Revocation is **record-level**, not wallet-level or issuer-level:
+
+- **Scope.** `revoke_vaccination(token_id, revoker)` affects exactly one `VaccinationRecord`.
+  It sets `record.revoked = true` and `Revoked(token_id) = true`. Other records for the same
+  patient, and the patient's wallet registration, are unaffected. Revoking an issuer
+  (`revoke_issuer`) does **not** revoke records that issuer previously minted — those remain
+  valid unless individually revoked.
+- **Authorization.** Only the record's original `issuer` or the current `admin` may revoke.
+  Any other caller receives `Unauthorized`.
+- **Irreversibility.** Revocation is permanent. There is no un-revoke function; a revoked
+  record can never be reactivated. Re-revoking an already-revoked record is idempotent
+  (no state change, no error).
+- **Verifier interpretation.** `verify_vaccination` and `batch_verify` return only active
+  (non-revoked) records. A revoked record is excluded from the returned `Vec` and does not
+  contribute to the `bool` validity flag. Verifiers MUST treat absence of a record as
+  equivalent to a revoked record for status purposes.
+- **Event representation.** Revocation emits `(revoked, token_id)` with payload
+  `(revoker, timestamp)`. Off-chain indexers should treat this event as the authoritative
+  signal of revocation; the `Revoked(token_id)` storage key is redundant with
+  `record.revoked` and exists only for fast lookup.
+
+---
+
+## 4b. Duplicate-Record Detection
+
+The duplicate key is defined as the tuple:
+
+```
+(patient, normalized_vaccine_name, normalized_date_administered)
+```
+
+- **Normalization.** `vaccine_name` and `date_administered` are trimmed of leading/trailing
+  whitespace and lowercased (ASCII) before comparison. This prevents bypass via casing or
+  padding variants. The normalization MUST be identical in the contract and the backend API.
+- **Semantically equivalent values.** Two records with the same patient, vaccine, and date
+  are duplicates regardless of formatting variants (e.g. `"COVID-19"` vs `"covid-19 "`).
+- **Legitimate repeat doses.** A repeat dose is distinguished by a different
+  `date_administered`; the same vaccine on a different date is **not** a duplicate.
+- **Concurrency.** Duplicate detection and insertion occur within a single Soroban
+  invocation (atomic), so concurrent calls cannot both succeed for the same key.
 
 ---
 
@@ -452,7 +498,7 @@ and a version bump is required for any breaking change.
 | `(minted, token_id, v1)` | `(patient, vaccine_name, issuer, timestamp, schema_version)` | `mint_vaccination` |
 | `(revoked, token_id, v1)` | `(revoker, timestamp, schema_version)` | `revoke_vaccination` |
 | `(iss_add, v1)` | `(issuer, admin, timestamp, schema_version)` | `add_issuer` |
-| `(iss_rev, v1)` | `(issuer, admin, timestamp, schema_version)` | `emit_issuer_revoked` (not called) |
+| `(iss_rev, v1)` | `(issuer, admin, timestamp, schema_version)` | `revoke_issuer` |
 | `(adm_prop, v1)` | `(current_admin, new_admin, expires_at, schema_version)` | `propose_admin` |
 | `(adm_acc, v1)` | `(new_admin, timestamp, schema_version)` | `accept_admin` |
 | `(upgraded, v1)` | `(new_wasm_hash, admin, timestamp, schema_version)` | `upgrade` |
@@ -495,9 +541,11 @@ The following are **in scope** for the external audit:
 - All logic in `src/lib.rs`, `src/mint.rs`, `src/verify.rs`, `src/storage.rs`, `src/events.rs`
 - Access control correctness for all privileged functions
 - Storage key consistency and data integrity
-- Duplicate detection and record limit enforcement
+- Duplicate detection (normalization, equivalence, repeat doses) and record limit enforcement
+- Revocation semantics (record-level scope, irreversibility, verifier interpretation, events)
+- Issuer lifecycle state machine (add, revoke, re-add, handoff)
 - Soulbound enforcement (`transfer` always reverts)
-- Admin transfer two-step flow and expiry
+- Admin transfer two-step flow, expiry, cancellation, replay resistance
 - Contract upgrade authorization and rollback limitations (§7.1)
 - Input validation completeness, including batch size limits (§4) and the input/collection bound policy (§5.1)
 - Privacy-safe field classification and on-chain schema minimization (§5.2)

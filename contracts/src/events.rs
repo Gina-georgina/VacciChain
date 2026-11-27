@@ -44,6 +44,8 @@
 //! | `iss_rev_v1`   | –                          | `(issuer, admin, timestamp)`                        |
 //! | `adm_prop_v1`  | –                          | `(current_admin, new_admin, expires_at)`            |
 //! | `adm_acc_v1`   | –                          | `(new_admin, timestamp)`                            |
+//! | `adm_cncl_v1`  | –                          | `(current_admin, cancelled_by, timestamp)`          |
+//! | `adm_exp_v1`   | –                          | `(current_admin, new_admin, timestamp)`             |
 //! | `upgraded_v1`  | –                          | `(new_wasm_hash, admin, timestamp)`                 |
 //! | `pat_reg_v1`   | –                          | `(patient, timestamp)`                              |
 //! | `paused_v1`    | –                          | `(admin, timestamp)`                                |
@@ -62,6 +64,11 @@ pub fn emit_minted(env: &Env, token_id: u64, patient: &Address, vaccine_name: &S
     );
 }
 
+/// Emitted when an individual vaccination record is revoked.
+///
+/// Revocation scope: affects only the single record identified by `token_id`.
+/// It does not revoke the issuer's permission nor other records they issued.
+/// Revocation is irreversible: a revoked record can never be un-revoked.
 pub fn emit_revoked(env: &Env, token_id: u64, revoker: &Address) {
     let timestamp = ledger_timestamp(env);
     env.events().publish(
@@ -78,6 +85,12 @@ pub fn emit_issuer_added(env: &Env, issuer: &Address, admin: &Address) {
     );
 }
 
+/// Emitted when an issuer's permission is revoked by the admin.
+///
+/// Revocation scope: affects the issuer's permission to mint new records.
+/// Previously minted records remain valid unless individually revoked.
+/// Revocation is irreversible for the current permission grant; re-adding
+/// the issuer emits a fresh `iss_add` event.
 pub fn emit_issuer_revoked(env: &Env, issuer: &Address, admin: &Address) {
     // Emitted by `revoke_issuer` only after the issuer is removed from
     // persistent storage, so a failed revocation never publishes this event.
@@ -104,6 +117,22 @@ pub fn emit_admin_transfer_accepted(env: &Env, new_admin: &Address) {
     env.events().publish(
         (symbol_short!("adm_acc_v1"),),
         (new_admin.clone(), timestamp),
+    );
+}
+
+pub fn emit_admin_transfer_cancelled(env: &Env, current_admin: &Address, cancelled_by: &Address) {
+    let timestamp = env.ledger().timestamp();
+    env.events().publish(
+        (symbol_short!("adm_cncl_v1"),),
+        (current_admin.clone(), cancelled_by.clone(), timestamp),
+    );
+}
+
+pub fn emit_admin_transfer_expired(env: &Env, current_admin: &Address, new_admin: &Address) {
+    let timestamp = env.ledger().timestamp();
+    env.events().publish(
+        (symbol_short!("adm_exp_v1"),),
+        (current_admin.clone(), new_admin.clone(), timestamp),
     );
 }
 
@@ -213,6 +242,24 @@ mod tests {
         let new = Address::generate(&env);
         emit_admin_transfer_accepted(&env, &new);
         assert_event(&env, "adm_acc_v1", 2);
+    }
+
+    #[test]
+    fn admin_transfer_cancelled_event_v1_schema() {
+        let env = setup();
+        let current = Address::generate(&env);
+        let cancelled_by = Address::generate(&env);
+        emit_admin_transfer_cancelled(&env, &current, &cancelled_by);
+        assert_event(&env, "adm_cncl_v1", 3);
+    }
+
+    #[test]
+    fn admin_transfer_expired_event_v1_schema() {
+        let env = setup();
+        let current = Address::generate(&env);
+        let new = Address::generate(&env);
+        emit_admin_transfer_expired(&env, &current, &new);
+        assert_event(&env, "adm_exp_v1", 3);
     }
 
     #[test]

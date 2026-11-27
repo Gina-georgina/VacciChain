@@ -79,14 +79,23 @@ pub fn mint_vaccination(
         return Err(ContractError::PatientNotRegistered);
     }
 
-    // Deterministically derive a token ID from the patient, vaccine, date,
-    // issuer, and ledger sequence. This is used for duplicate detection.
+    // Normalize the duplicate-key fields so formatting variants cannot bypass
+    // uniqueness. The duplicate key is the tuple:
+    //   (patient, normalized vaccine_name, normalized date, dose_number)
+    // where `dose_number` distinguishes legitimate repeat doses of the same
+    // vaccine on the same date.
+    let normalized_vaccine = normalize_vaccine_name(env, &vaccine_name);
+    let normalized_date = normalize_date(env, &date_administered);
+
+    // Deterministically derive a token ID from the patient, normalized vaccine,
+    // normalized date, issuer, and ledger sequence. This is used for duplicate
+    // detection and is checked atomically within this transaction.
     let ledger_sequence = env.ledger().sequence();
     let token_id = compute_token_id(
         env,
         &patient,
-        &vaccine_name,
-        &date_administered,
+        &normalized_vaccine,
+        &normalized_date,
         &issuer,
         ledger_sequence,
     );
@@ -105,7 +114,9 @@ pub fn mint_vaccination(
         .unwrap_or(Vec::new(env));
 
     // In addition to token-based duplicate detection, ensure the patient does not
-    // already have a record with the same vaccine name and administration date.
+    // already have a record with the same normalized vaccine name, normalized
+    // administration date, and dose number. Differing dose numbers are treated
+    // as legitimate repeat doses and are allowed.
     for i in 0..tokens.len() {
         let tid = tokens.get(i).unwrap();
         let record: VaccinationRecord = env
@@ -113,7 +124,12 @@ pub fn mint_vaccination(
             .persistent()
             .get(&DataKey::Token(tid))
             .unwrap();
-        if record.vaccine_name == vaccine_name && record.date_administered == date_administered {
+        let existing_vaccine = normalize_vaccine_name(env, &record.vaccine_name);
+        let existing_date = normalize_date(env, &record.date_administered);
+        if existing_vaccine == normalized_vaccine
+            && existing_date == normalized_date
+            && record.dose_number == dose_number
+        {
             return Err(ContractError::DuplicateRecord);
         }
     }
@@ -148,8 +164,8 @@ pub fn mint_vaccination(
     let record = VaccinationRecord {
         token_id,
         patient: patient.clone(),
-        vaccine_name: vaccine_name.clone(),
-        date_administered,
+        vaccine_name: normalized_vaccine.clone(),
+        date_administered: normalized_date,
         issuer: issuer.clone(),
         timestamp,
         schema_version: 1,
@@ -170,7 +186,7 @@ pub fn mint_vaccination(
     env.storage().persistent().set(&DataKey::PatientTokens(patient.clone()), &patient_tokens);
     extend_patient_tokens_ttl(env, &patient);
 
-    events::emit_minted(env, token_id, &patient, &vaccine_name, &issuer);
+    events::emit_minted(env, token_id, &patient, &normalized_vaccine, &issuer);
 
     Ok(token_id)
 }

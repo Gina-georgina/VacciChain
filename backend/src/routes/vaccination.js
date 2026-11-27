@@ -20,6 +20,28 @@ const DEFAULT_PAGE_SIZE = Math.min(Number(process.env.VACCINATION_DEFAULT_PAGE_S
 
 const router = express.Router();
 
+/**
+ * Normalize a vaccine name so the API and contract agree on the duplicate key.
+ * Mirrors the on-chain normalization: trim, collapse internal whitespace,
+ * and compare case-insensitively.
+ */
+function normalizeVaccineName(name) {
+  return String(name).trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+/**
+ * Normalize a date to a canonical UTC ISO-8601 string (YYYY-MM-DDTHH:mm:ss.sssZ).
+ * Mirrors the on-chain normalization so semantically equivalent dates
+ * (e.g. differing offsets or precision) map to the same duplicate key.
+ */
+function normalizeDateAdministered(date) {
+  const parsed = new Date(date);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error('Invalid date_administered');
+  }
+  return parsed.toISOString();
+}
+
 // Batch verification is expensive (multiple contract simulations per request),
 // so it gets a tighter limit than single-record verification.
 const batchVerifyLimiter = createRateLimiter({
@@ -119,6 +141,12 @@ function toStableErrorResponse(err) {
  *         description: Unauthorized
  *       403:
  *         description: Forbidden - issuer role required
+ *       409:
+ *         description: Duplicate record - an equivalent record (same normalized vaccine name and date) already exists
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       500:
  *         description: Contract invocation failed
  *         content:
@@ -171,11 +199,21 @@ router.post(
     });
   }
 
+  // Normalize before sending to the contract so the duplicate key matches on-chain.
+  let normalizedVaccineName;
+  let normalizedDate;
+  try {
+    normalizedVaccineName = normalizeVaccineName(vaccine_name);
+    normalizedDate = normalizeDateAdministered(date_administered);
+  } catch (err) {
+    return res.status(400).json({ error: 'date_administered must be a valid ISO-8601 date-time' });
+  }
+
   try {
     const result = await mintVaccination(
       patient_address,
-      vaccine_name,
-      date_administered,
+      normalizedVaccineName,
+      normalizedDate,
       process.env.ISSUER_SECRET_KEY,
       { doseNumber: dose_number, doseSeries: dose_series }
     );
@@ -186,7 +224,7 @@ router.post(
       action: 'vaccination.issue',
       target: patient_address,
       result: 'success',
-      meta: { token_id: result.tokenId, vaccine_name, date_administered, dose_number, dose_series },
+      meta: { token_id: result.tokenId, vaccine_name: normalizedVaccineName, date_administered: normalizedDate, dose_number, dose_series },
     });
 
     res.json({
@@ -195,6 +233,7 @@ router.post(
       transactionHash: result.hash,
       ledger: result.ledger,
       timestamp,
+      revoked: false,
     });
   } catch (err) {
     if (err instanceof SorobanTimeoutError) return sendRpcTimeout(res);
@@ -215,7 +254,13 @@ router.post(
  * @swagger
  * /vaccination/revoke:
  *   post:
- *     summary: Revoke a vaccination record (issuer only)
+ *     summary: Revoke a single vaccination record (issuer only)
+ *     description: >
+ *       Revocation is record-level and irreversible. It marks only the record
+ *       identified by token_id as revoked; other records held by the same wallet
+ *       remain valid, and the wallet itself is not deactivated. The issuer's
+ *       permission to issue is unaffected. Verifiers must treat a revoked record
+ *       as invalid while continuing to accept the wallet's remaining records.
  *     tags:
  *       - Vaccination
  *     security:
@@ -229,12 +274,12 @@ router.post(
  *             properties:
  *               token_id:
  *                 type: string
- *                 description: Token ID to revoke
+ *                 description: Token ID of the single record to revoke
  *             required:
  *               - token_id
  *     responses:
  *       200:
- *         description: Vaccination record revoked
+ *         description: Vaccination record revoked (irreversible, record-level)
  *         content:
  *           application/json:
  *             schema:
@@ -244,10 +289,23 @@ router.post(
  *                   type: boolean
  *                 token_id:
  *                   type: string
+ *                 revoked:
+ *                   type: boolean
+ *                   description: Always true once revocation succeeds
+ *                 scope:
+ *                   type: string
+ *                   description: Revocation scope (always "record")
+ *                 irreversible:
+ *                   type: boolean
+ *                   description: Always true; revocation cannot be undone
  *       401:
  *         description: Unauthorized
  *       403:
  *         description: Forbidden - issuer role required
+ *       404:
+ *         description: Record not found
+ *       409:
+ *         description: Record already revoked (revocation is irreversible)
  *       500:
  *         description: Contract invocation failed
  *         content:
@@ -255,7 +313,7 @@ router.post(
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-// POST /vaccination/revoke — revoke a vaccination record (issuer or admin only)
+// POST /vaccination/revoke — revoke a single vaccination record (issuer or admin only)
 router.post(
   '/revoke',
   authMiddleware,
@@ -277,10 +335,16 @@ router.post(
         action: 'vaccination.revoke',
         target: String(token_id),
         result: 'success',
-        meta: { token_id },
+        meta: { token_id, scope: 'record', irreversible: true },
       });
 
-      res.json({ success: true, token_id });
+      res.json({
+        success: true,
+        token_id,
+        revoked: true,
+        scope: 'record',
+        irreversible: true,
+      });
     } catch (err) {
       if (err instanceof SorobanTimeoutError) return sendRpcTimeout(res);
       const errorMessage = resolveContractErrorMessage(err);
@@ -476,7 +540,14 @@ router.get(
         return String(b.token_id ?? b.tokenId ?? '').localeCompare(String(a.token_id ?? a.tokenId ?? ''));
       });
 
-      const total = sorted.length;
+      // Revocation is record-level: expose per-record status so verifiers can
+      // ignore revoked records while still trusting the wallet's remaining ones.
+      const records = sorted.map((record) => ({
+        ...record,
+        revoked: Boolean(record.revoked),
+      }));
+
+      const total = records.length;
       const start = (rawPage - 1) * rawLimit;
       const data = toApiRecords(sorted.slice(start, start + rawLimit));
       const hasMore = start + data.length < total;
@@ -488,6 +559,7 @@ router.get(
         limit: rawLimit,
         has_more: hasMore,
         next_page: hasMore ? rawPage + 1 : null,
+        vaccinated: Boolean(vaccinated),
       });
     } catch (err) {
       if (err instanceof SorobanTimeoutError) return sendRpcTimeout(res);
