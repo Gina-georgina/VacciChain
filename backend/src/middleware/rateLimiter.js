@@ -47,6 +47,21 @@ const make = (maxEnvVar, defaultMax, keyGen = resolveClientIdentity) => {
   });
 };
 
+// Derive the client IP safely. Express resolves req.ip according to the
+// configured `trust proxy` setting, so forwarded headers (X-Forwarded-For,
+// etc.) are only honored when the deployment topology says they should be.
+// This prevents spoofed forwarded headers from bypassing rate limits.
+const clientIp = (req) => {
+  const ip = req.ip;
+  if (typeof ip === 'string' && ip.length > 0) return ip;
+  // Fall back to the raw socket address if req.ip is unavailable.
+  const socketIp = req.socket?.remoteAddress;
+  if (typeof socketIp === 'string' && socketIp.length > 0) return socketIp;
+  // Last-resort fallback so requests are still bucketed rather than sharing
+  // an undefined key.
+  return 'unknown';
+};
+
 module.exports = {
   resolveClientIdentity,
   // Authentication (SEP-10 challenge issuance)

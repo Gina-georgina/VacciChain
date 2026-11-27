@@ -29,6 +29,7 @@ const { sanitizeInputs } = require('./middleware/sanitize');
 const errorHandler = require('./middleware/errorHandler');
 const { onboardingLimiter, batchVerifyLimiter } = require('./middleware/rateLimit');
 const idempotency = require('./middleware/idempotency');
+const auditLog = require('./middleware/auditLog');
 
 const app = express();
 // Trust only the configured number of proxy hops so client identity (and thus
@@ -132,9 +133,14 @@ app.use(cors({
 }));
 app.use(securityHeaders);
 app.use(express.json({ limit: config.BODY_LIMIT }));
+// Request ID must be assigned before audit logging so every audit entry
+// can be correlated with the originating request.
 app.use(requestId);
 // Sanitize all string inputs at the API boundary (strips HTML tags, control chars, null bytes)
 app.use(sanitizeInputs);
+// Tamper-evident audit logging for issuer actions (mint, revoke, consent,
+// administrative changes). Records actor, request ID, outcome, timestamp.
+app.use(auditLog);
 
 app.use((req, res, next) => {
   const start = Date.now();

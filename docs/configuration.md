@@ -130,6 +130,89 @@ The backend validates its variables at startup via [Zod](https://zod.dev/). A mi
 - Description: TCP port the Express backend listens on.
 - Example: `PORT=4000`
 
+### `TRUST_PROXY`
+- Required: no
+- Default: `false`
+- Allowed values: `false` | `true` | `loopback` | `linklocal` | `uniquelocal` | a comma-separated list of IP addresses/CIDR ranges | a non-negative integer (number of trusted hops)
+- Description: Value passed to Express `app.set('trust proxy', ...)`. Controls how the client IP is derived from `X-Forwarded-For` / `X-Real-IP`. Must match the deployed load-balancer topology: set `false` when the backend is directly exposed, `1` (or the LB's CIDR) when exactly one trusted proxy sits in front, and so on. When unset or `false`, forwarded headers are ignored and the socket address is used, preventing spoofed headers from bypassing rate limits or corrupting audit attribution.
+- Example (single load balancer): `TRUST_PROXY=1`
+- Example (known proxy range): `TRUST_PROXY=10.0.0.0/8,192.168.1.10`
+
+---
+
+## Event index persistence
+
+The backend maintains a local event index (SQLite by default) of on-chain vaccination events. The persistence strategy is documented in `docs/persistence-strategy.md`; the variables below select and tune it.
+
+### `DATABASE_PATH`
+- Required: no
+- Default: `/data/vaccichain.db`
+- Format: file path; the parent directory must be writable
+- Description: Path to the SQLite database file used for the event index. Ignored when `DATABASE_URL` is set.
+- Example: `DATABASE_PATH=/data/vaccichain.db`
+
+### `DATABASE_URL`
+- Required: no
+- Default: unset (SQLite via `DATABASE_PATH`)
+- Format: PostgreSQL connection URL (`postgres://user:pass@host:5432/db`)
+- Description: When set, the event index uses the multi-writer PostgreSQL backend instead of SQLite. Required when running more than one backend task against a shared index. See `docs/persistence-strategy.md` for the load and failure analysis and the migration procedure.
+- Example: `DATABASE_URL=postgres://vaccichain:secret@db:5432/vaccichain`
+
+### `DATABASE_POOL_SIZE`
+- Required: no
+- Default: `10`
+- Format: positive integer
+- Description: Maximum number of pooled connections per backend task when `DATABASE_URL` is set. Size so that `DATABASE_POOL_SIZE × backend task count` stays below the database's `max_connections`.
+- Example: `DATABASE_POOL_SIZE=10`
+
+### `DATABASE_BUSY_TIMEOUT_MS`
+- Required: no
+- Default: `5000`
+- Format: positive integer (milliseconds)
+- Description: SQLite busy timeout applied to the event index connection. Longer values reduce `SQLITE_BUSY` errors under write contention at the cost of latency.
+- Example: `DATABASE_BUSY_TIMEOUT_MS=5000`
+
+### `DATABASE_BACKUP_PATH`
+- Required: no
+- Default: unset (scheduled backups disabled)
+- Format: directory path; must be writable
+- Description: Directory where periodic event index backups are written. Backups use SQLite's online backup API (or `pg_dump` for PostgreSQL) and are safe to take while the service is running.
+- Example: `DATABASE_BACKUP_PATH=/var/backups/vaccichain`
+
+### `DATABASE_BACKUP_INTERVAL_MINUTES`
+- Required: no
+- Default: `60`
+- Format: positive integer
+- Description: How often the event index backup job runs. Only used when `DATABASE_BACKUP_PATH` is set.
+- Example: `DATABASE_BACKUP_INTERVAL_MINUTES=60`
+
+---
+
+## Public verification limits
+
+Public verification endpoints (`GET /verify/:wallet`, batch verification) are bounded to protect memory, CPU, and response bandwidth.
+
+### `VERIFY_MAX_RECORDS`
+- Required: no
+- Default: `100`
+- Format: positive integer
+- Description: Maximum number of vaccination records returned in a single public record response. When a wallet has more records, the response is truncated and includes pagination metadata (`total`, `returned`, `truncated`, `nextCursor`). Clients page through the remainder with the `cursor` query parameter.
+- Example: `VERIFY_MAX_RECORDS=100`
+
+### `VERIFY_MAX_BATCH_SIZE`
+- Required: no
+- Default: `50`
+- Format: positive integer
+- Description: Maximum number of wallets accepted in a single batch verification request. Requests above this limit are rejected with HTTP 413 before any lookup work is performed.
+- Example: `VERIFY_MAX_BATCH_SIZE=50`
+
+### `VERIFY_MAX_PAGE_SIZE`
+- Required: no
+- Default: `100`
+- Format: positive integer
+- Description: Upper bound for the `limit` query parameter on paginated public verification responses. Values above this are clamped to the maximum.
+- Example: `VERIFY_MAX_PAGE_SIZE=100`
+
 ---
 
 ## Rate limiting
@@ -216,8 +299,57 @@ A throttled request returns HTTP `429` with a JSON body of the form `{ "error": 
 - Required: no
 - Default: `./audit.log` (relative to the backend working directory)
 - Format: valid file path; the parent directory must be writable
-- Description: Path to the append-only NDJSON audit log file. Each line is a JSON object with `timestamp`, `actor`, `action`, `target`, `result`, and `meta`. Never deleted or updated — only appended.
+- Description: Path to the append-only NDJSON audit log file. Each line is a JSON object with `timestamp`, `requestId`, `actor`, `action`, `target`, `result`, and `meta`. Mint, revoke, consent, and administrative changes are always recorded. Never deleted or updated — only appended.
 - Example: `AUDIT_LOG_PATH=/var/log/vaccichain/audit.log`
+
+### `AUDIT_LOG_MAX_BYTES`
+- Required: no
+- Default: `10485760` (10 MiB)
+- Format: positive integer (bytes)
+- Description: Size at which the current audit log file is rotated. On rotation the active file is renamed with a timestamp suffix and a new file is opened; rotation is atomic with respect to appends.
+- Example: `AUDIT_LOG_MAX_BYTES=10485760`
+
+### `AUDIT_LOG_MAX_FILES`
+- Required: no
+- Default: `10`
+- Format: positive integer
+- Description: Number of rotated audit log files retained. Older files are deleted once this count is exceeded. Set `0` to retain rotated files indefinitely (not recommended in production).
+- Example: `AUDIT_LOG_MAX_FILES=10`
+
+### `AUDIT_LOG_RETENTION_DAYS`
+- Required: no
+- Default: `90`
+- Format: positive integer
+- Description: Maximum age (in days) of rotated audit log files. Files older than this are removed by the retention job regardless of `AUDIT_LOG_MAX_FILES`. Set `0` to disable age-based retention.
+- Example: `AUDIT_LOG_RETENTION_DAYS=90`
+
+### `AUDIT_LOG_INTEGRITY_KEY`
+- Required: no
+- Default: unset (hash chaining only)
+- Format: non-empty string; minimum 32 characters recommended
+- Description: Secret used to compute the HMAC that chains each audit entry to its predecessor, making the log tamper-evident. When unset, entries are still hash-chained but the chain cannot be authenticated. Rotate only together with a documented re-seal procedure (see `docs/audit-log.md`).
+- Example: `AUDIT_LOG_INTEGRITY_KEY=change-me-to-a-long-random-string`
+
+### `AUDIT_LOG_VERIFY_ON_START`
+- Required: no
+- Default: `true`
+- Format: boolean (`true` | `false`)
+- Description: When enabled, the backend verifies the integrity chain of the active and rotated audit logs at startup and logs a warning (or fails fast, per `AUDIT_LOG_FAIL_ON_INTEGRITY_ERROR`) if a break is detected.
+- Example: `AUDIT_LOG_VERIFY_ON_START=true`
+
+### `AUDIT_LOG_FAIL_ON_INTEGRITY_ERROR`
+- Required: no
+- Default: `false`
+- Format: boolean (`true` | `false`)
+- Description: When `true`, an integrity verification failure at startup aborts the boot instead of logging a warning. Recommended for production deployments with strict audit requirements.
+- Example: `AUDIT_LOG_FAIL_ON_INTEGRITY_ERROR=true`
+
+### `AUDIT_LOG_FAILURE_MODE`
+- Required: no
+- Default: `fail-closed`
+- Allowed values: `fail-closed` | `fail-open`
+- Description: Behaviour when an audit entry cannot be written (e.g. disk full, permission error). `fail-closed` rejects the originating mint/revoke/consent/admin request so no action goes unrecorded; `fail-open` allows the action and emits a high-severity alert. `fail-closed` is required for production.
+- Example: `AUDIT_LOG_FAILURE_MODE=fail-closed`
 
 ---
 
@@ -428,6 +560,7 @@ When an anomaly is detected the service POSTs a JSON payload to `ALERT_WEBHOOK_U
 | `SOROBAN_TIP` | no | Zod (backend) | non-negative integer (stroops), default 0 |
 | `BODY_LIMIT` | no | Zod (backend) | size string, default `10kb` |
 | `EVENT_POLL_INTERVAL_MS` | no | Zod (backend) | positive integer (ms), default 15000 |
+| `TRUST_PROXY` | no | Zod (backend) | `false` \| `true` \| named range \| CIDR list \| hop count, default `false` |
 | `DATABASE_PATH` | no | Zod (backend) | file path, default `/data/vaccichain.db` |
 | `TRUST_PROXY` | no | Zod (backend) | `false` \| `true` \| hop count \| proxy IP/CIDR list, default `false` |
 | `RATE_LIMIT_SEP10` | no | Zod (backend) | positive integer, default 10 |

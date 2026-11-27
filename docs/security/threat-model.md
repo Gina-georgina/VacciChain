@@ -19,7 +19,7 @@
 | JWT secret (`JWT_SECRET`) | Backend environment | High — forging it grants arbitrary role claims |
 | Verifier API keys | Backend SQLite DB (`api_keys` table) | Medium — grants bulk verification access |
 | SEP-10 nonces | In-memory nonce store | Medium — single-use; expiry limits window |
-| Audit log (`audit.log`) | Backend filesystem | Medium — append-only NDJSON; contains wallet + action history |
+| Audit log (`audit.log`) | Backend filesystem | Medium — append-only NDJSON with hash chaining (tamper-evident); contains wallet + action history |
 | Backend indexer SQLite DB | Backend filesystem | Medium — indexed on-chain events cache |
 | Contract WASM / upgrade path | On-chain deployer | Critical — malicious upgrade replaces all logic |
 
@@ -109,6 +109,7 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 | B-I2 | Information Disclosure | CORS misconfiguration exposes API to arbitrary origins | CORS configured in `app.js`; verify allowed origins are restricted in production | Medium — confirm production CORS allowlist |
 | B-D1 | Denial of Service | Flood `/auth/sep10` to exhaust Horizon account sequence numbers | Rate limiters on auth, public verification, onboarding, and batch verification use a trusted client identity resolver: `req.ip` is only trusted when the request comes from a configured trusted proxy (`TRUSTED_PROXIES` / Express `trust proxy`), otherwise the socket address is used. Responses include documented `Retry-After` and `RateLimit-*` headers (issue #55) | Low — spoofed `X-Forwarded-For` from untrusted peers is ignored; covered by tests |
 | B-D2 | Denial of Service | Oversized request body crashes the parser | `body-limit` middleware enforced (tested in `body-limit.test.js`) | Low |
+| B-D4 | Denial of Service | Unbounded record histories or batch inputs exhaust memory, CPU, or response bandwidth | Public record responses are paginated/truncated to a documented maximum; batch requests are capped at a documented maximum size and rejected above it; boundary behavior tested at, below, and above each limit | Low |
 | B-D3 | Denial of Service | Soroban RPC unavailability blocks all minting | `withRetry` in `soroban.js` retries with exponential backoff up to `SOROBAN_RPC_MAX_RETRIES` | Medium — no circuit breaker; prolonged RPC outage blocks all writes |
 | B-D4 | Denial of Service | Distributed deployment bypasses per-IP limits because each instance counts independently | Per-instance in-memory counters; document that multi-instance deployments must front the API with a shared limiter (e.g., nginx `limit_req` or Redis-backed store) | Medium — single-instance limits only; see OR-10 |
 | B-T3 | Tampering | Corrupt or inaccessible indexer DB silently replaced with an empty database, hiding data loss | Startup and readiness checks validate schema version, required tables, and DB accessibility; corruption raises an actionable operator alert and fails fast instead of initializing an empty replacement (issue #63) | Low |
@@ -135,7 +136,7 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 | A-S1 | Spoofing | Unauthenticated caller accesses analytics endpoints | `/analytics/*` endpoints currently have no auth; `_bearer` variable is defined but not applied as a dependency in routes | **High — add auth before production** |
 | A-T1 | Tampering | Attacker sends crafted event data to skew analytics | Analytics reads from backend `/events` endpoint (read-only); no write path into analytics | Low |
 | A-I1 | Information Disclosure | Bulk harvest of issuer activity and anomaly data | No rate limiting on analytics endpoints; no auth (see A-S1) | High — blocked by fixing A-S1 |
-| A-D1 | Denial of Service | Flood `/batch/verify` with 100-wallet requests to amplify load on backend | Batch capped at 100 wallets per request; no rate limit on the analytics service itself | Medium — add rate limiting |
+| A-D1 | Denial of Service | Flood `/batch/verify` with 100-wallet requests to amplify load on backend | Batch capped at 100 wallets per request (documented limit; oversized batches rejected); no rate limit on the analytics service itself | Medium — add rate limiting |
 | A-E1 | Elevation of Privilege | Analytics service calls backend with elevated privileges | Analytics only calls public `/verify/:wallet` and `/events`; no JWT or admin key used | Low |
 
 ---
@@ -148,7 +149,7 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 | OR-2 | Analytics endpoints have no authentication (`_bearer` defined but not wired) | **High** | Python service | Apply `HTTPBearer` dependency to all analytics routes |
 | OR-3 | JWT storage in frontend — if stored in localStorage, vulnerable to XSS | **High** | Frontend | Move to `httpOnly` cookie or confirm current storage is safe |
 | OR-4 | Admin key is a single point of failure; compromise enables malicious issuer addition and contract upgrade | **High** | DevOps | Store in hardware wallet or cloud HSM; monitor `iss_add` and `upgraded` events |
-| OR-5 | Audit log on local filesystem — writable by process; no integrity protection | **Medium** | Backend / Infra | Use append-only log sink (e.g., Loki, CloudWatch Logs) in production |
+| OR-5 | Audit log on local filesystem — writable by process; hash chaining detects tampering but not wholesale replacement | **Medium** | Backend / Infra | Ship to append-only log sink (e.g., Loki, CloudWatch Logs); document and test rotation, retention, integrity verification, and failure handling |
 | OR-6 | No rate limiting on Python analytics service | **Medium** | Python service | Add `slowapi` or nginx rate limiting in front of the service |
 | OR-7 | CORS allowlist not verified for production — may be open | **Medium** | Backend | Restrict `Access-Control-Allow-Origin` to known frontend domain |
 | OR-8 | Soroban RPC outage has no circuit breaker — prolonged outage blocks all writes with no user feedback | **Low** | Backend | Add circuit breaker or health-check endpoint |
@@ -165,7 +166,7 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 - [ ] OR-2: Analytics routes protected with JWT or API key auth
 - [ ] OR-3: JWT stored in `httpOnly` cookie, not localStorage
 - [ ] OR-4: Admin key in HSM or hardware wallet; event monitoring configured
-- [ ] OR-5: Audit log shipped to tamper-evident sink
+- [ ] OR-5: Audit log shipped to tamper-evident sink; rotation, retention, integrity verification, and failure handling documented and tested
 - [ ] OR-6: Rate limiting on analytics service
 - [ ] OR-7: CORS restricted to production frontend domain
 - [ ] OR-10: Trusted proxy configuration verified; shared rate limiter in place for multi-instance deployment

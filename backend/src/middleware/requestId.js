@@ -30,10 +30,36 @@ function getLogger() {
   }
 }
 
+// Accept only well-formed, bounded request IDs from clients. Anything else is
+// replaced with a freshly generated UUID so that untrusted input cannot inject
+// control characters, forge log correlation, or bloat audit records.
+const MAX_REQUEST_ID_LENGTH = 128;
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]+$/;
+
+function isValidRequestId(value) {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= MAX_REQUEST_ID_LENGTH &&
+    REQUEST_ID_PATTERN.test(value)
+  );
+}
+
+function normalizeHeaderValue(value) {
+  // Node may surface repeated headers as an array; only accept a single value.
+  if (Array.isArray(value)) {
+    return value.length === 1 ? value[0] : undefined;
+  }
+  return value;
+}
+
 module.exports = function requestId(req, res, next) {
   const incoming = sanitizeRequestId(req.headers['x-request-id']);
   const id = incoming || randomUUID();
   req.requestId = id;
+  req.id = id;
+
+  // Echo the sanitized ID back so clients can correlate their requests.
   res.setHeader('X-Request-ID', id);
 
   const logger = getLogger();

@@ -55,12 +55,70 @@ let inFlight = null;
 let stopped = true;
 let lastCommittedLedger = null;
 
+// Retry configuration for lock contention / transient DB failures.
+// Multiple backend tasks may poll concurrently; SQLite serialises writers, so
+// a contended write surfaces as SQLITE_BUSY. We retry with backoff instead of
+// dropping the batch (which would leave gaps in the index).
+const MAX_WRITE_RETRIES = Number(process.env.INDEXER_WRITE_RETRIES || 5);
+const BASE_RETRY_DELAY_MS = Number(process.env.INDEXER_RETRY_BASE_MS || 100);
+
 function getRpc() {
   return new StellarSdk.SorobanRpc.Server(SOROBAN_RPC_URL);
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Persist a batch of events with retry-on-lock-contention.
+ * Returns true if the batch was written, false if it was abandoned.
+ */
+async function persistEventsWithRetry(events) {
+  for (let attempt = 0; attempt <= MAX_WRITE_RETRIES; attempt++) {
+    try {
+      upsertEvents(events);
+      return true;
+    } catch (err) {
+      const contention = isLockContentionError(err);
+      if (!contention || attempt === MAX_WRITE_RETRIES) {
+        if (process.env.NODE_ENV !== 'test') {
+          console.error(
+            `[indexer] Failed to persist ${events.length} event(s) after ${attempt + 1} attempt(s):`,
+            err.message
+          );
+        }
+        return false;
+      }
+      // Exponential backoff with jitter to de-synchronise competing writers.
+      const delay = BASE_RETRY_DELAY_MS * 2 ** attempt + Math.floor(Math.random() * BASE_RETRY_DELAY_MS);
+      if (process.env.NODE_ENV !== 'test') {
+        console.warn(
+          `[indexer] Lock contention writing events (attempt ${attempt + 1}/${MAX_WRITE_RETRIES}); retrying in ${delay}ms`
+        );
+      }
+      await sleep(delay);
+    }
+  }
+  return false;
+}
+
+/** Log the current schema/migration state so operators can detect drift after failover. */
+function logMigrationState() {
+  if (process.env.NODE_ENV === 'test') return;
+  try {
+    const state = getMigrationState();
+    console.log(
+      `[indexer] DB migration state: version=${state.version} applied=${state.applied} pending=${state.pending}`
+    );
+    if (state.pending > 0) {
+      console.warn(
+        `[indexer] ${state.pending} pending migration(s) detected — run migrations before scaling backend tasks`
+      );
+    }
+  } catch (err) {
+    console.error('[indexer] Unable to read migration state:', err.message);
+  }
 }
 
 /** Compute bounded exponential backoff delay for a given attempt (0-based). */
@@ -228,14 +286,10 @@ async function runPoll() {
   setGauge('indexer_latest_indexed_ledger', getLatestLedger());
 
   if (valid.length) {
-    try {
-      upsertEvents(valid);
-    } catch (err) {
-      // Persistence failed — leave the checkpoint untouched so events are
-      // retried on the next poll instead of being lost.
-      if (process.env.NODE_ENV !== 'test') {
-        console.error('[indexer] Persistence error (checkpoint unchanged):', err.message);
-      }
+    const stored = await persistEventsWithRetry(valid);
+    if (!stored) {
+      // Do not advance past this batch: the next poll re-reads from the same
+      // startLedger so no events are lost when a write is abandoned.
       return;
     }
 
@@ -285,6 +339,7 @@ function poll() {
 function startPoller(intervalMs) {
   if (timer) return;
   stopped = false;
+  logMigrationState();
   loadCheckpoint();
   poll(); // immediate first run
   timer = setInterval(() => {
@@ -333,4 +388,6 @@ module.exports = {
   loadCheckpoint,
   getCheckpoint,
   backoffDelay,
+  persistEventsWithRetry,
+  logMigrationState,
 };

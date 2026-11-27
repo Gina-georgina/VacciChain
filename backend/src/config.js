@@ -73,6 +73,45 @@ const schema = z.object({
   EVENT_POLL_BACKOFF_MAX_MS: z.coerce.number().int().positive().default(30000),
   DATABASE_PATH: z.string().default('/data/vaccichain.db'),
 
+  // Persistence strategy (see docs/persistence-strategy.md)
+  // 'sqlite' = single-writer SQLite index; 'postgres' = multi-writer database
+  DB_BACKEND: z.enum(['sqlite', 'postgres']).default('sqlite'),
+  // Connection string for the multi-writer backend (required when DB_BACKEND=postgres)
+  DATABASE_URL: z.string().optional(),
+  // Milliseconds to wait for a write lock before failing the operation
+  DB_LOCK_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
+  // Interval between automatic index backups (0 disables scheduled backups)
+  DB_BACKUP_INTERVAL_MS: z.coerce.number().int().nonnegative().default(3600000),
+  // Directory where index backups are written
+  DB_BACKUP_PATH: z.string().default('/data/backups'),
+  // Number of most recent backups to retain
+  DB_BACKUP_RETENTION: z.coerce.number().int().positive().default(7),
+  // Run pending schema migrations on startup
+  DB_MIGRATE_ON_START: z.coerce.boolean().default(true),
+  // Fail startup instead of continuing when migrations cannot be applied
+  DB_MIGRATE_STRICT: z.coerce.boolean().default(true),
+
+  // Public verification response limits
+  // Maximum number of history entries returned for a single record
+  MAX_RECORD_HISTORY: z.coerce.number().int().positive().default(100),
+  // Default page size for paginated record/history responses
+  DEFAULT_PAGE_SIZE: z.coerce.number().int().positive().default(20),
+  // Maximum number of items accepted in a single batch verification request
+  MAX_BATCH_SIZE: z.coerce.number().int().positive().default(50),
+
+  // Proxy / client IP derivation
+  // Express trust-proxy setting: 'false', 'true', a hop count, or a subnet list
+  TRUST_PROXY: z.string().default('false'),
+
+  // Audit logging
+  AUDIT_LOG_PATH: z.string().default('/data/audit/audit.log'),
+  // Maximum size of a single audit log file before rotation, in bytes
+  AUDIT_LOG_MAX_BYTES: z.coerce.number().int().positive().default(10485760),
+  // Number of rotated audit log files to retain
+  AUDIT_LOG_RETENTION: z.coerce.number().int().positive().default(10),
+  // Secret used to compute the tamper-evident hash chain over audit entries
+  AUDIT_LOG_INTEGRITY_KEY: z.string().min(1).optional(),
+
   // Vaccination list pagination (#44)
   // Hard upper bound on page size; requests above this are rejected/clamped.
   VACCINATION_MAX_PAGE_SIZE: z.coerce.number().int().positive().default(100),
@@ -112,6 +151,20 @@ const schema = z.object({
       code: z.ZodIssueCode.custom,
       path: ['NONCE_STORE_REDIS_URL'],
       message: 'is required when NONCE_STORE_BACKEND is "redis"',
+    });
+  }
+  if (val.DB_BACKEND === 'postgres' && !val.DATABASE_URL) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['DATABASE_URL'],
+      message: 'DATABASE_URL is required when DB_BACKEND=postgres',
+    });
+  }
+  if (val.DEFAULT_PAGE_SIZE > val.MAX_RECORD_HISTORY) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['DEFAULT_PAGE_SIZE'],
+      message: 'DEFAULT_PAGE_SIZE must not exceed MAX_RECORD_HISTORY',
     });
   }
 });

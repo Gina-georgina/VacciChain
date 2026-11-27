@@ -1,3 +1,6 @@
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { createLogger, format, transports } = require('winston');
 const { AsyncLocalStorage } = require('async_hooks');
 
