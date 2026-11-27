@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth } from './useFreighter';
 import { useToast } from './useToast';
+import { apiUrl } from '../config';
 
 // Module-level cache: request URL -> { records, total, limit, timestamp }
 export const cache = new Map();
@@ -116,7 +117,7 @@ export function useVaccination(walletAddress) {
   const issueVaccination = useCallback(async (payload) => {
     setLoading(true);
     try {
-      const res = await apiFetchRef.current('/v1/vaccination/issue', {
+      const res = await apiFetchRef.current(apiUrl('/v1/vaccination/issue'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -136,7 +137,7 @@ export function useVaccination(walletAddress) {
 
   const checkIssuerStatus = useCallback(async () => {
     try {
-      const res = await apiFetchRef.current('/v1/issuer/status');
+      const res = await apiFetchRef.current(apiUrl('/v1/issuer/status'));
       const data = await res.json();
       return res.ok ? data.authorized : false;
     } catch {

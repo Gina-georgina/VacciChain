@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useAuth } from './useFreighter';
+import { apiUrl } from '../config';
 
 /**
  * useConsent — manages patient consent state.
@@ -23,7 +24,7 @@ export function useConsent() {
     if (wallet !== activeWalletRef.current) return null;
     setLoading(true);
     try {
-      const res = await apiFetch(`/v1/patient/consent/${wallet}`);
+      const res = await apiFetch(apiUrl(`/v1/patient/consent/${wallet}`));
       const data = await res.json();
       if (wallet !== activeWalletRef.current) return null;
       setConsented(data.consented);
@@ -51,7 +52,7 @@ export function useConsent() {
     const wallet = publicKey;
     setLoading(true);
     try {
-      const res = await apiFetch('/v1/patient/consent', {
+      const res = await apiFetch(apiUrl('/v1/patient/consent'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ wallet }),

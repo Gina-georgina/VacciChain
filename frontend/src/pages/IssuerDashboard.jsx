@@ -234,14 +234,24 @@ export default function IssuerDashboard() {
   ];
 
   return (
-    <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
-      <div style={{ borderLeft: '4px solid #22c55e', paddingLeft: '0.75rem', marginBottom: '1.5rem' }}>
-        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem' }}>
-          <h2 style={{ color: '#e2e8f0', margin: 0 }}>Issue Vaccination NFT</h2>
-          <RoleBadge role="issuer" />
+    <RoleGuard requiredRole="issuer">
+      <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
+        <div style={{ borderLeft: '4px solid #22c55e', paddingLeft: '0.75rem', marginBottom: '1.5rem' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem' }}>
+            <h2 style={{ color: '#e2e8f0', margin: 0 }}>Issue Vaccination NFT</h2>
+            <RoleBadge role="issuer" />
+          </div>
         </div>
-      </div>
-      <form style={styles.form} onSubmit={handleSubmit} role="form">
+        {isAuthorized === null ? (
+          <p style={{ color: '#94a3b8' }}>Checking authorization status...</p>
+        ) : (
+          <>
+            {!isAuthorized && (
+              <div style={styles.warning} role="alert">
+                {t('issuer.notAuthorized', 'This wallet is not authorized to issue vaccinations.')}
+              </div>
+            )}
+            <form style={styles.form} onSubmit={handleSubmit} role="form">
         {[
           { key: 'patient_address', label: 'Patient Stellar Address', placeholder: 'G...' },
           { key: 'vaccine_name', label: 'Vaccine Name', placeholder: 'e.g. COVID-19' },
@@ -313,7 +323,26 @@ export default function IssuerDashboard() {
             </a>
           </div>
         )}
+        <div aria-live="polite" aria-atomic="true">
+          {mintResult && (
+            <div style={{ marginTop: '1rem', padding: '0.75rem 1rem', background: '#0f172a', borderRadius: 8, color: '#4ade80' }}>
+              <p>✅ Vaccination NFT minted!</p>
+              <p style={{ fontSize: '0.85rem', color: '#94a3b8', marginTop: '0.25rem', display: 'flex', alignItems: 'center' }}>
+                Token ID: {mintResult.tokenId}
+                <CopyButton text={String(mintResult.tokenId)} label="token ID" />
+              </p>
+              <a
+                href={`https://stellar.expert/explorer/testnet/tx/${mintResult.transactionHash}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ fontSize: '0.85rem', color: '#0ea5e9' }}
+              >
+                View on Stellar Explorer ↗
+              </a>
+            </div>
+          )}
+        </div>
       </div>
-    </div>
+    </RoleGuard>
   );
 }

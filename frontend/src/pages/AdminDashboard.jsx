@@ -24,7 +24,7 @@ const s = {
 };
 
 export default function AdminDashboard() {
-  const { publicKey, role, connect, apiFetch } = useAuth();
+  const { publicKey, role, apiFetch } = useAuth();
   const [keys, setKeys]             = useState([]);
   const [label, setLabel]           = useState('');
   const [newKey, setNewKey]         = useState(null);
@@ -62,6 +62,8 @@ export default function AdminDashboard() {
   }, [apiFetch]);
 
   useEffect(() => {
+    // Disconnected, loading, and denied states are owned by the route-level
+    // RoleGuard; only fetch once the authenticated role is confirmed.
     if (publicKey && role === 'issuer') {
       fetchKeys();
       fetchApplications();
