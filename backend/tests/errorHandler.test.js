@@ -1,6 +1,7 @@
 const request = require('supertest');
 const express = require('express');
 const errorHandler = require('../src/middleware/errorHandler');
+const { AppError } = require('../src/middleware/errors');
 const requestId = require('../src/middleware/requestId');
 const logger = require('../src/utils/logger');
 
@@ -19,7 +20,8 @@ describe('errorHandler middleware', () => {
     });
     const res = await request(app).get('/test');
     expect(res.status).toBe(500);
-    expect(res.body.error).toBe('Internal Server Error');
+    expect(res.body.code).toBe('internal_server_error');
+    expect(res.body.message).toBe('Internal Server Error');
     expect(res.body.requestId).toBeDefined();
     // internal detail must not leak
     expect(JSON.stringify(res.body)).not.toMatch(/db exploded/);
@@ -33,7 +35,18 @@ describe('errorHandler middleware', () => {
     });
     const res = await request(app).get('/test');
     expect(res.status).toBe(404);
-    expect(res.body.error).toBe('resource not found');
+    expect(res.body.message).toBe('resource not found');
+    expect(res.body.requestId).toBeDefined();
+  });
+
+  it('returns standardized shape for AppError', async () => {
+    const app = makeApp((_req, _res, next) => {
+      next(new AppError('validation_failed', 'bad input', 400));
+    });
+    const res = await request(app).get('/test');
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('validation_failed');
+    expect(res.body.message).toBe('bad input');
     expect(res.body.requestId).toBeDefined();
   });
 
@@ -77,7 +90,7 @@ describe('errorHandler middleware', () => {
     });
     const res = await request(app).get('/test');
     expect(res.status).toBe(503);
-    expect(res.body.error).toBe('Internal Server Error');
+    expect(res.body.message).toBe('Internal Server Error');
   });
 
   describe('log redaction', () => {

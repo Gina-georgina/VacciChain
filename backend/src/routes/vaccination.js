@@ -7,6 +7,7 @@ const { validateStellarPublicKey } = require('../middleware/wallet');
 const { invokeContract, simulateContract, mintVaccination, sendRpcTimeout, SorobanTimeoutError } = require('../stellar/soroban');
 const { resolveContractErrorMessage, mapContractError } = require('../stellar/contractErrors');
 const { audit } = require('../middleware/auditLog');
+const { AppError } = require('../middleware/errors');
 const validate = require('../middleware/validate');
 const { hasConsented } = require('../indexer/db');
 const { toApiRecords } = require('../schemas/vaccinationRecord');
@@ -369,7 +370,7 @@ router.post('/batch-verify', authMiddleware, batchVerifyLimiter, async (req, res
   } catch (err) {
     if (err instanceof SorobanTimeoutError) return sendRpcTimeout(res);
     const errorMessage = resolveContractErrorMessage(err);
-    res.status(500).json({ error: errorMessage });
+    next(new AppError('rpc_error', errorMessage, 500));
   }
 });
 

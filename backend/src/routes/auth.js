@@ -65,7 +65,7 @@ const router = express.Router();
  *       500:
  *         description: Internal server error
  */
-router.post('/sep10', sep10Limiter, validate(sep10Schema), async (req, res) => {
+router.post('/sep10', sep10Limiter, validate(sep10Schema), async (req, res, next) => {
   const { public_key } = req.body;
 
   try {
@@ -192,7 +192,7 @@ router.post('/verify', verifyLimiter, validate(verifySchema), bruteForceGuard, a
     if (wallet) recordFailure(`wallet:${wallet}`, { ip, wallet });
 
     audit({ actor: wallet || 'unknown', action: 'auth.login', result: 'failure', meta: { error: err.message } });
-    res.status(401).json({ error: err.message });
+    next(new AppError('unauthorized', 'Invalid signature or nonce mismatch', 401));
   }
 });
 

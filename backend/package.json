@@ -9,6 +9,7 @@
     "migrate:rollback": "node scripts/migrate.mjs --rollback",
     "migrate:status": "node scripts/migrate.mjs --status",
     "test": "jest --forceExit",
+    "test:swagger": "node scripts/check-swagger-coverage.js",
     "test:coverage": "c8 --check-coverage --lines 70 --functions 70 --branches 70 jest --forceExit",
     "lint": "eslint src",
     "docs:check": "node scripts/check-openapi.js",

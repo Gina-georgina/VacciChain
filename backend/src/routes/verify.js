@@ -8,6 +8,7 @@ const verifierApiKey = require('../middleware/verifierApiKey');
 const authMiddleware = require('../middleware/auth');
 const { toApiRecords } = require('../schemas/vaccinationRecord');
 const { audit } = require('../middleware/auditLog');
+const { AppError } = require('../middleware/errors');
 
 const router = express.Router();
 
@@ -304,9 +305,15 @@ router.get(
   validateStellarPublicKey('params', 'wallet'),
   jwtOrApiKey,
   adaptiveLimiter,
-  async (req, res) => {
+  async (req, res, next) => {
     const { wallet } = req.params;
     const actor = req.verifier ? `apikey:${req.verifier.id}` : (req.user?.wallet ?? 'unknown');
+
+    // Object-level authorization (#45): patients may only verify their own wallet;
+    // issuers, admins, and verifier API-key callers may verify any wallet.
+    if (req.user && req.user.role === 'patient' && req.user.wallet !== wallet) {
+      return next(new AppError('forbidden', 'Patients may only verify their own vaccination status', 403));
+    }
 
     const now = Date.now();
     const cached = verifyCache.get(wallet);

@@ -61,10 +61,9 @@ function redactSensitive(value) {
  * Sensitive values (JWTs, secret keys, signed payloads) are redacted from the
  * logged message and stack. Raw request headers and bodies are never logged.
  *
- * @param {Error} err
- * @param {import('express').Request} req
- * @param {import('express').Response} res
- * @param {import('express').NextFunction} _next
+ * Operational errors (4xx) return their safe message. Unexpected errors
+ * (5xx) return a generic message; the full stack is logged server-side and
+ * never leaked to the client.
  */
 function errorHandler(err, req, res, _next) {
   // express.json() parse failures and body-limit errors carry `status`.

@@ -38,8 +38,8 @@ function verifyBearer(req, allowedRoles) {
     try {
       decoded = jwt.verify(token, key.secret, options);
       break;
-    } catch (_) {
-      // try next key
+    } catch (err) {
+      lastErr = err;
     }
   }
   if (!decoded) {
