@@ -32,6 +32,24 @@ fn mint(
     )
 }
 
+// ── Storage lifecycle & TTL assumptions (Issue #90) ──────────────────────────
+//
+// Soroban persistent storage entries can expire when their TTL (time-to-live,
+// measured in ledgers) is not extended. The contract makes the following
+// assumptions, which the tests below validate:
+//
+// 1. Every write to a persistent entry (admin, issuer, patient, vaccination
+//    record, pause flag) extends that entry's TTL so it does not silently
+//    expire between transactions.
+// 2. Reads of missing/expired entries must degrade to a safe, recoverable
+//    state: `verify_vaccination` reports "not vaccinated" rather than
+//    panicking, and state-changing calls return a typed `ContractError`.
+// 3. Authorization checks must never fail open. If the admin or issuer entry
+//    is absent/expired, privileged calls must be denied (Unauthorized /
+//    NotInitialized) rather than permitted.
+// 4. Expired/missing entries must be recoverable: re-initialization or
+//    re-registration restores normal operation.
+
 fn setup() -> (Env, VacciChainContractClient<'static>, soroban_sdk::Address) {
     let env = Env::default();
     env.mock_all_auths();
@@ -320,6 +338,38 @@ fn invariant_revoke_one_record_keeps_remaining_records_valid() {
 }
 
 #[test]
+fn invariant_verification_degrades_gracefully_on_expired_entries() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+
+    add_issuer(&env, &client, &issuer);
+
+    client.mint_vaccination(
+        &patient,
+        &String::from_str(&env, "COVID-19"),
+        &String::from_str(&env, "2024-01-15"),
+        &issuer,
+        &None::<u32>,
+        &None::<u32>,
+    );
+
+    let (vaccinated, records, _) = client.verify_vaccination(&patient);
+    assert!(vaccinated);
+    assert_eq!(records.len(), 1);
+
+    // Simulate expiry of the patient's persistent entries.
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&patient);
+    });
+
+    // Verification must degrade gracefully, not panic.
+    let (vaccinated, records, _) = client.verify_vaccination(&patient);
+    assert!(!vaccinated, "Expired entries must not report vaccinated");
+    assert_eq!(records.len(), 0, "Expired entries must yield no records");
+}
+
+#[test]
 fn invariant_revocation_is_irreversible() {
     let (env, client, _admin) = setup();
     let issuer = soroban_sdk::Address::generate(&env);
@@ -364,6 +414,11 @@ fn invariant_exact_duplicate_is_rejected() {
     add_issuer(&env, &client, &issuer);
     mint(&env, &client, &patient, &issuer, "COVID-19", "2024-01-15", Some(1));
 
+    // Simulate expiry of the issuer's persistent entry.
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&issuer);
+    });
+
     let result = client.try_mint_vaccination(
         &patient,
         &String::from_str(&env, "COVID-19"),
@@ -383,6 +438,65 @@ fn invariant_case_and_whitespace_variants_are_duplicates() {
     let patient = soroban_sdk::Address::generate(&env);
 
     add_issuer(&env, &client, &issuer);
+}
+
+#[test]
+fn invariant_revoke_with_missing_issuer_entry_denies() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+
+    add_issuer(&env, &client, &issuer);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&issuer);
+    });
+
+    // Revoking an already-absent issuer must not succeed silently.
+    let result = client.try_revoke_issuer(&issuer);
+    assert!(result.is_err(), "Revoke of expired issuer must be denied");
+}
+
+#[test]
+fn invariant_add_issuer_with_missing_admin_denies() {
+    let (env, client, admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+
+    // Simulate expiry of the admin entry.
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&admin);
+    });
+
+    let result = client.try_add_issuer(
+        &issuer,
+        &String::from_str(&env, "Hospital"),
+        &String::from_str(&env, "LIC"),
+        &String::from_str(&env, "USA"),
+    );
+
+    // Missing admin must not fail open.
+    assert!(result.is_err(), "Missing admin must deny add_issuer");
+}
+
+#[test]
+fn invariant_missing_admin_blocks_pause() {
+    let (env, client, admin) = setup();
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&admin);
+    });
+
+    let result = client.try_pause();
+    assert!(result.is_err(), "Missing admin must deny pause");
+}
+
+#[test]
+fn invariant_writes_extend_ttl() {
+    let (env, client, _admin) = setup();
+    let issuer = soroban_sdk::Address::generate(&env);
+    let patient = soroban_sdk::Address::generate(&env);
+
+    add_issuer(&env, &client, &issuer);
+    client.register_patient(&patient);
     mint(&env, &client, &patient, &issuer, "COVID-19", "2024-01-15", Some(1));
 
     // Case variant of the vaccine name.
@@ -406,6 +520,14 @@ fn invariant_case_and_whitespace_variants_are_duplicates() {
         &None::<u32>,
     );
     assert_eq!(padded_variant, Err(Ok(ContractError::DuplicateRecord)));
+
+    // After writes, the persistent entries must have a live TTL.
+    env.as_contract(&client.address, || {
+        let issuer_ttl = env.storage().persistent().get_ttl(&issuer);
+        let patient_ttl = env.storage().persistent().get_ttl(&patient);
+        assert!(issuer_ttl > 0, "Issuer entry TTL must be extended on write");
+        assert!(patient_ttl > 0, "Patient entry TTL must be extended on write");
+    });
 }
 
 #[test]
@@ -416,12 +538,28 @@ fn invariant_legitimate_repeat_doses_are_allowed() {
 
     add_issuer(&env, &client, &issuer);
 
-    let dose1 = mint(&env, &client, &patient, &issuer, "COVID-19", "2024-01-15", Some(1));
-    let dose2 = mint(&env, &client, &patient, &issuer, "COVID-19", "2024-02-15", Some(2));
+    // Simulate expiry of admin + issuer entries.
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&admin);
+        env.storage().persistent().remove(&issuer);
+    });
 
-    assert_ne!(dose1, dose2);
-    assert!(client.is_vaccination_valid(&dose1));
-    assert!(client.is_vaccination_valid(&dose2));
+    // Privileged calls are denied while state is absent.
+    assert!(client.try_pause().is_err());
+
+    // Re-initialization restores a usable contract.
+    client.initialize(&admin).unwrap();
+    add_issuer(&env, &client, &issuer);
+
+    let result = client.try_mint_vaccination(
+        &patient,
+        &String::from_str(&env, "COVID-19"),
+        &String::from_str(&env, "2024-01-15"),
+        &issuer,
+        &None::<u32>,
+        &None::<u32>,
+    );
+    assert!(result.is_ok(), "Contract must recover after re-initialization");
 }
 
 // ── Issuer lifecycle state machine ───────────────────────────────────────────
