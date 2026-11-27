@@ -118,7 +118,9 @@ The release package must be published alongside the deployment and contain:
 |------|-------|--------|-------|
 | Build backend Docker image | DevOps | ⬜ | Tag with version (e.g., `v1.0.0-mainnet`) |
 | Push image to container registry | DevOps | ⬜ | Use private registry or Docker Hub |
-| Deploy to production infrastructure | DevOps | ⬜ | Use Kubernetes, ECS, or similar |
+| Review Terraform plan | DevOps | ⬜ | CI runs `terraform fmt -check` and `terraform validate` for all environment and module directories; review the plan artifact from the isolated-credentials plan job |
+| Approve Terraform apply | DevOps | ⬜ | Apply requires manual approval of the `production` GitHub environment; plan and apply use separate scoped credentials |
+| Deploy to production infrastructure | DevOps | ⬜ | Use Kubernetes, ECS, or similar; production deploys only from approved branches/events |
 | Verify backend health endpoint | DevOps | ⬜ | `GET /health` should return `{"status":"ok"}` |
 | Verify Swagger UI is accessible | QA Lead | ⬜ | `GET /docs` should load OpenAPI spec |
 | Test SEP-10 auth flow | QA Lead | ⬜ | Generate challenge, sign, verify JWT |
@@ -207,6 +209,8 @@ The release package must be published alongside the deployment and contain:
 | Item | Owner | Status | Notes |
 |------|-------|--------|-------|
 | Verify all systems are running | DevOps | ⬜ | Backend, frontend, analytics, contract |
+| Confirm production environment approvals | DevOps | ⬜ | `production` GitHub environment has required reviewers and separate scoped secrets from `staging` |
+| Confirm pre-deploy policy gate passed | DevOps | ⬜ | Policy check blocks production deploys from unapproved branches and events; staging cannot reach mainnet resources |
 | Check monitoring and alerting | DevOps | ⬜ | Ensure alerts are configured |
 | Verify backup systems are in place | DevOps | ⬜ | Database backups, key backups |
 | Notify stakeholders | Product Lead | ⬜ | Send launch notification to team |
@@ -304,6 +308,17 @@ The reviewer below must be independent of the deployer and must have executed th
 - **WASM hash reproduced**: ___________________
 - **Contract ID / transaction confirmed**: ___________________
 - **Signature**: ___________________
+
+---
+
+## Deployment Approval and Policy Gates
+
+Production deployments are gated by the following controls:
+
+- **Separate GitHub environments** — `staging` and `production` have distinct scoped secrets. The `production` environment requires reviewer approval; staging credentials cannot access mainnet resources.
+- **Pre-deploy policy gate** — A workflow policy check blocks production deploys from unapproved branches and events (e.g., only `main` pushes and tagged releases may deploy to production).
+- **Idempotent contract deployment** — The `deploy-contracts` workflow distinguishes `deploy`, `upgrade`, and `no-op` paths. Upgrades require an explicit target contract, and the deployment manifest prevents re-runs from silently creating a second production contract.
+- **Terraform plan review** — CI runs `terraform fmt -check` and `terraform validate` for all environment and module directories, publishes a reviewable plan using isolated credentials, and requires approval before apply.
 
 ---
 

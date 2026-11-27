@@ -187,7 +187,11 @@ Check that the event contains the expected `new_wasm_hash`, `admin`, and `timest
 
 Run a `verify_vaccination` call and a test mint against the upgraded contract before proceeding to mainnet.
 
-### 6. Repeat on mainnet
+### 6. Update the deployment manifest
+
+Record the new `wasm_hash` (and `contract_id` if this was a first deploy) in `deployments/<network>.json` so future CI runs classify correctly as **upgrade** or **no-op** rather than **deploy**.
+
+### 7. Repeat on mainnet
 
 Replace the RPC URL and network passphrase:
 
