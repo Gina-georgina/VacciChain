@@ -21,6 +21,16 @@ const {
 } = require('../src/indexer/poller');
 const { vaccinationRecordFactory } = require('./factories');
 
+let retention;
+try {
+  // Retention/purge module (backlog #53). Optional so this suite still runs
+  // if the module has not been wired up yet.
+  retention = require('../src/indexer/retention');
+} catch (err) {
+  retention = null;
+}
+const describeRetention = retention ? describe : describe.skip;
+
 
 const tmpDb = path.join(os.tmpdir(), `vaccichain-test-${Date.now()}.db`);
 

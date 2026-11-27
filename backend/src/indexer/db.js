@@ -484,6 +484,66 @@ function revokeApiKey(id) {
   });
 }
 
+// ── Retention / purge jobs ───────────────────────────────────────────────────
+
+/**
+ * Delete indexed event rows older than the configured retention period.
+ * Rows at or below the recovery checkpoint ledger are always preserved.
+ * @param {{ now?: number, retentionDays?: number }} opts
+ * @returns {{ deleted: number, cutoff: number, protectedLedger: number }}
+ */
+function purgeIndexedEvents({ now = Date.now(), retentionDays } = {}) {
+  const days = retentionDays != null
+    ? retentionDays
+    : RETENTION_POLICY.indexed_events.retentionDays;
+  const cutoff = now - days * DAY_MS;
+
+  const before = db.exec('SELECT COUNT(*) FROM events')[0].values[0][0];
+  db.run(
+    'DELETE FROM events WHERE timestamp < ? AND ledger > ?',
+    [cutoff, recoveryCheckpointLedger]
+  );
+  const after = db.exec('SELECT COUNT(*) FROM events')[0].values[0][0];
+  flush();
+  return { deleted: before - after, cutoff, protectedLedger: recoveryCheckpointLedger };
+}
+
+/**
+ * Purge transient operational data (revoked API keys older than retention).
+ * Audit, consent and issuer records are never touched.
+ * @param {{ now?: number, retentionDays?: number }} opts
+ * @returns {{ deleted: number, cutoff: number }}
+ */
+function purgeOperationalData({ now = Date.now(), retentionDays } = {}) {
+  const days = retentionDays != null
+    ? retentionDays
+    : RETENTION_POLICY.operational_data.retentionDays;
+  const cutoffIso = new Date(now - days * DAY_MS).toISOString();
+
+  const before = db.exec('SELECT COUNT(*) FROM api_keys')[0].values[0][0];
+  db.run(
+    'DELETE FROM api_keys WHERE revoked = 1 AND created_at < ?',
+    [cutoffIso]
+  );
+  const after = db.exec('SELECT COUNT(*) FROM api_keys')[0].values[0][0];
+  flush();
+  return { deleted: before - after, cutoff: now - days * DAY_MS };
+}
+
+/**
+ * Entry point for the scheduled retention job. Runs all purgeable data-class
+ * jobs and returns a per-class summary.
+ * @param {{ now?: number }} opts
+ */
+function runRetentionJobs({ now = Date.now() } = {}) {
+  return {
+    ranAt: new Date(now).toISOString(),
+    indexed_events: purgeIndexedEvents({ now }),
+    operational_data: purgeOperationalData({ now }),
+  };
+}
+
+module.exports = { initDb, upsertEvents, queryEvents, getLatestLedger, insertApiKey, getApiKeyByHash, listApiKeys, revokeApiKey, getConsent, recordConsent, hasConsented, insertIssuerApplication, getIssuerApplication, listIssuerApplications, updateIssuerApplicationStatus, getRetentionPolicy, setRecoveryCheckpoint, getRecoveryCheckpoint, purgeIndexedEvents, purgeOperationalData, runRetentionJobs };
 // ── Patient consent ───────────────────────────────────────────────────────────
 
 function recordConsent(wallet) {

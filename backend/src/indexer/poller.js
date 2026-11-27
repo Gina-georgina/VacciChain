@@ -174,7 +174,9 @@ async function runPoll() {
 
   let response;
   try {
-    response = await fetchEventsWithRetry(rpc, {
+    // Read-only call: safe to retry. The shared client applies bounded
+    // timeouts and a retry policy, and classifies exhausted failures.
+    response = await getEvents({
       startLedger,
       filters: [{ contractIds: [CONTRACT_ID] }],
     });
@@ -182,7 +184,12 @@ async function runPoll() {
     // Do NOT advance the checkpoint on RPC failure — the next poll retries
     // from the same startLedger so no ledger events are silently skipped.
     if (process.env.NODE_ENV !== 'test') {
-      console.error('[indexer] Poll error (checkpoint unchanged):', err.message);
+      const correlationId = err.correlationId || 'n/a';
+      const classification = err.classification || 'unknown';
+      console.error(
+        `[indexer] Poll error (classification=${classification}, correlationId=${correlationId}):`,
+        err.message,
+      );
     }
     return;
   }

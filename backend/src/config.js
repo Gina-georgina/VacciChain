@@ -9,6 +9,13 @@ const schema = z.object({
   SOROBAN_RPC_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   STELLAR_NETWORK_PASSPHRASE: z.string().min(1),
 
+  // Stellar call timeouts and retry policy (Horizon + Soroban RPC)
+  // Only idempotent/read operations are retried; transaction submissions are not.
+  STELLAR_RPC_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  STELLAR_RPC_MAX_RETRIES: z.coerce.number().int().nonnegative().default(3),
+  STELLAR_RETRY_BASE_DELAY_MS: z.coerce.number().int().nonnegative().default(250),
+  STELLAR_RETRY_MAX_DELAY_MS: z.coerce.number().int().nonnegative().default(5000),
+
   // Contract
   VACCINATIONS_CONTRACT_ID: z.string().min(1),
 

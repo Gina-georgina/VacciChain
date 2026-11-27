@@ -1,4 +1,7 @@
 const { randomUUID } = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
+
+const asyncLocalStorage = new AsyncLocalStorage();
 
 const MAX_REQUEST_ID_LENGTH = 128;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:\-]+$/;
