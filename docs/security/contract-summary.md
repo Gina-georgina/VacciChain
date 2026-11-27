@@ -100,6 +100,61 @@ and border agencies can verify vaccination status on-chain without a central dat
 | `get_issuer(address)` | Returns `IssuerRecord` metadata. |
 | `transfer(from, to, token_id)` | Always returns `SoulboundToken` error. |
 
+### 4.1 Authorization summary (source-derived)
+
+Every state-changing entry point calls `require_auth()` on the relevant address; the
+Soroban host enforces the signature. The table below is derived directly from the
+`require_auth()` calls in `src/lib.rs` and `src/mint.rs`.
+
+| Function | Auth required on | Additional checks |
+|---|---|---|
+| `initialize` | `admin` | `Initialized` must be false |
+| `add_issuer` | `admin` | caller must equal stored `Admin` |
+| `revoke_issuer` | `admin` | caller must equal stored `Admin` |
+| `propose_admin` | `admin` | caller must equal stored `Admin` |
+| `accept_admin` | `new_admin` | pending admin must match, not expired |
+| `upgrade` | `admin` | caller must equal stored `Admin` |
+| `mint_vaccination` | `issuer` | issuer authorized, patient allowlisted, no duplicate, record limit |
+| `revoke_vaccination` | `revoker` | revoker is original issuer or admin |
+| `register_patient` | `patient` | idempotent (re-registration is a no-op) |
+
+### 4.2 Error codes (stable contract surface)
+
+Contract errors are returned as `Result<_, ContractError>`. The numeric discriminants
+below are part of the public ABI and **must not be renumbered**; new variants are
+appended only. The backend maps each variant to a stable HTTP response (see
+`backend/` mapping tests).
+
+| Variant | Code | Meaning | Backend mapping |
+|---|---|---|---|
+| `AlreadyInitialized` | 1 | `initialize` called twice | `409 Conflict` |
+| `NotInitialized` | 2 | Admin action before `initialize` | `503 Service Unavailable` |
+| `Unauthorized` | 3 | Caller is not admin / not issuer | `403 Forbidden` |
+| `IssuerNotAuthorized` | 4 | Issuer missing or revoked | `403 Forbidden` |
+| `PatientNotRegistered` | 5 | Patient not on allowlist | `422 Unprocessable Entity` |
+| `DuplicateRecord` | 6 | Same vaccine + date already minted | `409 Conflict` |
+| `RecordLimitExceeded` | 7 | Per-patient limit (50) reached | `422 Unprocessable Entity` |
+| `TokenNotFound` | 8 | Unknown `token_id` | `404 Not Found` |
+| `SoulboundToken` | 9 | `transfer` attempted | `400 Bad Request` |
+| `BatchTooLarge` | 10 | `batch_verify` over 100 wallets | `400 Bad Request` |
+| `AdminTransferExpired` | 11 | `accept_admin` after expiry | `410 Gone` |
+| `InvalidInput` | 12 | Empty/oversized string argument | `400 Bad Request` |
+
+> Codes are illustrative of the intended stable mapping; the authoritative source is
+> the `ContractError` enum in `src/lib.rs`. Backend mapping tests
+> (`backend/tests/contract_error_mapping.*`) assert one-to-one coverage of every variant.
+
+### 4.3 Version-specific behavior
+
+- `VaccinationRecord.schema_version` is currently always `1`. Readers must treat
+  unknown `schema_version` values as forward-compatible: parse known fields, ignore
+  unknown ones, and never reject a record solely on version.
+- `verify_vaccination` returns only non-revoked records; revoked records remain
+  retrievable via `Token(token_id)` for audit but are excluded from verification.
+- Function argument evolution: new optional arguments are added as new functions
+  (e.g. `mint_vaccination_v2`) rather than changing existing signatures, so existing
+  callers keep working. Deprecations are announced one release ahead.
+
 ---
 
 ## 5. Data Model
@@ -275,6 +330,40 @@ named address has signed the invocation. There is no off-chain bypass.
 | Record reassignment via `mint_vaccination` | No | `PatientTokens` is append-only per patient; records are never moved |
 | `revoke_vaccination` | N/A | Marks `revoked = true`; record and ownership are never deleted or reassigned |
 | Direct storage write | No | No public function mutates `Token`/`PatientTokens` ownership |
+
+---
+
+## 6.1 Consent and allowlist semantics (contract/API boundary)
+
+The allowlist is a **consent gate**, not a privacy mechanism. It records that a patient
+has authorized their wallet to receive records; it does **not** make on-chain data private.
+
+### State transitions
+
+| State | Trigger | Contract effect | API behavior |
+|---|---|---|---|
+| **Absent** | Patient never registered | `PatientAllowlist(addr)` unset; `is_patient_registered` → `false` | `mint_vaccination` → `PatientNotRegistered` (422); API returns `consent: "absent"` |
+| **Granted** | `register_patient(patient)` signed by patient | `PatientAllowlist(addr) = true`; emits `pat_reg` | API returns `consent: "granted"`; issuance permitted |
+| **Revoked** | No on-chain revoke exists in v0.1.0; consent withdrawal is handled off-chain by the API refusing to submit mints | Allowlist entry remains `true` on-chain | API returns `consent: "revoked"` and rejects issuance before it reaches the contract |
+| **Changed** | Patient rotates wallet: register new wallet, API stops minting to old | New wallet `true`; old wallet retains historical records | API returns `consent: "changed"` with both wallet references |
+
+> **Important:** Because there is no on-chain consent revocation in v0.1.0, a revoked
+> consent is enforced at the API boundary only. Auditors should note this gap; an
+> on-chain `revoke_patient` is planned (see pre-audit notes).
+
+### Privacy boundary
+
+- **Public on-chain:** wallet addresses, vaccine names, dates, issuer addresses,
+  timestamps, revocation flags. Anyone can read these via `verify_vaccination`.
+- **Never on-chain:** patient names, dates of birth, government IDs, contact details,
+  or any PII. The contract stores only the fields in `VaccinationRecord`.
+- **Public verification** (`verify_vaccination`, `batch_verify`) returns only the
+  fields above and never reveals prohibited PII — there is none to reveal. Tests
+  (`src/verify.rs` and backend verification tests) assert the returned struct contains
+  no PII fields.
+- **Unauthorized issuance** is rejected: `mint_vaccination` requires a valid issuer
+  signature and an allowlisted patient, returning `IssuerNotAuthorized` or
+  `PatientNotRegistered` otherwise.
 
 ---
 

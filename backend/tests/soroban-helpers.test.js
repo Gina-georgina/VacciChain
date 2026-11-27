@@ -13,6 +13,8 @@ const {
   StellarRetryExhaustedError,
 } = require('../src/stellar/client');
 
+const contractErrors = require('../src/stellar/contractErrors');
+
 describe('Soroban Error Classes', () => {
   describe('SorobanError', () => {
     it('is an Error subclass with proper name', () => {

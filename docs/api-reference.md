@@ -237,6 +237,58 @@ Errors:
 
 > **Rule:** An RPC or contract failure MUST NOT be collapsed into a positive verification result. When data cannot be retrieved, the endpoint returns `status: "unavailable"` with `verified: false`; it never returns `verified: true` for missing, revoked, or unavailable data. This endpoint reports record state only and is not a medical determination.
 
+Public verification never returns prohibited fields. The following are omitted from
+`/verify/:wallet` responses regardless of consent state:
+- `metadata` (free-form issuer metadata, e.g. lot numbers)
+- `batch`
+- `patient_wallet` linkage beyond the queried wallet itself
+- any internal `contract_tx` or storage keys
+
+Only `vaccine`, `date`, and `issuer` are exposed per record. Public-chain data is
+not private; this endpoint only limits what the API surfaces.
+
+---
+
+## Consent & Allowlist Semantics
+
+Issuance requires the patient wallet to be allowlisted and consent to be granted.
+Consent state transitions and API behavior:
+
+| Consent state | Issuance (`POST /vaccination/issue`) | Verification (`GET /verify/:wallet`) |
+|---------------|--------------------------------------|--------------------------------------|
+| Absent        | 422 `CONSENT_ABSENT`                 | Records hidden; `verified: false`    |
+| Granted       | 201 (allowed)                        | Records returned (public fields only)|
+| Revoked       | 422 `CONSENT_REVOKED`                | Records hidden; `verified: false`    |
+| Changed       | 422 `CONSENT_CHANGED` (re-consent required) | Reflects latest granted scope |
+
+An unauthorized issuance (issuer not allowlisted or consent not granted) is
+rejected before any contract call is made.
+
+---
+
+## Contract Function & Error-Code Compatibility
+
+Contract function arguments and error codes are versioned for stable caller semantics.
+
+- Public contract methods: `issue`, `revoke`, `verify`, `get_record`.
+- Authorization: only allowlisted issuers may call `issue`/`revoke`; `verify`/`get_record` are read-only.
+- Error codes are stable; new codes may be added but existing codes never change meaning.
+
+Backend maps contract errors to stable API responses:
+
+| Contract error | HTTP status | API error code        |
+|----------------|-------------|-----------------------|
+| `Unauthorized` | 403         | `ISSUER_UNAUTHORIZED` |
+| `Duplicate`    | 409         | `DUPLICATE_RECORD`    |
+| `ConsentAbsent`| 422         | `CONSENT_ABSENT`      |
+| `ConsentRevoked`| 422        | `CONSENT_REVOKED`     |
+| `ConsentChanged`| 422        | `CONSENT_CHANGED`     |
+| `InvalidArgs`  | 400         | `VALIDATION_ERROR`    |
+| `NotFound`     | 404         | `NOT_FOUND`           |
+
+Version-specific behavior is documented alongside each contract release; callers
+should rely on the API error codes above rather than raw contract error strings.
+
 ---
 
 ## Analytics (Python service)

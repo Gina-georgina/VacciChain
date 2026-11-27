@@ -70,11 +70,17 @@ pub(crate) fn require_supported_schema(env: &Env) -> Result<(), ContractError> {
 
 /// Contract errors.
 ///
+/// These numeric codes are part of the public contract ABI and are **stable**:
+/// existing codes MUST NOT be renumbered or reused. New error conditions are
+/// appended with the next unused code. Backend/API layers map these codes to
+/// stable API responses (see the backend mapping tests), so callers can rely on
+/// the code → meaning mapping across contract upgrades.
+///
 /// | Code | Name                         | Description                                      |
 /// |------|------------------------------|--------------------------------------------------|
 /// | 1    | AlreadyInitialized           | Contract has already been initialized            |
 /// | 2    | NotInitialized               | Contract has not been initialized                |
-/// | 3    | Unauthorized                 | Caller is not an authorized issuer               |
+/// | 3    | Unauthorized                 | Caller is not an authorized issuer / revoker     |
 /// | 4    | ProposalExpired              | Admin transfer proposal has expired              |
 /// | 5    | NoPendingTransfer            | No pending admin transfer exists                 |
 /// | 6    | DuplicateRecord              | Identical vaccination record already exists      |
@@ -427,17 +433,36 @@ impl VacciChainContract {
         Ok(())
     }
 
-    /// Register a patient wallet into the allowlist.
+    /// Register a patient wallet into the allowlist (explicit consent).
     ///
-    /// Patients must self-register before an issuer can mint vaccination records to their wallet.
-    /// This is a security measure to prevent unsolicited minting.
+    /// This is the patient's explicit consent step: a patient must self-register
+    /// before an issuer can mint vaccination records to their wallet. It is a
+    /// security measure to prevent unsolicited minting.
+    ///
+    /// # Consent / allowlist semantics
+    /// * **Absent** — the patient has never registered. `is_patient_registered`
+    ///   returns `false` and `mint_vaccination` fails with `PatientNotRegistered`.
+    /// * **Granted** — the patient has registered. `is_patient_registered` returns
+    ///   `true` and issuers may mint to the wallet.
+    /// * **Revoked** — there is no on-chain revoke entry point in this version;
+    ///   consent, once granted, persists. (A future version may add revocation.)
+    /// * **Changed** — re-registering an already-registered patient is idempotent:
+    ///   it succeeds and re-emits `PatientRegistered`; the allowlist state is
+    ///   unchanged (`true`).
+    ///
+    /// Registration only gates *issuance*. It does not make any data private:
+    /// verification (`verify_vaccination`, `batch_verify`) is public and returns
+    /// only the non-sensitive record fields defined by `VaccinationRecord`.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `patient` - The wallet address to register
     ///
     /// # Returns
-    /// * `Ok(())` on successful registration
+    /// * `Ok(())` on successful registration (including idempotent re-registration)
+    ///
+    /// # Errors
+    /// * `ContractPaused` - Contract is paused
     ///
     /// # Authorization
     /// Requires the patient address to authorize the transaction via SEP-10 JWT.
@@ -455,15 +480,15 @@ impl VacciChainContract {
         Ok(())
     }
 
-    /// Check whether a wallet has self-registered.
+    /// Check whether a wallet has self-registered (granted consent).
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `patient` - The wallet address to check
     ///
     /// # Returns
-    /// * `true` if the patient is registered
-    /// * `false` if the patient is not registered
+    /// * `true` if the patient is registered (consent granted)
+    /// * `false` if the patient is not registered (consent absent)
     ///
     /// # Authorization
     /// This is a public read-only function; no authorization required.
@@ -490,14 +515,20 @@ impl VacciChainContract {
     /// * `Ok(token_id)` - The deterministic token ID of the minted NFT
     ///
     /// # Errors
+    /// * `ContractPaused` - Contract is paused
     /// * `Unauthorized` - Caller is not an authorized issuer
-    /// * `PatientNotRegistered` - Patient has not self-registered
+    /// * `PatientNotRegistered` - Patient has not self-registered (consent absent);
+    ///   issuance is rejected until the patient calls `register_patient`
     /// * `DuplicateRecord` - An identical record already exists for this patient
     /// * `InvalidInputVaccineName` - `vaccine_name` exceeds 100 characters
     /// * `InvalidInputDateAdministered` - `date_administered` exceeds 100 characters
     ///
     /// # Authorization
     /// Requires the issuer address to authorize the transaction.
+    ///
+    /// # Consent / allowlist
+    /// Issuance requires the patient to have granted consent via
+    /// `register_patient`; otherwise `PatientNotRegistered` is returned.
     ///
     /// # Events
     /// Emits `VaccinationMinted` event on success.
@@ -652,6 +683,12 @@ impl VacciChainContract {
     ///
     /// # Authorization
     /// This is a public read-only function; no authorization required.
+    ///
+    /// # Privacy
+    /// Verification is public and does not require consent. It returns only the
+    /// non-sensitive fields of `VaccinationRecord`; no prohibited/private fields
+    /// are exposed. Public-chain data is not private — allowlisting gates
+    /// issuance, not verification.
     pub fn verify_vaccination(env: Env, wallet: Address) -> (bool, Vec<VaccinationRecord>, Vec<DoseStatus>) {
         verify::verify_vaccination(&env, wallet)
     }

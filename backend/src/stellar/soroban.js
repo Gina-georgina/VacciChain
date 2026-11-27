@@ -54,6 +54,8 @@ async function callRead(fn, context) {
  * @param {StellarSdk.xdr.ScVal[]} args - Method arguments
  */
 async function invokeContract(secretKey, method, args) {
+  // Guard against invoking against the wrong network or contract.
+  validateDeploymentConfig();
   const rpc = getRpcServer();
   const keypair = StellarSdk.Keypair.fromSecret(secretKey);
   const account = await callRead(() => rpc.getAccount(keypair.publicKey()), 'getAccount');
@@ -223,6 +225,8 @@ async function verifyVaccination(wallet) {
  * Read-only contract call (no signing needed).
  */
 async function simulateContract(method, args) {
+  // Guard against simulating against the wrong network or contract.
+  validateDeploymentConfig();
   const rpc = getRpcServer();
   const contract = new StellarSdk.Contract(CONTRACT_ID);
 

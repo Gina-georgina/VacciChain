@@ -169,7 +169,7 @@ function adaptiveLimiter(req, res, next) {
  *         description: Number of records to skip before returning results.
  *     responses:
  *       200:
- *         description: Vaccination status retrieved
+ *         description: Vaccination status retrieved (redacted public projection)
  *         content:
  *           application/json:
  *             schema:
@@ -191,6 +191,7 @@ function adaptiveLimiter(req, res, next) {
  *                     negative (or positive) medical determination.
  *                 records:
  *                   type: array
+ *                   description: Redacted record summaries (no prohibited fields)
  *                   items:
  *                     $ref: '#/components/schemas/VaccinationRecord'
  *                 meta:
@@ -513,6 +514,8 @@ router.get(
 );
 
 router.verifyCache = verifyCache;
+router.toPublicRecord = toPublicRecord;
+router.toPublicRecords = toPublicRecords;
 router.VERIFY_STATUS = VERIFY_STATUS;
 router.MAX_RECORDS_LIMIT = MAX_RECORDS_LIMIT;
 router.DEFAULT_RECORDS_LIMIT = DEFAULT_RECORDS_LIMIT;

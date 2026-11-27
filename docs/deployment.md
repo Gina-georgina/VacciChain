@@ -98,7 +98,9 @@ The compiled WASM artifact is written to:
 
 ### 3.2 Deploy to Mainnet
 
-The `Makefile` targets `testnet` by default. For mainnet, pass the network flags explicitly:
+The `Makefile` targets `testnet` by default. For mainnet, pass the network flags explicitly.
+
+> **The deployment command requires an explicit network.** Deployments without an explicit `--network` (and the matching `--network-passphrase` / `--rpc-url`) are rejected by the deployment tooling — there is no implicit default. This prevents accidentally deploying to the wrong Stellar network.
 
 ```bash
 cd contracts
@@ -112,6 +114,25 @@ stellar contract deploy \
 ```
 
 The command prints the contract ID (a 56-character address starting with `C`). **Record this value** — it becomes `VACCINATIONS_CONTRACT_ID`.
+
+#### Network-specific configuration validation
+
+Before any deploy or invoke, the tooling validates that the network name, passphrase, RPC URL, and Horizon URL are a consistent set for the selected network. A mismatch (for example `--network mainnet` combined with the testnet passphrase or a testnet RPC URL) aborts the command before a transaction is submitted.
+
+| Network | `STELLAR_NETWORK` | `STELLAR_NETWORK_PASSPHRASE` | `SOROBAN_RPC_URL` | `HORIZON_URL` |
+|---|---|---|---|---|
+| `mainnet` | `mainnet` | `Public Global Stellar Network ; September 2015` | `https://mainnet.sorobanrpc.com` | `https://horizon.stellar.org` |
+| `testnet` | `testnet` | `Test SDF Network ; September 2015` | `https://soroban-testnet.stellar.org` | `https://horizon-testnet.stellar.org` |
+
+The same validation runs at backend startup: if `STELLAR_NETWORK` does not match `STELLAR_NETWORK_PASSPHRASE` and the configured RPC/Horizon URLs, the service refuses to start. See [Section 5](#5-environment-variable-configuration) for the production values.
+
+#### Record the artifact hash
+
+Compute and record the SHA-256 hash of the WASM artifact you are about to deploy. You will need it for the post-deploy smoke test in [Section 9.7](#97-contract-id-and-artifact-hash-smoke-test):
+
+```bash
+sha256sum target/wasm32-unknown-unknown/release/vaccichain.wasm
+```
 
 ### 3.3 Initialize the Contract
 
@@ -963,12 +984,14 @@ aws ecs update-service \
 The Soroban contract supports upgrades via the `upgrade` function (admin-only). To revert:
 
 1. Build the previous WASM from the prior Git tag
-2. Upload the WASM to Stellar:
+2. Upload the WASM to Stellar (the network must be passed explicitly):
    ```bash
    stellar contract install \
      --wasm target/wasm32-unknown-unknown/release/vaccichain.wasm \
      --source <ADMIN_SECRET_KEY> \
-     --network mainnet
+     --network mainnet \
+     --network-passphrase "Public Global Stellar Network ; September 2015" \
+     --rpc-url https://mainnet.sorobanrpc.com
    ```
 3. Call `upgrade` with the previous WASM hash:
    ```bash
@@ -976,9 +999,12 @@ The Soroban contract supports upgrades via the `upgrade` function (admin-only). 
      --id <CONTRACT_ID> \
      --source <ADMIN_SECRET_KEY> \
      --network mainnet \
+     --network-passphrase "Public Global Stellar Network ; September 2015" \
+     --rpc-url https://mainnet.sorobanrpc.com \
      -- upgrade \
      --new_wasm_hash <PREVIOUS_WASM_HASH>
    ```
+4. Re-run the [contract ID and artifact hash smoke test](#97-contract-id-and-artifact-hash-smoke-test) to confirm the rollback landed on the expected network with the expected artifact.
 
 See [`docs/contract-upgrade.md`](./contract-upgrade.md) for the full upgrade and rollback process.
 

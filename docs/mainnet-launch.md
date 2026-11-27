@@ -55,17 +55,18 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 | Item | Owner | Status | Notes |
 |------|-------|--------|-------|
 | Create mainnet `.env` file | DevOps | ⬜ | Use mainnet Horizon and Soroban RPC URLs |
-| Set `STELLAR_NETWORK=mainnet` | DevOps | ⬜ | Verify network passphrase matches Stellar mainnet |
+| Set `STELLAR_NETWORK=mainnet` | DevOps | ⬜ | Explicit network selection is **required**; deployment tooling must reject missing or ambiguous network values |
 | Set `HORIZON_URL` to mainnet endpoint | DevOps | ⬜ | Use official Stellar Horizon: https://horizon.stellar.org |
 | Set `SOROBAN_RPC_URL` to mainnet endpoint | DevOps | ⬜ | Use official Soroban RPC endpoint |
 | Set `STELLAR_NETWORK_PASSPHRASE` | DevOps | ⬜ | Must be: `Public Global Stellar Network ; September 2015` |
+| Validate network-specific configuration | DevOps | ⬜ | Run the deployment tooling's network validation; it must confirm Horizon URL, Soroban RPC URL, and network passphrase all match the selected network |
 | Set admin and issuer keys in `.env` | DevOps | ⬜ | Use keys from key ceremony |
 | Set JWT_SECRET to strong random value | DevOps | ⬜ | Min 32 characters; rotate before launch |
 | Configure rate limits for production | DevOps | ⬜ | Adjust based on expected traffic |
 | Set up audit logging | DevOps | ⬜ | Configure `AUDIT_LOG_PATH` to persistent storage |
 | Verify all required env vars are set | DevOps | ⬜ | Run backend startup check |
 
-**Go/No-Go Criteria**: All environment variables configured; backend starts without errors.
+**Go/No-Go Criteria**: Network explicitly selected; network-specific configuration validated (Horizon URL, Soroban RPC URL, and passphrase all match the selected network); all environment variables configured; backend starts without errors.
 
 ---
 
@@ -75,9 +76,11 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 
 | Item | Owner | Status | Notes |
 |------|-------|--------|-------|
-| Deploy contract to mainnet | Dev Lead | ⬜ | Use `make deploy` with mainnet config |
+| Deploy contract to mainnet | Dev Lead | ⬜ | Use `make deploy` with an **explicit** network argument (e.g., `NETWORK=mainnet`); deployment must fail if the network is omitted |
+| Confirm deployment tooling validated network config | Dev Lead | ⬜ | Tooling must verify Horizon URL, Soroban RPC URL, and passphrase match the selected network before submitting |
 | Record contract ID | Dev Lead | ⬜ | Store in version control and `.env` |
 | Record deployment transaction hash | Dev Lead | ⬜ | Store in the verification package (see below) |
+| Record deployed artifact hash | Dev Lead | ⬜ | Capture the WASM hash of the deployed artifact for later verification |
 | Record reproducible WASM hash | Dev Lead | ⬜ | Rebuild from the tagged commit; hashes must match |
 | Verify contract on Stellar Expert | Dev Lead | ⬜ | Check https://stellar.expert/explorer/public |
 | Test contract functions on mainnet | QA Lead | ⬜ | Call mint, verify, revoke with test data |
@@ -87,7 +90,7 @@ This document provides a comprehensive checklist for graduating VacciChain from 
 | Publish contract verification package | Dev Lead | ⬜ | See [Contract Verification Package](#contract-verification-package) |
 | Independent reviewer executes verification instructions | Independent Reviewer | ⬜ | Reviewer must not be the deployer; record sign-off below |
 
-**Go/No-Go Criteria**: Contract deployed; all functions callable; issuer allowlist configured; verification package published and independently verified.
+**Go/No-Go Criteria**: Network explicitly specified and validated; contract deployed; all functions callable; issuer allowlist configured; verification package published and independently verified.
 
 ---
 
@@ -167,12 +170,14 @@ The release package must be published alongside the deployment and contain:
 | End-to-end issuer flow | QA Lead | ⬜ | Issue vaccination → verify on-chain |
 | End-to-end verifier flow | QA Lead | ⬜ | Verify wallet status via public endpoint |
 | Test with real mainnet wallet | QA Lead | ⬜ | Use funded testnet wallet (if available) |
+| Contract-ID/network smoke test | QA Lead | ⬜ | Confirm the deployed contract ID exists on the expected network (query Horizon/Soroban RPC for the selected network) |
+| Contract-ID/artifact-hash smoke test | QA Lead | ⬜ | Confirm the on-chain WASM hash for the contract ID matches the recorded deployed artifact hash |
 | Verify audit logs are being written | QA Lead | ⬜ | Check audit log file for entries |
 | Test rate limiting | QA Lead | ⬜ | Verify rate limits are enforced |
 | Test error handling | QA Lead | ⬜ | Trigger errors; verify graceful responses |
 | Load test (optional) | QA Lead | ⬜ | Simulate expected traffic volume |
 
-**Go/No-Go Criteria**: All smoke tests pass; no critical errors; performance acceptable.
+**Go/No-Go Criteria**: All smoke tests pass, including confirmation that the deployed contract ID belongs to the expected network and its artifact hash matches the recorded deployment; no critical errors; performance acceptable.
 
 ---
 

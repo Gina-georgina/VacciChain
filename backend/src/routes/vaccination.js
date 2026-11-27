@@ -29,6 +29,46 @@ const batchVerifyLimiter = createRateLimiter({
 });
 
 /**
+ * Stable API error codes returned by the vaccination routes.
+ *
+ * These codes are part of the public API contract: callers may rely on them
+ * remaining stable even as contract error variants or function arguments
+ * evolve. Human-readable `error` messages may change; `code` values must not.
+ *
+ * - CONSENT_REQUIRED      Patient has not granted consent (403)
+ * - PATIENT_NOT_ALLOWLISTED Patient is not on the issuer allowlist (403)
+ * - DUPLICATE_RECORD      Contract rejected a duplicate record (409)
+ * - CONTRACT_ERROR        Unmapped contract failure (500)
+ * - RPC_TIMEOUT           Soroban RPC timed out (504)
+ */
+const ERROR_CODES = Object.freeze({
+  CONSENT_REQUIRED: 'CONSENT_REQUIRED',
+  PATIENT_NOT_ALLOWLISTED: 'PATIENT_NOT_ALLOWLISTED',
+  DUPLICATE_RECORD: 'DUPLICATE_RECORD',
+  CONTRACT_ERROR: 'CONTRACT_ERROR',
+  RPC_TIMEOUT: 'RPC_TIMEOUT',
+});
+
+/**
+ * Map a contract error to a stable HTTP status + API error code.
+ * Falls back to a generic 500/CONTRACT_ERROR for unknown variants so that
+ * new contract errors never leak internals or change existing status codes.
+ */
+function toStableErrorResponse(err) {
+  const mapped = mapContractError(err);
+  const message = resolveContractErrorMessage(err);
+  switch (mapped?.name) {
+    case 'DuplicateRecord':
+      return { status: 409, body: { error: message, code: ERROR_CODES.DUPLICATE_RECORD } };
+    case 'Unauthorized':
+    case 'NotIssuer':
+      return { status: 403, body: { error: message, code: ERROR_CODES.CONTRACT_ERROR } };
+    default:
+      return { status: 500, body: { error: message, code: ERROR_CODES.CONTRACT_ERROR } };
+  }
+}
+
+/**
  * @swagger
  * /vaccination/issue:
  *   post:
@@ -97,9 +137,38 @@ router.post(
   async (req, res) => {
   const { patient_address, vaccine_name, date_administered, dose_number, dose_series } = req.body;
 
-  // Enforce patient consent unless jurisdiction config waives it
+  // Enforce patient allowlisting before any issuance is attempted.
+  // Allowlisting is a prerequisite for consent: a patient who is not
+  // allowlisted cannot be issued a record regardless of consent state.
+  if (!isAllowlisted(patient_address)) {
+    audit({
+      actor: req.user.publicKey,
+      action: 'vaccination.issue',
+      target: patient_address,
+      result: 'failure',
+      meta: { error: 'patient_not_allowlisted' },
+    });
+    return res.status(403).json({
+      error: 'Patient is not allowlisted for issuance.',
+      code: ERROR_CODES.PATIENT_NOT_ALLOWLISTED,
+    });
+  }
+
+  // Enforce patient consent unless jurisdiction config waives it.
+  // Consent states: absent -> rejected here; granted -> proceeds;
+  // revoked/changed -> hasConsented returns false and issuance is rejected.
   if (process.env.REQUIRE_PATIENT_CONSENT !== 'false' && !hasConsented(patient_address)) {
-    return res.status(403).json({ error: 'Patient has not provided consent. They must consent before a record can be issued.' });
+    audit({
+      actor: req.user.publicKey,
+      action: 'vaccination.issue',
+      target: patient_address,
+      result: 'failure',
+      meta: { error: 'consent_required' },
+    });
+    return res.status(403).json({
+      error: 'Patient has not provided consent. They must consent before a record can be issued.',
+      code: ERROR_CODES.CONSENT_REQUIRED,
+    });
   }
 
   try {
@@ -137,11 +206,8 @@ router.post(
       result: 'failure',
       meta: { error: errorMessage },
     });
-    const mapped = mapContractError(err);
-    if (mapped?.name === 'DuplicateRecord') {
-      return res.status(409).json({ error: errorMessage });
-    }
-    res.status(500).json({ error: errorMessage });
+    const { status, body } = toStableErrorResponse(err);
+    res.status(status).json(body);
   }
 });
 
@@ -225,7 +291,8 @@ router.post(
         result: 'failure',
         meta: { token_id, error: errorMessage },
       });
-      res.status(500).json({ error: errorMessage });
+      const { status, body } = toStableErrorResponse(err);
+      res.status(status).json(body);
     }
   }
 );
@@ -431,3 +498,5 @@ router.get(
 );
 
 module.exports = router;
+module.exports.ERROR_CODES = ERROR_CODES;
+module.exports.toStableErrorResponse = toStableErrorResponse;
