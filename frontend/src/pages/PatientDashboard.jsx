@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../hooks/useFreighter';
 import { useVaccination } from '../hooks/useVaccination';
@@ -21,14 +21,34 @@ const styles = {
 
 export default function PatientDashboard() {
   const { t } = useTranslation();
-  const { publicKey, connect, disconnect, isNetworkMismatch } = useAuth();
-  const { records, loading, error, refetch } = useVaccination(publicKey);
+  const { publicKey, connect, disconnect } = useAuth();
+  const { records, loading, error, refetch, page = 1, totalPages = 1, total = records.length, setPage } = useVaccination(publicKey);
   const { consented, giveConsent, loading: consentLoading } = useConsent();
   const [qrRecord, setQrRecord] = useState(null);
 
-  useDocumentTitle('My Vaccination Records — VacciChain');
+  // Clear wallet-specific UI state whenever the active account changes or the
+  // wallet disconnects, so the prior account's data is never shown.
+  useEffect(() => {
+    setQrRecord(null);
+  }, [publicKey]);
 
-  const handleDeclineConsent = () => disconnect();
+  const handleDeclineConsent = () => {
+    setQrRecord(null);
+    disconnect();
+  };
+
+  const handleRetry = () => {
+    // Retry only refetches data; safe form state (e.g. open QR modal) is kept.
+    refetch();
+  };
+
+  // Treat a pending request as loading even if stale records exist, so a
+  // stalled request is never mistaken for empty data.
+  const isInitialLoading = loading && records.length === 0;
+  const isRefreshing = loading && records.length > 0;
+  const hasError = !loading && Boolean(error);
+  const isEmpty = !loading && !error && records.length === 0;
+  const isPartial = !loading && !error && records.length > 0;
 
   if (!publicKey) {
     return (
@@ -58,9 +78,9 @@ export default function PatientDashboard() {
           <h2 style={{ color: '#e2e8f0', margin: 0 }}>{t('patient.title')}</h2>
           <RoleBadge role="patient" />
         </div>
-        {records.length > 0 && (
+        {total > 0 && (
           <span style={{ color: '#64748b', fontSize: '0.85rem' }}>
-            {t('patient.recordCount', { count: records.length })}
+            {t('patient.recordCount', { count: total })}
           </span>
         )}
       </div>
@@ -69,29 +89,39 @@ export default function PatientDashboard() {
         <CopyButton text={publicKey} label="wallet address" />
       </p>
 
-      {isNetworkMismatch && (
-        <div role="alert" style={{ background: '#7f1d1d', color: '#fecaca', padding: '0.75rem 1rem', borderRadius: 8, marginBottom: '1.5rem' }}>
-          ⚠️ Your wallet is connected to a different Stellar network than this app. Signing is disabled until you switch networks in Freighter.
+      {isInitialLoading && (
+        <div role="status" aria-live="polite" aria-busy="true">
+          <span style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>
+            Loading records…
+          </span>
+          <NFTCardSkeleton count={3} />
         </div>
       )}
 
-      {loading && <NFTCardSkeleton count={3} />}
-      {!loading && error && (
-        <div style={{ textAlign: 'center', padding: '2rem 0' }}>
+      {hasError && (
+        <div role="alert" style={{ textAlign: 'center', padding: '2rem 0' }}>
           <p style={{ color: '#f87171', marginBottom: '0.75rem' }}>⚠️ {error}</p>
-          <button style={styles.btn} onClick={refetch}>Retry</button>
+          <button style={styles.btn} onClick={handleRetry}>Retry</button>
         </div>
       )}
-      {!loading && !error && records.length === 0 && <EmptyState />}
 
-      {records.map((r) => (
+      {!loading && !error && records.map((r) => (
         <NFTCard
           key={r.token_id}
           record={r}
+          patientWallet={publicKey}
           onShowQR={setQrRecord}
           disabled={isNetworkMismatch}
         />
       ))}
+
+      {total > 0 && totalPages > 1 && (
+        <nav aria-label="Vaccination records pagination" style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem' }}>
+          <button style={styles.btn} onClick={() => setPage(page - 1)} disabled={loading || page <= 1}>Previous</button>
+          <span aria-live="polite" style={{ color: '#94a3b8' }}>Page {page} of {totalPages}</span>
+          <button style={styles.btn} onClick={() => setPage(page + 1)} disabled={loading || page >= totalPages}>Next</button>
+        </nav>
+      )}
 
       {qrRecord && (
         <QRCodeModal

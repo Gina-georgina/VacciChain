@@ -1,14 +1,5 @@
-import { useRef, useEffect } from 'react';
-import { useAnnounce } from '../hooks/useAnnounce';
+import AccessibleDialog from './AccessibleDialog';
 
-const overlay = {
-  position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
-  display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
-};
-const box = {
-  background: '#1e293b', border: '1px solid #334155', borderRadius: 12,
-  padding: '1.5rem', maxWidth: 420, width: '90%', color: '#e2e8f0',
-};
 const row = { display: 'flex', justifyContent: 'space-between', margin: '0.4rem 0', fontSize: '0.9rem' };
 const btnRow = { display: 'flex', gap: '0.75rem', marginTop: '1.5rem' };
 const btnConfirm = { flex: 1, padding: '0.7rem', background: '#0ea5e9', color: '#fff', border: 'none', borderRadius: 8, fontSize: '1rem', cursor: 'pointer' };
@@ -22,11 +13,21 @@ function getFocusableElements(root) {
   return Array.from(root.querySelectorAll(selectors)).filter((el) => el.offsetParent !== null);
 }
 
-export default function ConfirmMintDialog({ record, onConfirm, onCancel, networkMismatch = false, configuredNetwork, walletNetwork }) {
+export default function ConfirmMintDialog({ record, onConfirm, onCancel, isSubmitting = false }) {
   const overlayRef = useRef(null);
   const boxRef = useRef(null);
   const previousActive = useRef(null);
-  const announce = useAnnounce();
+  const submittingRef = useRef(isSubmitting);
+
+  useEffect(() => {
+    submittingRef.current = isSubmitting;
+  }, [isSubmitting]);
+
+  const handleConfirm = () => {
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    onConfirm();
+  };
 
   useEffect(() => {
     previousActive.current = document.activeElement;
@@ -98,17 +99,17 @@ export default function ConfirmMintDialog({ record, onConfirm, onCancel, network
           </div>
         )}
         <div style={btnRow}>
-          <button style={btnCancel} onClick={onCancel}>Cancel</button>
+          <button style={btnCancel} onClick={onCancel} disabled={isSubmitting}>Cancel</button>
           <button
-            style={networkMismatch ? btnConfirmDisabled : btnConfirm}
+            style={{ ...btnConfirm, opacity: isSubmitting ? 0.6 : 1, cursor: isSubmitting ? 'not-allowed' : 'pointer' }}
             onClick={handleConfirm}
-            disabled={networkMismatch}
-            aria-describedby={networkMismatch ? 'network-mismatch-msg' : undefined}
+            disabled={isSubmitting}
+            aria-busy={isSubmitting}
           >
-            Confirm &amp; Mint
+            {isSubmitting ? 'Minting…' : 'Confirm & Mint'}
           </button>
         </div>
       </div>
-    </div>
+    </AccessibleDialog>
   );
 }

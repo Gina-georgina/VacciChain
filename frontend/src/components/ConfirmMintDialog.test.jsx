@@ -1,4 +1,5 @@
 import { render, screen, fireEvent } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import ConfirmMintDialog from './ConfirmMintDialog';
 
 describe('ConfirmMintDialog', () => {
@@ -80,89 +81,49 @@ describe('ConfirmMintDialog', () => {
     expect(preventDefault).not.toHaveBeenCalled(); // Enter is allowed to propagate
   });
 
-  it('disables confirm and blocks submission when wallet network mismatches', () => {
+  it('disables confirm button and does not call onConfirm when isSubmitting is true', () => {
     render(
       <ConfirmMintDialog
         record={mockRecord}
         onConfirm={mockOnConfirm}
         onCancel={mockOnCancel}
-        networkMismatch
-        configuredNetwork="TESTNET"
-        walletNetwork="PUBLIC"
+        isSubmitting={true}
       />
     );
-
     const confirmButton = screen.getByRole('button', { name: /Confirm & Mint/i });
     expect(confirmButton).toBeDisabled();
-
     fireEvent.click(confirmButton);
     expect(mockOnConfirm).not.toHaveBeenCalled();
-
-    expect(screen.getByRole('alert')).toHaveTextContent(/network mismatch/i);
-    expect(screen.getByText(/TESTNET/i)).toBeInTheDocument();
-    expect(screen.getByText(/PUBLIC/i)).toBeInTheDocument();
-    expect(screen.getByText(/switch your wallet/i)).toBeInTheDocument();
   });
 
-  it('announces the mint result through a live region', () => {
-    const { rerender } = render(
-      <ConfirmMintDialog record={mockRecord} onConfirm={mockOnConfirm} onCancel={mockOnCancel} />
-    );
-
-    const liveRegion = screen.getByRole('status');
-    expect(liveRegion).toHaveAttribute('aria-live', 'polite');
-    expect(liveRegion).toHaveTextContent('');
-
-    rerender(
-      <ConfirmMintDialog
-        record={mockRecord}
-        onConfirm={mockOnConfirm}
-        onCancel={mockOnCancel}
-        mintResult={{ status: 'success', message: 'Vaccination minted successfully.' }}
-      />
-    );
-
-    expect(screen.getByRole('status')).toHaveTextContent(/minted successfully/i);
-  });
-
-  it('announces mint errors through an assertive live region', () => {
+  it('keeps confirm button enabled and calls onConfirm once when isSubmitting is false', () => {
     render(
       <ConfirmMintDialog
         record={mockRecord}
         onConfirm={mockOnConfirm}
         onCancel={mockOnCancel}
-        mintResult={{ status: 'error', message: 'Mint failed. Please try again.' }}
+        isSubmitting={false}
       />
     );
-
-    const alertRegion = screen.getByRole('alert');
-    expect(alertRegion).toHaveAttribute('aria-live', 'assertive');
-    expect(alertRegion).toHaveTextContent(/mint failed/i);
+    const confirmButton = screen.getByRole('button', { name: /Confirm & Mint/i });
+    expect(confirmButton).not.toBeDisabled();
+    fireEvent.click(confirmButton);
+    expect(mockOnConfirm).toHaveBeenCalledTimes(1);
   });
 
-  it('does not duplicate announcements when the same result is re-rendered', () => {
-    const mintResult = { status: 'success', message: 'Vaccination minted successfully.' };
-    const { rerender } = render(
+  it('only triggers onConfirm once when confirm is clicked multiple times rapidly', () => {
+    render(
       <ConfirmMintDialog
         record={mockRecord}
         onConfirm={mockOnConfirm}
         onCancel={mockOnCancel}
-        mintResult={mintResult}
+        isSubmitting={false}
       />
     );
-
-    const firstAnnouncement = screen.getByRole('status').textContent;
-
-    rerender(
-      <ConfirmMintDialog
-        record={mockRecord}
-        onConfirm={mockOnConfirm}
-        onCancel={mockOnCancel}
-        mintResult={{ ...mintResult }}
-      />
-    );
-
-    expect(screen.getByRole('status').textContent).toBe(firstAnnouncement);
-    expect(screen.getAllByRole('status')).toHaveLength(1);
+    const confirmButton = screen.getByRole('button', { name: /Confirm & Mint/i });
+    fireEvent.click(confirmButton);
+    fireEvent.click(confirmButton);
+    fireEvent.click(confirmButton);
+    expect(mockOnConfirm).toHaveBeenCalledTimes(1);
   });
 });

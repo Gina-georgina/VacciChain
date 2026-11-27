@@ -78,56 +78,48 @@ All ratios computed using the WCAG relative luminance formula.
 
 ---
 
-## Live-Region Announcements for Async Actions
+## Forms — Labels, Errors, and Required Fields
 
-Async action results (mint, verification, wallet connection, copy) are announced through
-polite/assertive live regions so screen-reader users get feedback **without a focus change**.
+Issuer and onboarding forms communicate field purpose, constraints, and validation status accessibly.
 
-### Announcer behavior
+### Labels and error association
 
-- A single app-level announcer component renders two visually hidden regions:
-  - `role="status"` with `aria-live="polite"` — success and informational messages
-    (mint success, verification result, wallet connected, copy success).
-  - `role="alert"` with `aria-live="assertive"` — errors (mint failure, verification
-    failure, wallet connection error, copy failure).
-- Regions are always present in the DOM (never conditionally mounted) so that content
-  changes are reliably picked up by assistive technology.
-- Messages are set via a shared `announce(message, { priority })` helper; the helper
-  writes the text into the appropriate region and clears it after a short timeout.
-- Focus is never moved as part of an announcement. Visible inline status/error text
-  remains in place for sighted users.
+- Every form control has a programmatic label: inputs are associated with a `<label htmlFor>` matching the control's `id`, or an `aria-label` where a visible label is not rendered.
+- Validation errors are associated with the invalid field via `aria-describedby` pointing at the error message element, and the field is marked `aria-invalid="true"` while invalid.
+- Error messages are rendered in a live region (`role="alert"` / `aria-live="assertive"`) so screen readers announce them when validation fails.
+- Field purpose and constraints (e.g., format hints) are exposed through `aria-describedby` alongside the error message.
 
-### Deduplication rules
+### Required and optional fields
 
-- Identical consecutive messages are not re-announced (the helper compares the new
-  message against the last announced message per region and skips duplicates).
-- Repeating an action that produces the same message re-triggers the announcement by
-  first clearing the region (empty string) and then setting the text on the next tick,
-  so the DOM mutation is observable.
-- Messages are keyed per flow (e.g. `mint`, `verify`, `wallet`, `copy`) so an error in
-  one flow does not suppress an identical-looking message in another.
-- Announcements are debounced within a short window (~150 ms) to collapse rapid
-  repeated events (e.g. multiple copy clicks) into a single announcement.
+- Required fields are marked with `required` / `aria-required="true"` and a visible required indicator.
+- Optional fields are explicitly labeled as optional so the distinction is clear to all users.
+- The required/optional distinction is conveyed in text, not by color or asterisk alone.
 
-### Manual screen-reader check procedure
+### Verification
 
-Perform with at least one of NVDA (Windows/Firefox), VoiceOver (macOS/Safari), or
-TalkBack (Android/Chrome). For each flow, confirm the message is spoken and that
-keyboard focus does not move.
+- Run an accessibility checker (e.g., axe DevTools, Lighthouse accessibility audit, or `jest-axe` in tests) against the issuer and onboarding forms and confirm zero label/error-association violations.
+- Manually verify with a screen reader that focusing an invalid field announces its label, constraint, and error message.
+- Confirm required and optional fields are announced correctly.
 
-1. **Mint** — Connect a wallet, submit a valid mint. Confirm a polite success
-   announcement. Submit an invalid/failing mint and confirm an assertive error
-   announcement. Confirm focus stays on the submit button.
-2. **Verification** — Run a verification for a valid and an invalid token. Confirm the
-   result is announced (polite for valid, assertive for failure) and focus stays on the
-   verify control.
-3. **Wallet connection** — Connect and disconnect. Confirm "connected" and
-   "disconnected"/error states are announced without moving focus.
-4. **Copy** — Activate copy on the wallet address. Confirm a single "copied"
-   announcement, and that clicking copy repeatedly does not spam duplicate
-   announcements.
+---
 
-Record the screen reader, browser, and OS used alongside the pass/fail result.
+## Reduced Motion
+
+The app honors the user's `prefers-reduced-motion` setting. When reduced motion is requested, non-essential transitions and animations are disabled or reduced to near-instant.
+
+### Covered areas
+
+- **Navigation:** route/page transitions and nav hover/active animations are suppressed.
+- **Skeletons:** loading skeleton shimmer/pulse animations are replaced with a static placeholder.
+- **Notifications:** toast/notification enter/exit animations are reduced to instant appearance/disappearance.
+
+### Verification
+
+- Enable reduced motion at the OS level (macOS: System Settings → Accessibility → Display → Reduce motion; Windows: Settings → Accessibility → Visual effects → Animation effects off) or emulate it in DevTools (Rendering → Emulate CSS media feature `prefers-reduced-motion: reduce`).
+- Navigate between pages and confirm no non-essential transitions play.
+- Trigger loading states and confirm skeletons render statically without shimmer/pulse.
+- Trigger a notification and confirm it appears/disappears without animation.
+- Confirm all content remains fully usable and no information is conveyed by motion alone.
 
 ---
 

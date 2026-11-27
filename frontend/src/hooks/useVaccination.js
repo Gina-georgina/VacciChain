@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth } from './useFreighter';
 import { useToast } from './useToast';
-import { useAnnounce } from './useAnnounce';
+import { apiUrl } from '../config';
 
-// Module-level cache: walletAddress -> { records, timestamp }
+// Module-level cache: request URL -> { records, total, limit, timestamp }
 export const cache = new Map();
+const PAGE_SIZE = 10;
+const recordsUrl = (wallet, page) => `/v1/vaccination/${wallet}?page=${page}&limit=${PAGE_SIZE}`;
 const CACHE_TTL = 30_000; // 30 seconds
 
 // Redaction utility for client-side diagnostics. Strips tokens, patient
@@ -33,13 +35,17 @@ function safeErrorMessage(e, fallback) {
 }
 
 export function useVaccination(walletAddress) {
-  const { apiFetch } = useAuth();
+  const { apiFetch, walletAddress: activeAccount } = useAuth();
   const toast = useToast();
   const announce = useAnnounce();
   const [records, setRecords] = useState([]);
+  const [page, setPage] = useState(1);
+  const [pagination, setPagination] = useState({ total: 0, limit: PAGE_SIZE });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const abortRef = useRef(null);
+  // Track the account the current records belong to so we never show stale data
+  const recordsAccountRef = useRef(null);
   // Keep latest apiFetch/toast in refs so effects don't re-run when they change
   const apiFetchRef = useRef(apiFetch);
   const toastRef = useRef(toast);
@@ -48,16 +54,21 @@ export function useVaccination(walletAddress) {
   useEffect(() => { toastRef.current = toast; }, [toast]);
   useEffect(() => { announceRef.current = announce; }, [announce]);
 
-  const fetchFromApi = useCallback(async (wallet, signal) => {
+  const fetchFromApi = useCallback(async (url, signal) => {
     setLoading(true);
     setError(null);
     try {
-      const res = await apiFetchRef.current(`/v1/vaccination/${wallet}`, { signal });
+      const res = await apiFetchRef.current(url, { signal });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       const list = Array.isArray(data.data) ? data.data : [];
-      cache.set(wallet, { records: list, timestamp: Date.now() });
+      if (signal.aborted) return;
+      const meta = { total: data.total ?? list.length, limit: data.limit ?? PAGE_SIZE };
+      cache.set(url, { records: list, ...meta, timestamp: Date.now() });
       setRecords(list);
+      setPagination(meta);
+      // The history may have shrunk since the last request
+      setPage((p) => Math.min(p, Math.max(1, Math.ceil(meta.total / meta.limit))));
       return list;
     } catch (e) {
       if (e.name === 'AbortError') return;
@@ -66,39 +77,50 @@ export function useVaccination(walletAddress) {
       toastRef.current(msg, 'error');
       return null;
     } finally {
-      setLoading(false);
+      if (!signal.aborted) setLoading(false);
     }
   }, []); // stable — uses refs internally
 
   useEffect(() => {
+    setPage(1);
+    setRecords([]);
+    setPagination({ total: 0, limit: PAGE_SIZE });
+  }, [walletAddress]);
+
+  useEffect(() => {
     if (!walletAddress) return;
 
-    const cached = cache.get(walletAddress);
+    const cached = cache.get(recordsUrl(walletAddress, page));
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
       setRecords(cached.records);
+      setPagination({ total: cached.total, limit: cached.limit });
+      setError(null);
+      setLoading(false);
       return;
     }
 
     const controller = new AbortController();
     abortRef.current = controller;
-    fetchFromApi(walletAddress, controller.signal);
+    fetchFromApi(recordsUrl(walletAddress, page), controller.signal);
 
     return () => { controller.abort(); };
-  }, [walletAddress, fetchFromApi]);
+  }, [walletAddress, page, fetchFromApi]);
 
   const refetch = useCallback(() => {
     if (!walletAddress) return;
-    cache.delete(walletAddress);
+    for (const key of cache.keys()) {
+      if (key.startsWith(`/v1/vaccination/${walletAddress}?`)) cache.delete(key);
+    }
     if (abortRef.current) abortRef.current.abort();
     const controller = new AbortController();
     abortRef.current = controller;
-    return fetchFromApi(walletAddress, controller.signal);
-  }, [walletAddress, fetchFromApi]);
+    return fetchFromApi(recordsUrl(walletAddress, page), controller.signal);
+  }, [walletAddress, page, fetchFromApi]);
 
   const issueVaccination = useCallback(async (payload) => {
     setLoading(true);
     try {
-      const res = await apiFetchRef.current('/v1/vaccination/issue', {
+      const res = await apiFetchRef.current(apiUrl('/v1/vaccination/issue'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -121,7 +143,7 @@ export function useVaccination(walletAddress) {
 
   const checkIssuerStatus = useCallback(async () => {
     try {
-      const res = await apiFetchRef.current('/v1/issuer/status');
+      const res = await apiFetchRef.current(apiUrl('/v1/issuer/status'));
       const data = await res.json();
       return res.ok ? data.authorized : false;
     } catch {
@@ -129,5 +151,7 @@ export function useVaccination(walletAddress) {
     }
   }, []);
 
-  return { records, loading, error, refetch, issueVaccination, checkIssuerStatus };
+  const totalPages = Math.max(1, Math.ceil(pagination.total / pagination.limit));
+
+  return { page, setPage, total: pagination.total, totalPages, records, loading, error, refetch, issueVaccination, checkIssuerStatus };
 }
