@@ -1,11 +1,17 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useAuth } from '../hooks/useFreighter';
 
 const INSTALL_URL = 'https://www.freighter.app/';
 
 export default function FreighterBanner() {
-  const { freighterInstalled } = useAuth();
+  const { freighterInstalled, publicKey } = useAuth();
   const [dismissed, setDismissed] = useState(false);
+
+  // Reset dismissal whenever the wallet connection state changes so stale
+  // wallet UI is not shown after a disconnect or account switch.
+  useEffect(() => {
+    setDismissed(false);
+  }, [freighterInstalled, publicKey]);
 
   if (freighterInstalled || dismissed) return null;
 

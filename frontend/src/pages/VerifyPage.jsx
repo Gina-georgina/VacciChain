@@ -34,6 +34,7 @@ function deriveStatus(result) {
 }
 
 const styles = {
+  page: { margin: '2rem 0' },
   input: { padding: '0.6rem 0.75rem', background: 'var(--input-bg)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: '1rem', width: '100%' },
   inputInvalid: { borderColor: '#f87171' },
   btn: { padding: '0.6rem 1.5rem', background: 'var(--btn-primary)', color: '#fff', border: 'none', borderRadius: 8, fontSize: '1rem', marginTop: '0.75rem' },
@@ -50,17 +51,17 @@ export default function VerifyPage() {
   const [resultWallet, setResultWallet] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [validationError, setValidationError] = useState(null);
-  const requestIdRef = useRef(0);
+  const [lastAddress, setLastAddress] = useState('');
 
   const verify = async (address) => {
-    const requestId = ++requestIdRef.current;
+    const trimmed = address.trim();
+    setLastAddress(trimmed);
     setLoading(true);
     setResult(null);
     setResultWallet(null);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE_URL}/v1/verify/${address}`);
+      const res = await fetch(`/v1/verify/${trimmed}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       if (requestId !== requestIdRef.current) return;
@@ -76,7 +77,10 @@ export default function VerifyPage() {
     }
   };
 
-  // Keep the input in sync with the URL (deep links, back/forward navigation).
+  const handleRetry = () => {
+    if (lastAddress) verify(lastAddress);
+  };
+
   useEffect(() => {
     setWallet(urlWallet);
     setValidationError(null);
@@ -141,7 +145,7 @@ export default function VerifyPage() {
   const showResult = result && resultWallet && resultWallet === urlWallet;
 
   return (
-    <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
+    <div className="page-container page-section content-medium" style={{ ...pageContainerNarrow, ...styles.page }}>
       <h2 style={{ marginBottom: '1.5rem', color: 'var(--text)' }}>Verify Vaccination Status</h2>
       <form onSubmit={handleVerify} noValidate>
         <label htmlFor="wallet-input" style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0,0,0,0)' }}>
@@ -169,10 +173,27 @@ export default function VerifyPage() {
       </form>
 
       <div aria-live="polite" aria-atomic="true">
-        {error && <p style={{ color: '#f87171', marginTop: '1rem' }} role="alert">Error: {error}</p>}
+        {loading && (
+          <p style={{ color: 'var(--text)', marginTop: '1rem' }} role="status">
+            Checking vaccination status…
+          </p>
+        )}
+        {error && (
+          <div style={{ marginTop: '1rem' }} role="alert">
+            <p style={{ color: '#f87171' }}>Error: {error}</p>
+            <button
+              type="button"
+              style={styles.btn}
+              onClick={handleRetry}
+              disabled={loading || !lastAddress}
+            >
+              Retry
+            </button>
+          </div>
+        )}
       </div>
 
-      {showResult && (
+      {!loading && !error && result && (
         <div style={{ marginTop: '1.5rem' }} aria-live="polite">
           <VerificationBadge
             status={deriveStatus(result)}
@@ -183,15 +204,9 @@ export default function VerifyPage() {
             Wallet: {resultWallet}
             <CopyButton text={resultWallet} label="wallet address" />
           </p>
-          {result.record_count === 0 || !result.records?.length ? (
-            <p style={{ color: '#64748b', marginTop: '1rem' }}>
-              No vaccination records found for this wallet.
-            </p>
-          ) : (
-            <div style={{ marginTop: '1rem' }}>
-              {result.records.map((r) => <NFTCard key={r.token_id} record={r} />)}
-            </div>
-          )}
+          <div style={{ marginTop: '1rem' }}>
+            {result.records?.map((r) => <NFTCard key={r.token_id} record={r} patientWallet={result.wallet} />)}
+          </div>
         </div>
       )}
     </div>

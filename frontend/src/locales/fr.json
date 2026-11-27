@@ -2,6 +2,14 @@
   "accessibility": {
     "skipToContent": "Aller au contenu principal"
   },
+  "asyncState": {
+    "loading": "Chargement…",
+    "empty": "Aucune donnée disponible.",
+    "partial": "Certaines données n'ont pas pu être chargées.",
+    "error": "Échec du chargement des données : {{message}}",
+    "retry": "Réessayer",
+    "retrying": "Nouvelle tentative…"
+  },
   "nav": {
     "home": "Accueil",
     "myRecords": "Mes dossiers",
@@ -24,6 +32,9 @@
     "wallet": "Portefeuille : {{address}}",
     "loading": "Chargement…",
     "error": "Erreur : {{message}}",
+    "retry": "Réessayer",
+    "retrying": "Nouvelle tentative…",
+    "partial": "Certains dossiers n'ont pas pu être chargés.",
     "noRecords": "Aucun dossier de vaccination trouvé.",
     "prevPage": "‹ Préc.",
     "nextPage": "Suiv. ›",
@@ -41,10 +52,14 @@
     "submit": "Émettre le NFT de vaccination",
     "submitting": "Émission en cours…",
     "error": "Erreur : {{message}}",
+    "retry": "Réessayer",
+    "retrying": "Nouvelle tentative…",
     "success": "✅ NFT de vaccination émis ! ID du jeton : {{tokenId}}",
     "validation": {
       "invalidAddress": "Doit être une clé publique Stellar valide (G…, 56 caractères)",
       "vaccineRequired": "Le nom du vaccin est requis",
+      "dosePositive": "Doit être un nombre entier positif",
+      "doseExceedsSeries": "Le numéro de dose ne peut pas dépasser le nombre de doses de la série",
       "dateRequired": "La date est requise",
       "dateFuture": "La date ne peut pas être dans le futur"
     }
@@ -54,7 +69,10 @@
     "placeholder": "Entrez l'adresse du portefeuille Stellar (G...)",
     "submit": "Vérifier",
     "checking": "Vérification…",
-    "error": "Erreur : {{message}}"
+    "error": "Erreur : {{message}}",
+    "retry": "Réessayer",
+    "retrying": "Nouvelle tentative…",
+    "empty": "Aucun dossier trouvé pour cette adresse."
   },
   "nftCard": {
     "date": "Date : {{date}}",

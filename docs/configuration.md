@@ -99,19 +99,79 @@ The backend validates its variables at startup via [Zod](https://zod.dev/). A mi
 
 ## Rate limiting
 
+Sensitive operations are rate limited per client identity. The client identity is derived from the request using the trusted-proxy configuration below — forwarding headers (`X-Forwarded-For`, `X-Real-IP`) are only honoured when the immediate peer is a trusted proxy, so spoofed headers from untrusted clients are ignored.
+
+### `TRUST_PROXY`
+- Required: no
+- Default: `false`
+- Allowed values: `false` | `true` | positive integer (number of trusted hops) | comma-separated list of trusted proxy IPs/CIDRs
+- Description: Controls how the client IP is resolved. When `false`, the socket peer address is always used and forwarding headers are ignored. When set to a number, that many hops from the right of `X-Forwarded-For` are trusted. When set to a list, only requests whose immediate peer matches a listed proxy have forwarding headers honoured.
+- Example: `TRUST_PROXY=10.0.0.0/8,172.16.0.0/12`
+
 ### `RATE_LIMIT_SEP10`
 - Required: no
 - Default: `10`
 - Format: positive integer
-- Description: Maximum SEP-10 challenge requests per IP per minute. Protects the challenge endpoint from enumeration and DoS.
+- Description: Maximum SEP-10 challenge requests per client per minute. Protects the challenge endpoint from enumeration and DoS.
 - Example: `RATE_LIMIT_SEP10=10`
 
 ### `RATE_LIMIT_VERIFY`
 - Required: no
 - Default: `60`
 - Format: positive integer
-- Description: Maximum public verification requests (`GET /verify/:wallet`) per IP per minute.
+- Description: Maximum public verification requests (`GET /verify/:wallet`) per client per minute.
 - Example: `RATE_LIMIT_VERIFY=60`
+
+### `RATE_LIMIT_ONBOARDING`
+- Required: no
+- Default: `20`
+- Format: positive integer
+- Description: Maximum onboarding requests per client per minute.
+- Example: `RATE_LIMIT_ONBOARDING=20`
+
+### `RATE_LIMIT_BATCH_VERIFY`
+- Required: no
+- Default: `10`
+- Format: positive integer
+- Description: Maximum batch verification requests per client per minute. Batch endpoints are weighted by batch size where applicable.
+- Example: `RATE_LIMIT_BATCH_VERIFY=10`
+
+### `RATE_LIMIT_WINDOW_MS`
+- Required: no
+- Default: `60000`
+- Format: positive integer (milliseconds)
+- Description: Length of the rate-limit window. All per-operation limits above are expressed per this window.
+- Example: `RATE_LIMIT_WINDOW_MS=60000`
+
+### `RATE_LIMIT_STORE`
+- Required: no
+- Default: `memory`
+- Allowed values: `memory` | `redis`
+- Description: Backing store for rate-limit counters. Use `memory` for single-instance deployments. Use `redis` when running multiple backend replicas behind a load balancer so limits are enforced across the whole deployment rather than per instance.
+- Example: `RATE_LIMIT_STORE=redis`
+
+### `REDIS_URL`
+- Required: when `RATE_LIMIT_STORE=redis`
+- Format: valid Redis URL (`redis://` or `rediss://`)
+- Description: Connection string for the shared rate-limit store. All replicas must point at the same Redis instance.
+- Example: `REDIS_URL=redis://redis:6379/0`
+
+### Rate-limit response headers
+
+Every rate-limited response includes standard metadata so clients can back off correctly:
+
+- `RateLimit-Limit` — the configured maximum for the operation in the current window.
+- `RateLimit-Remaining` — requests remaining in the current window.
+- `RateLimit-Reset` — seconds until the window resets.
+- `Retry-After` — seconds to wait before retrying; present on `429 Too Many Requests` responses.
+
+A throttled request returns HTTP `429` with a JSON body of the form `{ "error": "rate_limited", "retryAfter": <seconds> }`.
+
+### Distributed deployment guidance
+
+- Set `TRUST_PROXY` to the exact proxy hops or CIDRs in front of the backend. Never set `TRUST_PROXY=true` on an internet-facing instance without a proxy — it allows clients to spoof their identity via `X-Forwarded-For`.
+- When running more than one backend replica, set `RATE_LIMIT_STORE=redis` and a shared `REDIS_URL` so counters are consistent across instances. With `memory`, each replica enforces its own limit, effectively multiplying the allowed rate by the replica count.
+- Ensure load balancers preserve the original client address (or append to `X-Forwarded-For`) and that the trusted-proxy list matches the load balancer's egress addresses.
 
 ---
 
@@ -282,8 +342,14 @@ When an anomaly is detected the service POSTs a JSON payload to `ALERT_WEBHOOK_U
 | `BODY_LIMIT` | no | Zod (backend) | size string, default `10kb` |
 | `EVENT_POLL_INTERVAL_MS` | no | Zod (backend) | positive integer (ms), default 15000 |
 | `DATABASE_PATH` | no | Zod (backend) | file path, default `/data/vaccichain.db` |
-| `RATE_LIMIT_SEP10` | no | runtime | parsed as integer, default 10 |
-| `RATE_LIMIT_VERIFY` | no | runtime | parsed as integer, default 60 |
+| `TRUST_PROXY` | no | Zod (backend) | `false` \| `true` \| hop count \| proxy IP/CIDR list, default `false` |
+| `RATE_LIMIT_SEP10` | no | Zod (backend) | positive integer, default 10 |
+| `RATE_LIMIT_VERIFY` | no | Zod (backend) | positive integer, default 60 |
+| `RATE_LIMIT_ONBOARDING` | no | Zod (backend) | positive integer, default 20 |
+| `RATE_LIMIT_BATCH_VERIFY` | no | Zod (backend) | positive integer, default 10 |
+| `RATE_LIMIT_WINDOW_MS` | no | Zod (backend) | positive integer (ms), default 60000 |
+| `RATE_LIMIT_STORE` | no | Zod (backend) | enum: `memory` \| `redis`, default `memory` |
+| `REDIS_URL` | when store=redis | Zod (backend) | valid `redis://` or `rediss://` URL |
 | `AUDIT_LOG_PATH` | no | runtime | writable path, default `./audit.log` |
 | `ANALYTICS_PORT` | no | runtime | positive integer, default 8001 |
 | `BACKEND_URL` | no | runtime | valid URL, default set by Compose |

@@ -3,6 +3,7 @@ import { useAuth } from '../hooks/useFreighter';
 import { pageContainerNarrow } from '../layout.js';
 
 const s = {
+  page:    { margin: '2rem 0' },
   table:   { width: '100%', borderCollapse: 'collapse', fontSize: '0.9rem' },
   th:      { textAlign: 'left', padding: '0.5rem 0.75rem', borderBottom: '1px solid #334155', color: '#94a3b8' },
   td:      { padding: '0.5rem 0.75rem', borderBottom: '1px solid #1e293b', color: '#e2e8f0', wordBreak: 'break-all' },
@@ -31,15 +32,33 @@ export default function AdminDashboard() {
   const [loading, setLoading]       = useState(false);
   const [applications, setApps]     = useState([]);
   const [reviewError, setReviewErr] = useState(null);
+  const [keysState, setKeysState]   = useState({ status: 'idle', error: null });
+  const [appsState, setAppsState]   = useState({ status: 'idle', error: null });
 
   const fetchKeys = useCallback(async () => {
-    const res = await apiFetch('/v1/admin/api-keys');
-    if (res.ok) setKeys(await res.json());
+    setKeysState({ status: 'loading', error: null });
+    try {
+      const res = await apiFetch('/v1/admin/api-keys');
+      if (!res.ok) throw new Error(`Failed to load API keys (${res.status})`);
+      const data = await res.json();
+      setKeys(Array.isArray(data) ? data : []);
+      setKeysState({ status: 'success', error: null });
+    } catch (err) {
+      setKeysState({ status: 'error', error: err.message || 'Failed to load API keys' });
+    }
   }, [apiFetch]);
 
   const fetchApplications = useCallback(async () => {
-    const res = await apiFetch('/v1/onboarding/applications');
-    if (res.ok) setApps(await res.json());
+    setAppsState({ status: 'loading', error: null });
+    try {
+      const res = await apiFetch('/v1/onboarding/applications');
+      if (!res.ok) throw new Error(`Failed to load applications (${res.status})`);
+      const data = await res.json();
+      setApps(Array.isArray(data) ? data : []);
+      setAppsState({ status: 'success', error: null });
+    } catch (err) {
+      setAppsState({ status: 'error', error: err.message || 'Failed to load applications' });
+    }
   }, [apiFetch]);
 
   useEffect(() => {
@@ -50,6 +69,19 @@ export default function AdminDashboard() {
       fetchApplications();
     }
   }, [publicKey, role, fetchKeys, fetchApplications]);
+
+  if (!publicKey) {
+    return (
+      <div className="page-container page-section content-medium" style={{ ...s.page, ...pageContainerNarrow }}>
+        <p style={{ color: '#94a3b8', marginBottom: '1rem' }}>Connect your admin wallet to manage API keys.</p>
+        <button style={s.btn} onClick={connect}>Connect Wallet</button>
+      </div>
+    );
+  }
+
+  if (role !== 'issuer') {
+    return <div className="page-container page-section content-medium" style={{ ...s.page, ...pageContainerNarrow }}><p style={{ color: '#f87171' }}>Access denied: admin role required.</p></div>;
+  }
 
   const handleCreate = async (e) => {
     e.preventDefault();
@@ -99,7 +131,7 @@ export default function AdminDashboard() {
   };
 
   return (
-    <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
+    <div className="page-container page-section content-medium" style={{ ...s.page, ...pageContainerNarrow }}>
       <h2 style={{ marginBottom: '1.5rem', color: 'var(--text)' }}>API Key Management</h2>
 
       <form style={s.row} onSubmit={handleCreate}>
@@ -126,9 +158,20 @@ export default function AdminDashboard() {
         </div>
       )}
 
-      {keys.length === 0 ? (
+      {keysState.status === 'loading' && keys.length === 0 ? (
+        <p style={{ color: '#94a3b8' }} role="status">Loading API keys…</p>
+      ) : keysState.status === 'error' ? (
+        <div role="alert" style={{ marginBottom: '1rem' }}>
+          <p style={{ color: '#f87171', marginBottom: '0.5rem' }}>{keysState.error}</p>
+          <button style={s.btn} onClick={fetchKeys}>Retry</button>
+        </div>
+      ) : keys.length === 0 ? (
         <p style={{ color: '#64748b' }}>No API keys yet.</p>
       ) : (
+        <>
+        {keysState.status === 'loading' && (
+          <p style={{ color: '#94a3b8', marginBottom: '0.5rem' }} role="status">Refreshing API keys…</p>
+        )}
         <table style={s.table} aria-label="API keys">
           <thead>
             <tr>
@@ -155,15 +198,27 @@ export default function AdminDashboard() {
             ))}
           </tbody>
         </table>
+        </>
       )}
 
       {/* ── Issuer Onboarding Applications ── */}
       <div style={s.section}>
         <h3 style={s.h3}>Issuer Onboarding Applications</h3>
         {reviewError && <p style={{ color: '#f87171', marginBottom: '0.75rem' }}>{reviewError}</p>}
-        {applications.length === 0 ? (
+        {appsState.status === 'loading' && applications.length === 0 ? (
+          <p style={{ color: '#94a3b8' }} role="status">Loading applications…</p>
+        ) : appsState.status === 'error' ? (
+          <div role="alert" style={{ marginBottom: '1rem' }}>
+            <p style={{ color: '#f87171', marginBottom: '0.5rem' }}>{appsState.error}</p>
+            <button style={s.btn} onClick={fetchApplications}>Retry</button>
+          </div>
+        ) : applications.length === 0 ? (
           <p style={{ color: '#64748b' }}>No applications yet.</p>
         ) : (
+          <>
+          {appsState.status === 'loading' && (
+            <p style={{ color: '#94a3b8', marginBottom: '0.5rem' }} role="status">Refreshing applications…</p>
+          )}
           <table style={s.table} aria-label="Issuer applications">
             <thead>
               <tr>
@@ -193,6 +248,7 @@ export default function AdminDashboard() {
               ))}
             </tbody>
           </table>
+          </>
         )}
       </div>
     </div>

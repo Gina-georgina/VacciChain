@@ -31,7 +31,7 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build && node scripts/bundle-report.mjs",
     "preview": "vite preview",
     "lint": "eslint src",
     "test": "jest",
@@ -40,6 +40,7 @@
     "test:e2e:ui": "playwright test --ui",
     "test:e2e:debug": "playwright test --debug",
     "test:e2e:xss": "playwright test xss-security.spec.js",
-    "test:e2e:report": "playwright show-report"
+    "test:e2e:report": "playwright show-report",
+    "build-report": "vite build && echo '--- Bundle Budget ---' && echo 'Route chunks: target < 100KB gzip each' && echo 'Vendor chunks: target < 150KB gzip each' && ls -lh dist/assets/*.js 2>/dev/null | awk '{print $NF, $5}' || true"
   }
 }
