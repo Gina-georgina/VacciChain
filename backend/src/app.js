@@ -21,18 +21,19 @@ const analyticsProxyRoutes = require('./routes/analyticsProxy');
 const apiVersion = require('./middleware/apiVersion');
 const securityHeaders = require('./middleware/securityHeaders');
 const { getRpcServer } = require('./stellar/soroban');
-const {
-  getHealthStatus,
-  getLivenessStatus,
-  getReadinessStatus,
-  startHealthProbe,
-} = require('./health');
+const { getHealthStatus, getReadinessStatus, startHealthProbe } = require('./health');
+const { getDbReadiness } = require('./indexer/db');
 
 const requestId = require('./middleware/requestId');
 const { sanitizeInputs } = require('./middleware/sanitize');
 const errorHandler = require('./middleware/errorHandler');
+const { onboardingLimiter, batchVerifyLimiter } = require('./middleware/rateLimit');
+const idempotency = require('./middleware/idempotency');
 
 const app = express();
+// Trust only the configured number of proxy hops so client identity (and thus
+// rate-limit keys) cannot be spoofed via forwarding headers.
+app.set('trust proxy', config.TRUST_PROXY);
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean);
 
 // --- Graceful shutdown / in-flight request tracking -------------------------
@@ -115,6 +116,7 @@ app.use((req, res, next) => {
 // ---------------------------------------------------------------------------
 
 app.use(cors({
+  exposedHeaders: ['API-Version', 'Deprecation', 'Link'],
   origin: (origin, callback) => {
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin || allowedOrigins.includes(origin)) {
@@ -137,26 +139,23 @@ app.use(sanitizeInputs);
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
+    // logger redacts sensitive headers/fields before emitting the record.
     logger.info('request', {
       requestId: req.requestId,
       method: req.method,
       route: req.path,
       statusCode: res.statusCode,
       durationMs: Date.now() - start,
+      headers: req.headers,
     });
   });
   next();
 });
 
-app.use('/auth', authRoutes);
-app.use('/vaccination', vaccinationRoutes);
-app.use('/verify', verifyRoutes);
-app.use('/admin', adminRoutes);
-app.use('/events', eventsRoutes);
-
 // v1 routes — all API endpoints are versioned under /v1/
 const v1 = express.Router();
 v1.use(apiVersion);
+v1.use('/vaccination/issue', idempotency);
 v1.use('/auth', authRoutes);
 v1.use('/vaccination', vaccinationRoutes);
 v1.use('/verify', verifyRoutes);
@@ -164,15 +163,23 @@ v1.use('/admin', adminRoutes);
 v1.use('/patient', patientRoutes);
 v1.use('/patient', consentRoutes);
 v1.use('/events', eventsRoutes);
-v1.use('/onboarding', onboardingRoutes);
+v1.use('/onboarding', onboardingLimiter, onboardingRoutes);
+v1.use('/verify/batch', batchVerifyLimiter);
 v1.use('/analytics', analyticsProxyRoutes);
 app.use('/v1', v1);
 
-// Legacy unversioned routes — 308 redirect to /v1/ with Deprecation header
-app.use(['/auth', '/vaccination', '/verify', '/admin', '/patient', '/events'], (req, res) => {
-  res.setHeader('Deprecation', 'true');
-  res.redirect(308, `/v1${req.originalUrl}`);
-});
+// Legacy unversioned routes: 308 (method and body preserved) to /v1. No handlers are
+// mounted here, so both forms always reach the same code. See docs/api-routes.md.
+app.use(
+  ['/auth', '/vaccination', '/verify', '/admin', '/patient', '/events', '/onboarding'],
+  apiVersion,
+  (req, res) => {
+    const target = `/v1${req.originalUrl}`;
+    res.setHeader('Deprecation', 'true');
+    res.setHeader('Link', `<${encodeURI(target)}>; rel="successor-version"`);
+    res.redirect(308, target);
+  }
+);
 
 // Global error handler — must be registered after all routes
 app.use(errorHandler);
@@ -213,7 +220,12 @@ app.get('/health/ready', async (_req, res) => {
  * @returns {Object} 503 - { status: "degraded", uptime, checks: { database, rpc } }
  */
 app.get('/health', async (_req, res) => {
-  const body = await getReadinessStatus();
+  const body = getHealthStatus();
+  const db = getDbReadiness();
+  body.database = { status: db.status, schemaVersion: db.schemaVersion };
+  if (db.status !== 'ok') {
+    body.status = 'degraded';
+  }
   res.status(body.status === 'ok' ? 200 : 503).json(body);
 });
 

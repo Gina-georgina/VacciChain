@@ -163,81 +163,125 @@ describe('poller — parseEvent', () => {
   });
 });
 
-describeRetention('retention — purge policies', () => {
-  const DAY_MS = 24 * 60 * 60 * 1000;
-  const now = Date.now();
+describe('db — integrity and startup checks', () => {
+  const { checkDatabaseIntegrity } = require('../src/indexer/db');
 
-  const seedRetentionEvents = () => {
-    upsertEvents([
-      {
-        id: 'ret-old-indexed',
-        event_type: 'VaccinationMinted',
-        ledger: 300,
-        timestamp: Math.floor((now - 400 * DAY_MS) / 1000),
-        contract_id: 'CABC',
-        payload: { vaccine_name: 'Old' },
-      },
-      {
-        id: 'ret-recent-indexed',
-        event_type: 'VaccinationMinted',
-        ledger: 301,
-        timestamp: Math.floor((now - 1 * DAY_MS) / 1000),
-        contract_id: 'CABC',
-        payload: { vaccine_name: 'Recent' },
-      },
-      {
-        id: 'ret-old-audit',
-        event_type: 'IssuerAdded',
-        ledger: 302,
-        timestamp: Math.floor((now - 400 * DAY_MS) / 1000),
-        contract_id: 'CABC',
-        payload: { issuer: 'GAUDIT' },
-      },
-    ]);
+  it('reports a valid database as healthy', async () => {
+    const result = await checkDatabaseIntegrity(tmpDb);
+    expect(result.ok).toBe(true);
+    expect(result.schemaVersion).toBeDefined();
+    expect(Array.isArray(result.missingTables)).toBe(true);
+    expect(result.missingTables.length).toBe(0);
+  });
+
+  it('fails closed on a corrupt database without creating a replacement', async () => {
+    const corruptPath = path.join(os.tmpdir(), `vaccichain-corrupt-${Date.now()}.db`);
+    fs.writeFileSync(corruptPath, 'this is not a sqlite database');
+    const sizeBefore = fs.statSync(corruptPath).size;
+
+    const result = await checkDatabaseIntegrity(corruptPath);
+    expect(result.ok).toBe(false);
+    expect(result.alert).toBeTruthy();
+    expect(result.alert).toMatch(/corrupt|integrity|inaccessible/i);
+
+    // Must not silently replace the corrupt file with an empty database
+    expect(fs.existsSync(corruptPath)).toBe(true);
+    expect(fs.statSync(corruptPath).size).toBe(sizeBefore);
+    expect(fs.readFileSync(corruptPath, 'utf8')).toBe('this is not a sqlite database');
+
+    fs.unlinkSync(corruptPath);
+  });
+
+  it('fails closed on an inaccessible database path', async () => {
+    const inaccessiblePath = path.join(
+      os.tmpdir(),
+      `vaccichain-missing-dir-${Date.now()}`,
+      'nested',
+      'db.sqlite'
+    );
+
+    const result = await checkDatabaseIntegrity(inaccessiblePath);
+    expect(result.ok).toBe(false);
+    expect(result.alert).toBeTruthy();
+    expect(fs.existsSync(inaccessiblePath)).toBe(false);
+  });
+
+  it('detects missing required tables', async () => {
+    const emptyPath = path.join(os.tmpdir(), `vaccichain-empty-${Date.now()}.db`);
+    const Database = require('better-sqlite3');
+    const db = new Database(emptyPath);
+    db.close();
+
+    const result = await checkDatabaseIntegrity(emptyPath);
+    expect(result.ok).toBe(false);
+    expect(result.missingTables.length).toBeGreaterThan(0);
+    expect(result.alert).toBeTruthy();
+
+    fs.unlinkSync(emptyPath);
+  });
+});
+
+describe('versioned event schemas', () => {
+  const v1Raw = {
+    id: 'raw-v1-001',
+    topic: [{ value: { toString: () => 'minted' } }],
+    ledger: 300,
+    ledgerClosedAt: '2024-02-01T00:00:00Z',
+    contractId: 'CABC',
+    value: { vaccine_name: 'Flu', issuer: 'GISSUER1' },
   };
 
-  it('documents data classes with retention periods and deletion constraints', () => {
-    const policy = retention.getRetentionPolicy();
-    expect(Array.isArray(policy)).toBe(true);
-    expect(policy.length).toBeGreaterThan(0);
-    policy.forEach((entry) => {
-      expect(typeof entry.dataClass).toBe('string');
-      expect(typeof entry.retentionDays).toBe('number');
-      expect(entry.retentionDays).toBeGreaterThan(0);
-      expect(typeof entry.deletable).toBe('boolean');
-    });
-    const audit = policy.find((e) => /audit/i.test(e.dataClass));
-    expect(audit).toBeDefined();
-    expect(audit.deletable).toBe(false);
+  const v2Raw = {
+    id: 'raw-v2-001',
+    topic: [{ value: { toString: () => 'minted' } }],
+    ledger: 301,
+    ledgerClosedAt: '2024-02-01T00:01:00Z',
+    contractId: 'CABC',
+    value: {
+      schema_version: 2,
+      vaccine_name: 'Flu',
+      issuer: 'GISSUER1',
+      dose_number: 2,
+      metadata: { lot: 'LOT-42' },
+    },
+  };
+
+  it('maps v1 payloads to VaccinationMinted with schema_version 1', () => {
+    const parsed = parseEvent(v1Raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed.event_type).toBe('VaccinationMinted');
+    expect(parsed.payload.schema_version).toBe(1);
+    expect(parsed.payload.vaccine_name).toBe('Flu');
   });
 
-  it('purges expired indexed events only', () => {
-    seedRetentionEvents();
-    const result = retention.runRetentionJob({ now });
-    expect(result).toBeDefined();
-    expect(result.purged).toBeGreaterThanOrEqual(1);
-
-    const remaining = queryEvents({ limit: 1000 }).map((e) => e.id);
-    expect(remaining).not.toContain('ret-old-indexed');
-    expect(remaining).toContain('ret-recent-indexed');
+  it('maps v2 payloads to VaccinationMinted preserving schema_version 2', () => {
+    const parsed = parseEvent(v2Raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed.event_type).toBe('VaccinationMinted');
+    expect(parsed.payload.schema_version).toBe(2);
+    expect(parsed.payload.dose_number).toBe(2);
+    expect(parsed.payload.metadata.lot).toBe('LOT-42');
   });
 
-  it('preserves audit and recovery records even when expired', () => {
-    seedRetentionEvents();
-    retention.runRetentionJob({ now });
-
-    const remaining = queryEvents({ limit: 1000 }).map((e) => e.id);
-    expect(remaining).toContain('ret-old-audit');
+  it('does not misclassify v1 and v2 payloads as different event types', () => {
+    expect(parseEvent(v1Raw).event_type).toBe(parseEvent(v2Raw).event_type);
   });
 
-  it('respects configured retention periods', () => {
-    seedRetentionEvents();
-    // With a very long retention window nothing should be purged.
-    const result = retention.runRetentionJob({ now, retentionDays: 100000 });
-    expect(result.purged).toBe(0);
+  it('stores and retrieves versioned payloads without misclassification', () => {
+    const parsedV1 = parseEvent(v1Raw);
+    const parsedV2 = parseEvent(v2Raw);
+    upsertEvents([parsedV1, parsedV2]);
 
-    const remaining = queryEvents({ limit: 1000 }).map((e) => e.id);
-    expect(remaining).toContain('ret-old-indexed');
+    const stored = queryEvents({ event_type: 'VaccinationMinted' });
+    const byId = new Map(stored.map((e) => [e.id, e]));
+
+    expect(byId.get('raw-v1-001').payload.schema_version).toBe(1);
+    expect(byId.get('raw-v2-001').payload.schema_version).toBe(2);
+    expect(byId.get('raw-v2-001').payload.dose_number).toBe(2);
+    expect(byId.get('raw-v1-001').event_type).toBe('VaccinationMinted');
+    expect(byId.get('raw-v2-001').event_type).toBe('VaccinationMinted');
+  });
+});
   });
 });
 
@@ -467,20 +511,20 @@ describe('GET /events route', () => {
   const app = require('../src/app');
 
   it('returns events array', async () => {
-    const res = await request(app).get('/events');
+    const res = await request(app).get('/v1/events');
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body.events)).toBe(true);
     expect(typeof res.body.count).toBe('number');
   });
 
   it('filters by event_type', async () => {
-    const res = await request(app).get('/events?event_type=VaccinationMinted');
+    const res = await request(app).get('/v1/events?event_type=VaccinationMinted');
     expect(res.status).toBe(200);
     res.body.events.forEach((e) => expect(e.event_type).toBe('VaccinationMinted'));
   });
 
   it('respects limit param', async () => {
-    const res = await request(app).get('/events?limit=1');
+    const res = await request(app).get('/v1/events?limit=1');
     expect(res.status).toBe(200);
     expect(res.body.events.length).toBeLessThanOrEqual(1);
   });

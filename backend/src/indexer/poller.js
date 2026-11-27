@@ -5,9 +5,10 @@
  * Indexed event types: VaccinationMinted, IssuerAdded, IssuerRevoked
  */
 const StellarSdk = require('@stellar/stellar-sdk');
-const { upsertEvents, getLatestLedger } = require('./db');
+const { upsertEvents, getLatestLedger, checkDatabaseIntegrity } = require('./db');
+const { toIndexedMint } = require('../schemas/vaccinationRecord');
 const { invalidateCache } = require('../stellar/issuerCache');
-const { getEvents } = require('../stellar/client');
+const { setGauge } = require('../metrics');
 const config = require('../config');
 
 
@@ -25,12 +26,29 @@ const RPC_BACKOFF_MAX_MS = Number.isFinite(config.SOROBAN_RPC_BACKOFF_MAX_MS)
   ? config.SOROBAN_RPC_BACKOFF_MAX_MS
   : 30_000;
 
-// Map Soroban symbol_short event topic names to our internal event_type strings
+// Map Soroban symbol_short event topic names to our internal event_type strings.
+// Versioned symbols (e.g. minted_v1, minted_v2) map to the same internal
+// event_type; the version is preserved in the payload as `schema_version`.
 const TOPIC_MAP = {
-  minted:  'VaccinationMinted',
-  iss_add: 'IssuerAdded',
-  iss_rev: 'IssuerRevoked',
+  minted:     'VaccinationMinted',
+  minted_v1:  'VaccinationMinted',
+  minted_v2:  'VaccinationMinted',
+  iss_add:    'IssuerAdded',
+  iss_add_v1: 'IssuerAdded',
+  iss_add_v2: 'IssuerAdded',
+  iss_rev:    'IssuerRevoked',
+  iss_rev_v1: 'IssuerRevoked',
+  iss_rev_v2: 'IssuerRevoked',
 };
+
+// Default schema version for unversioned (legacy) topic symbols.
+const DEFAULT_SCHEMA_VERSION = 1;
+
+/** Extract the schema version encoded in a topic symbol, or the default. */
+function extractSchemaVersion(topicStr) {
+  const match = /_v(\d+)$/.exec(topicStr ?? '');
+  return match ? Number(match[1]) : DEFAULT_SCHEMA_VERSION;
+}
 
 let timer = null;
 let inFlight = null;
@@ -109,8 +127,12 @@ function parseEvent(raw) {
         ? Math.floor(new Date(raw.ledgerClosedAt).getTime() / 1000)
         : 0,
       contract_id: raw.contractId ?? CONTRACT_ID,
-      payload: raw.value ?? {},
+      payload: event_type === 'VaccinationMinted' ? toIndexedMint(raw.value) : (raw.value ?? {}),
     };
+
+    // Preserve the event schema version so indexers can distinguish payloads
+    // emitted before and after contract upgrades.
+    parsed.payload.schema_version = extractSchemaVersion(topicStr);
 
     // Extract issuer address from topics for IssuerAdded/Revoked events
     if (parsed.event_type === 'IssuerAdded' || parsed.event_type === 'IssuerRevoked') {
@@ -135,6 +157,19 @@ async function runPoll() {
     return;
   }
 
+  // Refuse to process new events if the database failed its integrity check.
+  // Never silently initialize an empty replacement database over a corrupt one.
+  const integrity = checkDatabaseIntegrity();
+  if (!integrity.ok) {
+    console.error(
+      '[indexer] OPERATOR ALERT: database integrity check failed — refusing to process events. ' +
+      'Investigate and repair the index database before restarting the poller. ' +
+      `Reason: ${integrity.reason}`
+    );
+    return;
+  }
+
+  const rpc = getRpc();
   const startLedger = getCheckpoint() + 1;
 
   let response;
@@ -187,6 +222,11 @@ async function runPoll() {
     console.warn(`[indexer] Quarantined ${malformed} malformed event(s) at ledger ${startLedger}`);
   }
 
+  // Record successful poll timestamp and latest indexed ledger for SLO alerting
+  // (poller lag / data freshness).
+  setGauge('indexer_last_successful_poll_timestamp_seconds', Math.floor(Date.now() / 1000));
+  setGauge('indexer_latest_indexed_ledger', getLatestLedger());
+
   if (valid.length) {
     try {
       upsertEvents(valid);
@@ -198,6 +238,8 @@ async function runPoll() {
       }
       return;
     }
+
+    setGauge('indexer_latest_indexed_ledger', getLatestLedger());
 
     if (process.env.NODE_ENV !== 'test') {
       console.log(`[indexer] Stored ${valid.length} new event(s) from ledger ${startLedger}`);
@@ -286,6 +328,8 @@ module.exports = {
   stopPoller,
   poll,
   parseEvent,
+  TOPIC_MAP,
+  extractSchemaVersion,
   loadCheckpoint,
   getCheckpoint,
   backoffDelay,

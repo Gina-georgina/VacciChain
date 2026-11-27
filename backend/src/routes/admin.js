@@ -1,4 +1,5 @@
 const express = require('express');
+const { ERROR_CODES, sendError } = require('../errors');
 const crypto = require('crypto');
 const StellarSdk = require('@stellar/stellar-sdk');
 const authMiddleware = require('../middleware/auth');
@@ -28,6 +29,66 @@ function adminOnly(req, res, next) {
 // ── Issuer management ─────────────────────────────────────────────────────────
 
 /**
+ * @swagger
+ * /admin/issuers:
+ *   post:
+ *     summary: Authorize a new issuer on-chain
+ *     tags:
+ *       - Admin
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - address
+ *             properties:
+ *               address:
+ *                 type: string
+ *     responses:
+ *       201:
+ *         description: Issuer authorized
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - admin required
+ *   delete:
+ *     summary: Revoke an issuer on-chain
+ *     tags:
+ *       - Admin
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: wallet
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Issuer revoked
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - admin required
+ *   get:
+ *     summary: List all authorized issuers
+ *     tags:
+ *       - Admin
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Issuer list
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - admin required
+ */
+
+/**
  * POST /admin/issuers
  * Body: { address: string }
  * Authorizes a new issuer on-chain via add_issuer contract call.
@@ -37,11 +98,12 @@ router.post('/issuers', adminAuthMiddleware, adminOnly, validate(addIssuerSchema
 
   try {
     const result = await addIssuer(address);
+    invalidateCache(address);
     audit({ actor: req.user.wallet, action: 'admin.add_issuer', result: 'success', meta: { address } });
     res.status(201).json({ address, authorized: true, hash: result.hash });
   } catch (err) {
     audit({ actor: req.user.wallet, action: 'admin.add_issuer', result: 'failure', meta: { address, error: err.message } });
-    res.status(500).json({ error: err.message });
+    sendError(req, res, 500, ERROR_CODES.INTERNAL_ERROR, err.message);
   }
 });
 
@@ -67,7 +129,7 @@ router.delete('/issuers/:wallet', adminAuthMiddleware, adminOnly, async (req, re
     res.json({ wallet, authorized: false, hash: result.hash });
   } catch (err) {
     audit({ actor: req.user.wallet, action: 'admin.revoke_issuer', target: wallet, result: 'failure', meta: { error: err.message } });
-    res.status(500).json({ error: err.message });
+    sendError(req, res, 500, ERROR_CODES.INTERNAL_ERROR, err.message);
   }
 });
 
@@ -85,11 +147,45 @@ router.get('/issuers', adminAuthMiddleware, adminOnly, async (req, res) => {
     }
     res.json({ issuers });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendError(req, res, 500, ERROR_CODES.INTERNAL_ERROR, err.message);
   }
 });
 
 // ── Audit log ─────────────────────────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /admin/audit:
+ *   get:
+ *     summary: Query audit log entries
+ *     tags:
+ *       - Admin
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: actor
+ *         schema: { type: string }
+ *       - in: query
+ *         name: from
+ *         schema: { type: string, format: date-time }
+ *       - in: query
+ *         name: to
+ *         schema: { type: string, format: date-time }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: offset
+ *         schema: { type: integer }
+ *     responses:
+ *       200:
+ *         description: Audit entries
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - admin required
+ */
 
 /**
  * GET /admin/audit
@@ -113,6 +209,58 @@ router.get('/audit', adminAuthMiddleware, adminOnly, (req, res) => {
 
 // ── API key management ────────────────────────────────────────────────────────
 
+/**
+ * @swagger
+ * /admin/api-keys:
+ *   post:
+ *     summary: Create a verifier API key
+ *     tags:
+ *       - Admin
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - label
+ *             properties:
+ *               label:
+ *                 type: string
+ *     responses:
+ *       201:
+ *         description: API key created
+ *   get:
+ *     summary: List all API keys
+ *     tags:
+ *       - Admin
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: API key list
+ *   delete:
+ *     summary: Revoke an API key
+ *     tags:
+ *       - Admin
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: API key revoked
+ */
+
+/**
+ * POST /admin/api-keys
+ * Body: { label: string }
+ */
 router.post('/api-keys', adminAuthMiddleware, adminOnly, validate(createApiKeySchema), (req, res) => {
   const { label } = req.body;
 
@@ -135,6 +283,37 @@ router.delete('/api-keys/:id', adminAuthMiddleware, adminOnly, (req, res) => {
 });
 
 // ── JWT key rotation ──────────────────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /admin/jwt/rotate:
+ *   post:
+ *     summary: Rotate the JWT signing key at runtime
+ *     tags:
+ *       - Admin
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               new_secret:
+ *                 type: string
+ *               new_kid:
+ *                 type: string
+ *               reload_from_env:
+ *                 type: boolean
+ *     responses:
+ *       200:
+ *         description: Key rotated
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - admin required
+ */
 
 /**
  * POST /admin/jwt/rotate
@@ -163,11 +342,50 @@ router.post('/jwt/rotate', adminAuthMiddleware, adminOnly, validate(rotateJwtSch
     rotateKey({ newSecret: new_secret, newKid: new_kid });
     res.json({ rotated: true, method: 'inline', kid: new_kid || 'auto' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendError(req, res, 500, ERROR_CODES.INTERNAL_ERROR, err.message);
   }
 });
 
 // ── Multi-sig proposal management ─────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /admin/multisig/approve:
+ *   post:
+ *     summary: Approve a pending multi-sig proposal
+ *     tags:
+ *       - Admin
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - proposal_id
+ *             properties:
+ *               proposal_id:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Proposal approval recorded
+ *   get:
+ *     summary: Get the current state of a proposal
+ *     tags:
+ *       - Admin
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Proposal state
+ */
 
 /**
  * POST /admin/multisig/approve
