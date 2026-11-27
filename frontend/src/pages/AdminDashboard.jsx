@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../hooks/useFreighter';
+import { pageContainerNarrow } from '../layout.js';
 
 const s = {
-  page:    { maxWidth: 700, width: '100%', margin: '2rem auto', padding: '0 1rem', boxSizing: 'border-box' },
   table:   { width: '100%', borderCollapse: 'collapse', fontSize: '0.9rem' },
   th:      { textAlign: 'left', padding: '0.5rem 0.75rem', borderBottom: '1px solid #334155', color: '#94a3b8' },
   td:      { padding: '0.5rem 0.75rem', borderBottom: '1px solid #1e293b', color: '#e2e8f0', wordBreak: 'break-all' },
@@ -99,7 +99,7 @@ export default function AdminDashboard() {
   };
 
   return (
-    <div style={s.page}>
+    <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
       <h2 style={{ marginBottom: '1.5rem', color: 'var(--text)' }}>API Key Management</h2>
 
       <form style={s.row} onSubmit={handleCreate}>

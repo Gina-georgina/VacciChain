@@ -6,6 +6,7 @@ import NFTCard from '../components/NFTCard';
 import CopyButton from '../components/CopyButton';
 import { useToast } from '../hooks/useToast';
 import { API_BASE_URL } from '../config';
+import { pageContainerNarrow } from '../layout.js';
 
 const STELLAR_ADDRESS_RE = /^G[A-Z2-7]{55}$/;
 
@@ -13,8 +14,26 @@ export function isValidStellarAddress(address) {
   return typeof address === 'string' && STELLAR_ADDRESS_RE.test(address);
 }
 
+// Redact anything that looks like a token/secret and strip record details from
+// messages before they reach the console, toasts, or error UI.
+const SENSITIVE_PATTERN = /(bearer\s+)?[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|token[=:]\s*\S+|api[_-]?key[=:]\s*\S+/gi;
+
+function sanitizeMessage(message) {
+  const fallback = 'Verification failed. Please try again.';
+  if (typeof message !== 'string' || !message.trim()) return fallback;
+  const redacted = message.replace(SENSITIVE_PATTERN, '[redacted]');
+  // Only surface short, generic messages; drop anything that may embed record data.
+  return redacted.length > 200 ? fallback : redacted;
+}
+
+function deriveStatus(result) {
+  if (!result) return 'not-found';
+  if (result.revoked) return 'revoked';
+  if (result.vaccinated) return 'verified';
+  return 'not-found';
+}
+
 const styles = {
-  page: { maxWidth: 600, margin: '2rem auto', padding: '0 1rem' },
   input: { padding: '0.6rem 0.75rem', background: 'var(--input-bg)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: '1rem', width: '100%' },
   inputInvalid: { borderColor: '#f87171' },
   btn: { padding: '0.6rem 1.5rem', background: 'var(--btn-primary)', color: '#fff', border: 'none', borderRadius: 8, fontSize: '1rem', marginTop: '0.75rem' },
@@ -49,8 +68,9 @@ export default function VerifyPage() {
       setResultWallet(address);
     } catch (e) {
       if (requestId !== requestIdRef.current) return;
-      setError(e.message || 'Verification failed.');
-      toast(e.message || 'Verification failed.', 'error');
+      const message = sanitizeMessage(e.message);
+      setError(message);
+      toast(message, 'error');
     } finally {
       if (requestId === requestIdRef.current) setLoading(false);
     }
@@ -121,7 +141,7 @@ export default function VerifyPage() {
   const showResult = result && resultWallet && resultWallet === urlWallet;
 
   return (
-    <div style={styles.page}>
+    <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
       <h2 style={{ marginBottom: '1.5rem', color: 'var(--text)' }}>Verify Vaccination Status</h2>
       <form onSubmit={handleVerify} noValidate>
         <label htmlFor="wallet-input" style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0,0,0,0)' }}>
@@ -154,7 +174,11 @@ export default function VerifyPage() {
 
       {showResult && (
         <div style={{ marginTop: '1.5rem' }} aria-live="polite">
-          <VerificationBadge vaccinated={result.vaccinated} recordCount={result.record_count} />
+          <VerificationBadge
+            status={deriveStatus(result)}
+            vaccinated={result.vaccinated}
+            recordCount={result.record_count}
+          />
           <p style={{ color: '#64748b', fontSize: '0.85rem', marginTop: '1rem', wordBreak: 'break-all', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '0.25rem' }}>
             Wallet: {resultWallet}
             <CopyButton text={resultWallet} label="wallet address" />

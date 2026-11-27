@@ -6,9 +6,9 @@ import ConfirmMintDialog from '../components/ConfirmMintDialog';
 import CopyButton from '../components/CopyButton';
 import RoleBadge from '../components/RoleBadge';
 import RoleGuard from '../components/RoleGuard';
+import { pageContainerNarrow } from '../layout.js';
 
 const styles = {
-  page: { maxWidth: 500, width: '100%', margin: '2rem auto', padding: '0 1rem', boxSizing: 'border-box' },
   form: { display: 'flex', flexDirection: 'column', gap: '1rem' },
   input: { padding: '0.6rem 0.75rem', background: '#1e293b', border: '1px solid #334155', borderRadius: 8, color: '#e2e8f0', fontSize: '1rem', width: '100%', boxSizing: 'border-box' },
   inputError: { padding: '0.6rem 0.75rem', background: '#1e293b', border: '1px solid #f87171', borderRadius: 8, color: '#e2e8f0', fontSize: '1rem', width: '100%', boxSizing: 'border-box' },
@@ -29,7 +29,7 @@ const EMPTY_FORM = { patient_address: '', vaccine_name: '', date_administered: '
 
 export default function IssuerDashboard() {
   const { t } = useTranslation();
-  const { publicKey, role } = useAuth();
+  const { publicKey, role, connect } = useAuth();
   const { issueVaccination, checkIssuerStatus, loading } = useVaccination();
 
   const [form, setForm] = useState(() => {
@@ -73,6 +73,27 @@ export default function IssuerDashboard() {
     }
   }, [publicKey, role, checkIssuerStatus]);
 
+  if (!publicKey) {
+    return (
+      <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
+        <p style={{ color: '#94a3b8', marginBottom: '1rem' }}>Connect your issuer wallet.</p>
+        <button style={styles.btn} onClick={connect} aria-label="Connect issuer wallet">Connect Wallet</button>
+      </div>
+    );
+  }
+
+  if (role !== 'issuer') {
+    return <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}><p style={{ color: '#f87171' }}>{t('issuer.accessDenied')}</p></div>;
+  }
+
+  if (isAuthorized === null) {
+    return (
+      <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
+        <p style={{ color: '#94a3b8' }}>Checking authorization status...</p>
+      </div>
+    );
+  }
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     const result = await issueVaccination(form);
@@ -91,7 +112,7 @@ export default function IssuerDashboard() {
 
   return (
     <RoleGuard requiredRole="issuer">
-      <div style={styles.page}>
+      <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
         <div style={{ borderLeft: '4px solid #22c55e', paddingLeft: '0.75rem', marginBottom: '1.5rem' }}>
           <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem' }}>
             <h2 style={{ color: '#e2e8f0', margin: 0 }}>Issue Vaccination NFT</h2>
