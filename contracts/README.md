@@ -98,6 +98,32 @@ Upgrades the contract WASM code.
 
 **Authorization:** Requires admin signature
 
+**Upgrade authorization and compatibility process:**
+
+1. **Proposer**: Only the current admin (as set by `initialize` / `accept_admin`)
+   may call `upgrade`. There is no separate proposer role; the admin is the sole
+   authorized proposer.
+2. **Approval**: The upgrade is authorized by the admin's signature on the
+   `upgrade` invocation. Multi-party approval, if required by governance, must be
+   enforced off-chain (e.g., a multisig admin address) before the call is made.
+3. **Artifact review**: The `new_wasm_hash` must correspond to a WASM artifact
+   that has been reproducibly built (see *Reproducible Builds*) and reviewed
+   against the tagged source release. The hash is the sole on-chain commitment
+   to the reviewed artifact.
+4. **Rollback limitations**: Soroban upgrades replace the WASM in place. There is
+   no automatic rollback; reverting requires a subsequent `upgrade` call with the
+   previously reviewed hash. Storage written by a new version is **not** migrated
+   or reverted automatically, so upgrades must be storage-compatible or perform
+   explicit, idempotent migrations.
+5. **Client compatibility**: `VaccinationRecord.schema_version` and the versioned
+   event schemas (see *Events*) allow clients and indexers to interpret data
+   across upgrades. New versions must not reorder or reuse `ContractError` codes
+   or event field positions; additions are append-only.
+6. **Unauthorized upgrades**: Calls from any address other than the admin fail
+   with `ContractError::Unauthorized`, and contract state is left unchanged.
+   Tests verify unauthorized upgrades fail and that state remains valid across
+   supported upgrade paths.
+
 ### Issuer Functions
 
 #### `mint_vaccination(env: Env, patient: Address, vaccine_name: String, date_administered: String, issuer: Address) -> Result<u64, ContractError>`
@@ -161,6 +187,22 @@ Batch verification for multiple wallets (max 100).
 
 **Panics:** If more than 100 addresses provided
 
+**Batch maximum and resource limits:**
+- The maximum batch size is **100 wallets** (`MAX_BATCH_SIZE`). This limit is
+  validated at the very start of `batch_verify`, before any ledger storage is
+  read, so an over-limit call fails fast without incurring storage-access cost.
+- Each wallet in the batch performs a bounded number of storage reads (patient
+  token list + one read per token). The per-invocation limit is therefore
+  `100 × (1 + tokens_per_patient)` reads; callers should keep per-patient token
+  counts small to stay within Soroban CPU/memory budgets.
+- Mixed results are supported: a batch may contain wallets with no records
+  (`is_vaccinated == false`, empty vector), wallets with only revoked records
+  (also `false`), and wallets with active records (`true`). The output vector
+  preserves input order and has exactly one entry per input wallet.
+- Over-limit input (more than 100 wallets) is rejected with a panic before any
+  storage access; this is covered by resource tests alongside maximum-size and
+  mixed-result cases.
+
 ---
 
 #### `get_issuer(env: Env, address: Address) -> Option<IssuerRecord>`
@@ -184,6 +226,35 @@ Checks if an address is an authorized issuer.
 **Returns:**
 - `true` if address is an authorized issuer
 - `false` otherwise
+
+## Events
+
+Events are versioned and stable so indexers can safely interpret payloads across
+upgrades. Every event carries a `version: u32` field (currently `1`) as its first
+data field, and event names are stable strings. New fields are appended only;
+existing field order and meaning never change within a version. A breaking change
+requires a new event name or a bumped `version`, and indexers must key on
+`(name, version)`.
+
+| Event name | Version | Fields (in order) | Emitted by |
+|------------|---------|-------------------|------------|
+| `init` | 1 | `version`, `admin` | `initialize` |
+| `issuer_added` | 1 | `version`, `issuer`, `name`, `license`, `country` | `add_issuer` |
+| `issuer_revoked` | 1 | `version`, `issuer` | `revoke_issuer` |
+| `admin_proposed` | 1 | `version`, `new_admin`, `expiry` | `propose_admin` |
+| `admin_accepted` | 1 | `version`, `new_admin` | `accept_admin` |
+| `upgraded` | 1 | `version`, `new_wasm_hash` | `upgrade` |
+| `mint` | 1 | `version`, `token_id`, `patient`, `issuer`, `schema_version` | `mint_vaccination` |
+| `revoke` | 1 | `version`, `token_id`, `revoker` | `revoke_vaccination` |
+
+**Compatibility rules:**
+- Event names and field order are part of the public interface and are covered by
+  contract tests and indexer fixtures.
+- `schema_version` on `VaccinationRecord` and `version` on events advance
+  independently; indexers must handle records whose `schema_version` is older
+  than the current event `version`.
+- Unknown future versions must be ignored (not misclassified) by indexers rather
+  than treated as the current version.
 
 ### Soulbound Enforcement
 
@@ -252,6 +323,81 @@ pub enum DataKey {
 3. **Patients → Records**: Each patient has a list of their token IDs
 4. **Records → Revocation**: Each record can be revoked by original issuer or admin
 
+## ADR: Storage Sizing, Rent, and Archival Strategy
+
+**Status:** Approved
+**Context:** Backlog items #78 (storage growth/archival), #90 (missing/expired storage), #92 (schema migrations).
+
+This ADR quantifies persistent storage cost for long-lived vaccination histories and issuer
+records, and defines the approved retention/compaction/indexing approach. It must not violate
+audit requirements: **records are never deleted, only revoked.**
+
+### Per-Entry Size Estimates
+
+Soroban charges rent per ledger entry based on serialized size plus a fixed per-entry overhead.
+The estimates below are approximate serialized sizes (bytes) for the dominant fields; treat them
+as upper bounds for planning.
+
+| Entry | Contents | Est. size (bytes) |
+|-------|----------|-------------------|
+| `Token(u64)` → `VaccinationRecord` | token_id (8) + patient Address (~32) + vaccine_name (≤100) + date_administered (≤100) + issuer Address (~32) + timestamp (8) + schema_version (4) + revoked (1) + struct/key overhead (~64) | **~350** |
+| `Revoked(u64)` | key (8) + bool (1) + overhead (~32) | **~40** |
+| `Issuer(BytesN<32>)` → `IssuerRecord` | name (≤100) + license (≤100) + country (≤100) + authorized (1) + overhead (~64) | **~370** |
+| `PatientTokens(BytesN<32>)` → `Vec<u64>` | 32-byte hash key + 8 bytes per token id + vec overhead (~32) | **~40 + 8·N** |
+| `Admin` / `Initialized` / `PendingAdmin` / `AdminTransferExpiry` / `NextTokenId` | scalar entries | **~40 each (~200 total)** |
+
+Note: `PatientTokens` grows linearly with the number of records per patient, so a patient with
+`N` records costs roughly `350·N` (records) + `40·N` (revocation flags) + `8·N` (index) bytes.
+
+### Projected Storage at Expected Volumes
+
+Assumptions: average 3 vaccination records per patient, 1 issuer per ~5,000 patients.
+
+| Scenario | Patients | Records | Issuers | Est. total bytes | Est. total (MiB) |
+|----------|----------|---------|---------|------------------|------------------|
+| Pilot | 10,000 | 30,000 | 5 | ~12.0 MB | ~11.5 |
+| Regional | 1,000,000 | 3,000,000 | 200 | ~1.20 GB | ~1,145 |
+| National | 50,000,000 | 150,000,000 | 10,000 | ~60 GB | ~57,220 |
+
+Issuer records are negligible relative to vaccination records; growth is dominated by
+`Token` entries and their per-patient index entries.
+
+### Soroban Rent Implications
+
+- Every persistent entry accrues rent proportional to its size and the length of time it stays
+  live. Long-lived vaccination histories therefore have an ongoing, non-trivial rent cost.
+- Entries whose TTL is not extended will **expire** (be archived) and become unavailable to the
+  contract until restored. Reads of expired entries return "missing" and must be handled
+  explicitly (see #90).
+- The contract extends TTLs on write paths (mint, revoke, issuer add/revoke) so that active
+  records remain live. Extension thresholds and bump amounts are documented in
+  [`docs/resource-limits.md`](../docs/resource-limits.md).
+- Rent and resource consumption per operation are measured in [`GAS_REPORT.md`](../GAS_REPORT.md).
+  Any change to storage layout must be re-measured there.
+
+### Approved Retention / Compaction / Indexing Approach
+
+1. **Never delete records.** Revocation sets `revoked = true` and the `Revoked(id)` flag; the
+   `VaccinationRecord` and its `PatientTokens` entry are retained permanently for audit. There is
+   no delete path in the contract.
+2. **TTL extension, not compaction.** Active entries have their TTL extended on write. Expired
+   entries are restored (via Soroban archival restore) rather than recreated, preserving the
+   original data and audit trail.
+3. **Off-chain indexing.** Query-heavy workloads (history lookups, reporting, analytics) are
+   served by an off-chain indexer that consumes contract events and mirrors state. The contract
+   remains the source of truth; the indexer is a read-optimized cache and is never authoritative.
+4. **Bounded inputs.** All string fields are length-validated (≤100 chars) to keep per-entry size
+   and rent bounded.
+5. **Schema versioning.** `VaccinationRecord.schema_version` allows forward-compatible reads.
+   Schema changes require fixture-based migration tests against prior state, and unsupported
+   upgrade paths must fail safely with a documented recovery plan (see #92).
+
+### Storage Lifecycle & Missing/Expired Entries
+
+- Missing or expired entries must be treated as "not found", never as "authorized". Authorization
+  checks (`is_issuer`, admin checks) must fail closed when the relevant entry is absent.
+- Tests cover expired/missing entries and assert that authorization cannot fail open (see #90).
+
 ## Error Codes
 
 Error codes are stable integers. Do not reorder or reuse codes; append new variants with a new code.
@@ -305,6 +451,30 @@ cargo build --target wasm32-unknown-unknown --release
 The compiled WASM artifact will be located at:
 `target/wasm32-unknown-unknown/release/vaccichain.wasm`
 
+### Reproducible Builds
+
+Release WASM artifacts must be independently reproducible so the deployed hash can
+be compared against the reviewed source release.
+
+- **Pinned toolchain**: The Rust toolchain is pinned via `rust-toolchain.toml`
+  (channel and components). Builds must use this pinned toolchain.
+- **Pinned dependencies**: `Cargo.lock` is committed and must not be regenerated
+  during a release build. Dependency versions are locked.
+- **Deterministic flags**: Build with `--locked` and the release profile; the
+  `wasm32-unknown-unknown` target is pinned in the toolchain file.
+- **Artifact hash**: After building, generate the SHA-256 of the WASM artifact and
+  record it with the release candidate:
+
+  ```bash
+  cargo build --locked --target wasm32-unknown-unknown --release
+  sha256sum target/wasm32-unknown-unknown/release/vaccichain.wasm
+  ```
+
+- **Verification**: A clean runner (fresh checkout, pinned toolchain, committed
+  `Cargo.lock`) must reproduce the same artifact hash. Any nondeterministic input
+  (e.g., absolute paths, timestamps, or unpinned tooling) must be documented in
+  the release notes; if the hash cannot be reproduced, the release is blocked.
+
 ### Running Tests
 
 ```bash
@@ -324,9 +494,13 @@ The contract includes comprehensive tests covering:
 - Input validation
 - Admin transfer functionality
 - Revocation mechanisms
-- Batch verification
+- Batch verification (maximum batch size, mixed results, over-limit rejection)
+- Event schema compatibility (names, field order, versions)
+- Upgrade authorization (unauthorized upgrades fail, state valid across paths)
 - Soulbound transfer prevention
 - Edge cases and error conditions
+- Storage lifecycle: missing/expired entries and fail-closed authorization (#90)
+- Schema migration fixtures against prior on-chain state (#92)
 
 ## Deployment Guide
 
@@ -368,3 +542,6 @@ make deploy
 - **Audit Trail**: Revoked records are preserved, not deleted
 - **Input Validation**: All string inputs are length-validated
 - **Admin Controls**: Two-step admin transfer with expiry protection
+- **Upgrade Authorization**: Only the admin can upgrade; artifacts are reviewed and reproducibly built before deployment
+- **Event Stability**: Versioned event schemas let indexers interpret payloads safely across upgrades
+- **Bounded Batch Verification**: Batch size is capped and validated before storage access to bound resource usage

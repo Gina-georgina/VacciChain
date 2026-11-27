@@ -7,7 +7,7 @@
   "containerDefinitions": [
     {
       "name": "frontend",
-      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-frontend:staging-latest",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-frontend:${GITHUB_SHA}",
       "portMappings": [
         {
           "containerPort": 80,
@@ -15,6 +15,16 @@
           "protocol": "tcp"
         }
       ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -fsS http://localhost/healthz || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
@@ -26,13 +36,13 @@
       "dependsOn": [
         {
           "containerName": "backend",
-          "condition": "START"
+          "condition": "HEALTHY"
         }
       ]
     },
     {
       "name": "backend",
-      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-backend:staging-latest",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-backend:${GITHUB_SHA}",
       "portMappings": [
         {
           "containerPort": 4000,
@@ -100,6 +110,16 @@
           "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:vaccichain/staging/stellar:JWT_SECRET::"
         }
       ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:4000/health/ready || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
@@ -111,13 +131,13 @@
       "dependsOn": [
         {
           "containerName": "python-service",
-          "condition": "START"
+          "condition": "HEALTHY"
         }
       ]
     },
     {
       "name": "python-service",
-      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-python:staging-latest",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-python:${GITHUB_SHA}",
       "portMappings": [
         {
           "containerPort": 8001,
@@ -131,6 +151,16 @@
           "value": "http://backend:4000"
         }
       ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:8001/health/ready || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {

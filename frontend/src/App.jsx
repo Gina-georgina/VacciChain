@@ -6,6 +6,7 @@ import VerifyPage from './pages/VerifyPage';
 import AdminDashboard from './pages/AdminDashboard';
 import IssuerOnboarding from './pages/IssuerOnboarding';
 import AnalyticsDashboard from './pages/AnalyticsDashboard';
+import { useEffect } from 'react';
 import { AuthProvider } from './hooks/useFreighter';
 import { useDarkMode } from './hooks/useDarkMode';
 import { AnnouncerProvider } from './hooks/useAnnounce';
@@ -13,9 +14,19 @@ import FreighterBanner from './components/FreighterBanner';
 import DemoBanner from './components/DemoBanner';
 import NavBar from './components/NavBar';
 import SkipToContent from './components/SkipToContent';
+import NotFoundPage from './pages/NotFoundPage';
 
 export default function App() {
   const [dark, setDark] = useDarkMode();
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (dark) {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
+  }, [dark]);
 
   return (
     <AuthProvider>
@@ -33,6 +44,7 @@ export default function App() {
             <Route path="/admin" element={<AdminDashboard />} />
             <Route path="/apply" element={<IssuerOnboarding />} />
             <Route path="/analytics" element={<AnalyticsDashboard />} />
+            <Route path="*" element={<NotFoundPage />} />
           </Routes>
         </main>
       </AnnouncerProvider>
