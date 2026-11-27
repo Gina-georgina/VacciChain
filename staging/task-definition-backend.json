@@ -7,7 +7,7 @@
   "containerDefinitions": [
     {
       "name": "frontend",
-      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-frontend:staging-latest",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-frontend:${GITHUB_SHA}",
       "portMappings": [
         {
           "containerPort": 80,
@@ -42,7 +42,7 @@
     },
     {
       "name": "backend",
-      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-backend:staging-latest",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-backend:${GITHUB_SHA}",
       "portMappings": [
         {
           "containerPort": 4000,
@@ -137,7 +137,7 @@
     },
     {
       "name": "python-service",
-      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-python:staging-latest",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/vaccichain-python:${GITHUB_SHA}",
       "portMappings": [
         {
           "containerPort": 8001,

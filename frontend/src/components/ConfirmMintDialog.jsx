@@ -19,10 +19,21 @@ function getFocusableElements(root) {
   return Array.from(root.querySelectorAll(selectors)).filter((el) => el.offsetParent !== null);
 }
 
-export default function ConfirmMintDialog({ record, onConfirm, onCancel }) {
+export default function ConfirmMintDialog({ record, onConfirm, onCancel, isSubmitting = false }) {
   const overlayRef = useRef(null);
   const boxRef = useRef(null);
   const previousActive = useRef(null);
+  const submittingRef = useRef(isSubmitting);
+
+  useEffect(() => {
+    submittingRef.current = isSubmitting;
+  }, [isSubmitting]);
+
+  const handleConfirm = () => {
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    onConfirm();
+  };
 
   useEffect(() => {
     previousActive.current = document.activeElement;
@@ -76,8 +87,15 @@ export default function ConfirmMintDialog({ record, onConfirm, onCancel }) {
           <div style={row}><span style={{ color: '#64748b' }}>Date</span><span>{record.date_administered}</span></div>
         </div>
         <div style={btnRow}>
-          <button style={btnCancel} onClick={onCancel}>Cancel</button>
-          <button style={btnConfirm} onClick={onConfirm}>Confirm &amp; Mint</button>
+          <button style={btnCancel} onClick={onCancel} disabled={isSubmitting}>Cancel</button>
+          <button
+            style={{ ...btnConfirm, opacity: isSubmitting ? 0.6 : 1, cursor: isSubmitting ? 'not-allowed' : 'pointer' }}
+            onClick={handleConfirm}
+            disabled={isSubmitting}
+            aria-busy={isSubmitting}
+          >
+            {isSubmitting ? 'Minting…' : 'Confirm & Mint'}
+          </button>
         </div>
       </div>
     </div>

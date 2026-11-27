@@ -37,7 +37,6 @@ const ADMIN_ROTATION_OPERATION = 'admin.rotate';
 // rotation may be in flight at a time so that a compromised key cannot stack
 // competing proposals.
 let activeAdminRotation = null;
-=======
 
 const router = express.Router();
 

@@ -153,6 +153,128 @@ describe('poller — parseEvent', () => {
   });
 });
 
+describe('db — integrity and startup checks', () => {
+  const { checkDatabaseIntegrity } = require('../src/indexer/db');
+
+  it('reports a valid database as healthy', async () => {
+    const result = await checkDatabaseIntegrity(tmpDb);
+    expect(result.ok).toBe(true);
+    expect(result.schemaVersion).toBeDefined();
+    expect(Array.isArray(result.missingTables)).toBe(true);
+    expect(result.missingTables.length).toBe(0);
+  });
+
+  it('fails closed on a corrupt database without creating a replacement', async () => {
+    const corruptPath = path.join(os.tmpdir(), `vaccichain-corrupt-${Date.now()}.db`);
+    fs.writeFileSync(corruptPath, 'this is not a sqlite database');
+    const sizeBefore = fs.statSync(corruptPath).size;
+
+    const result = await checkDatabaseIntegrity(corruptPath);
+    expect(result.ok).toBe(false);
+    expect(result.alert).toBeTruthy();
+    expect(result.alert).toMatch(/corrupt|integrity|inaccessible/i);
+
+    // Must not silently replace the corrupt file with an empty database
+    expect(fs.existsSync(corruptPath)).toBe(true);
+    expect(fs.statSync(corruptPath).size).toBe(sizeBefore);
+    expect(fs.readFileSync(corruptPath, 'utf8')).toBe('this is not a sqlite database');
+
+    fs.unlinkSync(corruptPath);
+  });
+
+  it('fails closed on an inaccessible database path', async () => {
+    const inaccessiblePath = path.join(
+      os.tmpdir(),
+      `vaccichain-missing-dir-${Date.now()}`,
+      'nested',
+      'db.sqlite'
+    );
+
+    const result = await checkDatabaseIntegrity(inaccessiblePath);
+    expect(result.ok).toBe(false);
+    expect(result.alert).toBeTruthy();
+    expect(fs.existsSync(inaccessiblePath)).toBe(false);
+  });
+
+  it('detects missing required tables', async () => {
+    const emptyPath = path.join(os.tmpdir(), `vaccichain-empty-${Date.now()}.db`);
+    const Database = require('better-sqlite3');
+    const db = new Database(emptyPath);
+    db.close();
+
+    const result = await checkDatabaseIntegrity(emptyPath);
+    expect(result.ok).toBe(false);
+    expect(result.missingTables.length).toBeGreaterThan(0);
+    expect(result.alert).toBeTruthy();
+
+    fs.unlinkSync(emptyPath);
+  });
+});
+
+describe('versioned event schemas', () => {
+  const v1Raw = {
+    id: 'raw-v1-001',
+    topic: [{ value: { toString: () => 'minted' } }],
+    ledger: 300,
+    ledgerClosedAt: '2024-02-01T00:00:00Z',
+    contractId: 'CABC',
+    value: { vaccine_name: 'Flu', issuer: 'GISSUER1' },
+  };
+
+  const v2Raw = {
+    id: 'raw-v2-001',
+    topic: [{ value: { toString: () => 'minted' } }],
+    ledger: 301,
+    ledgerClosedAt: '2024-02-01T00:01:00Z',
+    contractId: 'CABC',
+    value: {
+      schema_version: 2,
+      vaccine_name: 'Flu',
+      issuer: 'GISSUER1',
+      dose_number: 2,
+      metadata: { lot: 'LOT-42' },
+    },
+  };
+
+  it('maps v1 payloads to VaccinationMinted with schema_version 1', () => {
+    const parsed = parseEvent(v1Raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed.event_type).toBe('VaccinationMinted');
+    expect(parsed.payload.schema_version).toBe(1);
+    expect(parsed.payload.vaccine_name).toBe('Flu');
+  });
+
+  it('maps v2 payloads to VaccinationMinted preserving schema_version 2', () => {
+    const parsed = parseEvent(v2Raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed.event_type).toBe('VaccinationMinted');
+    expect(parsed.payload.schema_version).toBe(2);
+    expect(parsed.payload.dose_number).toBe(2);
+    expect(parsed.payload.metadata.lot).toBe('LOT-42');
+  });
+
+  it('does not misclassify v1 and v2 payloads as different event types', () => {
+    expect(parseEvent(v1Raw).event_type).toBe(parseEvent(v2Raw).event_type);
+  });
+
+  it('stores and retrieves versioned payloads without misclassification', () => {
+    const parsedV1 = parseEvent(v1Raw);
+    const parsedV2 = parseEvent(v2Raw);
+    upsertEvents([parsedV1, parsedV2]);
+
+    const stored = queryEvents({ event_type: 'VaccinationMinted' });
+    const byId = new Map(stored.map((e) => [e.id, e]));
+
+    expect(byId.get('raw-v1-001').payload.schema_version).toBe(1);
+    expect(byId.get('raw-v2-001').payload.schema_version).toBe(2);
+    expect(byId.get('raw-v2-001').payload.dose_number).toBe(2);
+    expect(byId.get('raw-v1-001').event_type).toBe('VaccinationMinted');
+    expect(byId.get('raw-v2-001').event_type).toBe('VaccinationMinted');
+  });
+});
+  });
+});
+
 describe('poller — resilience', () => {
   const rawEvent = (id, ledger, topic = 'minted') => ({
     id,

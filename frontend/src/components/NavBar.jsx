@@ -292,6 +292,31 @@ export default function NavBar({ dark, onToggleDark }) {
         <DarkModeToggle dark={dark} onToggle={onToggleDark} />
         <WalletIndicator />
       </div>
+
+      <style>{`
+        @media (max-width: 639px) {
+          .nav-hamburger { display: block !important; }
+          .nav-links {
+            display: ${open ? 'flex' : 'none'} !important;
+            flex-direction: column;
+            align-items: flex-start;
+            width: 100%;
+            padding: 0.5rem 0;
+            gap: 0.75rem;
+          }
+        }
+
+        /* Reduced motion: disable any nav transitions/animations (menu open/close, focus) */
+        @media (prefers-reduced-motion: reduce) {
+          .nav-hamburger,
+          .nav-links,
+          .nav-links a,
+          .nav-links button {
+            transition: none !important;
+            animation: none !important;
+          }
+        }
+      `}</style>
     </nav>
   );
 }

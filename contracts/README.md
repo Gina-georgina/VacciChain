@@ -122,6 +122,32 @@ Upgrades the contract WASM code.
 
 **Authorization:** Requires admin signature
 
+**Upgrade authorization and compatibility process:**
+
+1. **Proposer**: Only the current admin (as set by `initialize` / `accept_admin`)
+   may call `upgrade`. There is no separate proposer role; the admin is the sole
+   authorized proposer.
+2. **Approval**: The upgrade is authorized by the admin's signature on the
+   `upgrade` invocation. Multi-party approval, if required by governance, must be
+   enforced off-chain (e.g., a multisig admin address) before the call is made.
+3. **Artifact review**: The `new_wasm_hash` must correspond to a WASM artifact
+   that has been reproducibly built (see *Reproducible Builds*) and reviewed
+   against the tagged source release. The hash is the sole on-chain commitment
+   to the reviewed artifact.
+4. **Rollback limitations**: Soroban upgrades replace the WASM in place. There is
+   no automatic rollback; reverting requires a subsequent `upgrade` call with the
+   previously reviewed hash. Storage written by a new version is **not** migrated
+   or reverted automatically, so upgrades must be storage-compatible or perform
+   explicit, idempotent migrations.
+5. **Client compatibility**: `VaccinationRecord.schema_version` and the versioned
+   event schemas (see *Events*) allow clients and indexers to interpret data
+   across upgrades. New versions must not reorder or reuse `ContractError` codes
+   or event field positions; additions are append-only.
+6. **Unauthorized upgrades**: Calls from any address other than the admin fail
+   with `ContractError::Unauthorized`, and contract state is left unchanged.
+   Tests verify unauthorized upgrades fail and that state remains valid across
+   supported upgrade paths.
+
 ### Issuer Functions
 
 #### `mint_vaccination(env: Env, patient: Address, vaccine_name: String, date_administered: String, issuer: Address) -> Result<u64, ContractError>`
@@ -155,8 +181,6 @@ Normalization rules (applied identically in API and contract):
 - `dose_number`: integer dose index (1-based) distinguishing legitimate repeat doses.
 
 **Repeat doses:** Legitimate repeat doses are allowed because `dose_number` is part of the key. Minting dose 2 of the same vaccine on the same date for the same patient is not a duplicate; minting the same `dose_number` again is. Concurrency cannot bypass the check: the duplicate lookup and insertion occur within a single contract invocation, and Soroban serializes invocations per contract instance.
-
-**Authorization:** Requires issuer signature
 
 ---
 
@@ -211,6 +235,22 @@ Batch verification for multiple wallets (max 100).
 
 **Panics:** If more than 100 addresses provided
 
+**Batch maximum and resource limits:**
+- The maximum batch size is **100 wallets** (`MAX_BATCH_SIZE`). This limit is
+  validated at the very start of `batch_verify`, before any ledger storage is
+  read, so an over-limit call fails fast without incurring storage-access cost.
+- Each wallet in the batch performs a bounded number of storage reads (patient
+  token list + one read per token). The per-invocation limit is therefore
+  `100 × (1 + tokens_per_patient)` reads; callers should keep per-patient token
+  counts small to stay within Soroban CPU/memory budgets.
+- Mixed results are supported: a batch may contain wallets with no records
+  (`is_vaccinated == false`, empty vector), wallets with only revoked records
+  (also `false`), and wallets with active records (`true`). The output vector
+  preserves input order and has exactly one entry per input wallet.
+- Over-limit input (more than 100 wallets) is rejected with a panic before any
+  storage access; this is covered by resource tests alongside maximum-size and
+  mixed-result cases.
+
 ---
 
 #### `get_issuer(env: Env, address: Address) -> Option<IssuerRecord>`
@@ -234,6 +274,35 @@ Checks if an address is an authorized issuer.
 **Returns:**
 - `true` if address is an authorized issuer
 - `false` otherwise
+
+## Events
+
+Events are versioned and stable so indexers can safely interpret payloads across
+upgrades. Every event carries a `version: u32` field (currently `1`) as its first
+data field, and event names are stable strings. New fields are appended only;
+existing field order and meaning never change within a version. A breaking change
+requires a new event name or a bumped `version`, and indexers must key on
+`(name, version)`.
+
+| Event name | Version | Fields (in order) | Emitted by |
+|------------|---------|-------------------|------------|
+| `init` | 1 | `version`, `admin` | `initialize` |
+| `issuer_added` | 1 | `version`, `issuer`, `name`, `license`, `country` | `add_issuer` |
+| `issuer_revoked` | 1 | `version`, `issuer` | `revoke_issuer` |
+| `admin_proposed` | 1 | `version`, `new_admin`, `expiry` | `propose_admin` |
+| `admin_accepted` | 1 | `version`, `new_admin` | `accept_admin` |
+| `upgraded` | 1 | `version`, `new_wasm_hash` | `upgrade` |
+| `mint` | 1 | `version`, `token_id`, `patient`, `issuer`, `schema_version` | `mint_vaccination` |
+| `revoke` | 1 | `version`, `token_id`, `revoker` | `revoke_vaccination` |
+
+**Compatibility rules:**
+- Event names and field order are part of the public interface and are covered by
+  contract tests and indexer fixtures.
+- `schema_version` on `VaccinationRecord` and `version` on events advance
+  independently; indexers must handle records whose `schema_version` is older
+  than the current event `version`.
+- Unknown future versions must be ignored (not misclassified) by indexers rather
+  than treated as the current version.
 
 ### Soulbound Enforcement
 
@@ -432,6 +501,30 @@ cargo build --target wasm32-unknown-unknown --release
 The compiled WASM artifact will be located at:
 `target/wasm32-unknown-unknown/release/vaccichain.wasm`
 
+### Reproducible Builds
+
+Release WASM artifacts must be independently reproducible so the deployed hash can
+be compared against the reviewed source release.
+
+- **Pinned toolchain**: The Rust toolchain is pinned via `rust-toolchain.toml`
+  (channel and components). Builds must use this pinned toolchain.
+- **Pinned dependencies**: `Cargo.lock` is committed and must not be regenerated
+  during a release build. Dependency versions are locked.
+- **Deterministic flags**: Build with `--locked` and the release profile; the
+  `wasm32-unknown-unknown` target is pinned in the toolchain file.
+- **Artifact hash**: After building, generate the SHA-256 of the WASM artifact and
+  record it with the release candidate:
+
+  ```bash
+  cargo build --locked --target wasm32-unknown-unknown --release
+  sha256sum target/wasm32-unknown-unknown/release/vaccichain.wasm
+  ```
+
+- **Verification**: A clean runner (fresh checkout, pinned toolchain, committed
+  `Cargo.lock`) must reproduce the same artifact hash. Any nondeterministic input
+  (e.g., absolute paths, timestamps, or unpinned tooling) must be documented in
+  the release notes; if the hash cannot be reproduced, the release is blocked.
+
 ### Running Tests
 
 ```bash
@@ -454,7 +547,9 @@ The contract includes comprehensive tests covering:
 - Duplicate detection (exact duplicates, normalized-equivalent values, legitimate repeat doses)
 - Issuer lifecycle state transitions (add, revoke, re-add, idempotency)
 - Admin recovery/rotation (proposal, acceptance, expiry, replay, unauthorized attempts)
-- Batch verification
+- Batch verification (maximum batch size, mixed results, over-limit rejection)
+- Event schema compatibility (names, field order, versions)
+- Upgrade authorization (unauthorized upgrades fail, state valid across paths)
 - Soulbound transfer prevention
 - Edge cases and error conditions
 - Storage lifecycle: missing/expired entries and fail-closed authorization (#90)
@@ -501,3 +596,6 @@ make deploy
 - **Revocation Semantics**: Verifiers treat revoked records as invalid; revocation does not affect issuer permission or other records
 - **Input Validation**: All string inputs are length-validated
 - **Admin Controls**: Two-step admin transfer with 24-hour expiry, cancellation, and replay protection; no unilateral control path
+- **Upgrade Authorization**: Only the admin can upgrade; artifacts are reviewed and reproducibly built before deployment
+- **Event Stability**: Versioned event schemas let indexers interpret payloads safely across upgrades
+- **Bounded Batch Verification**: Batch size is capped and validated before storage access to bound resource usage

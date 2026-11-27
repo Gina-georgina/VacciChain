@@ -2,7 +2,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const StellarSdk = require('@stellar/stellar-sdk');
 const { buildChallenge, verifyChallenge } = require('../stellar/sep10');
-const { sep10Limiter } = require('../middleware/rateLimiter');
+const { sep10Limiter, verifyLimiter } = require('../middleware/rateLimiter');
 const { audit } = require('../middleware/auditLog');
 const validate = require('../middleware/validate');
 const { bruteForceGuard, recordFailure, recordSuccess } = require('../middleware/bruteForce');
@@ -47,7 +47,19 @@ const router = express.Router();
  *       400:
  *         description: Invalid Stellar public key format
  *       429:
- *         description: Rate limit exceeded (max 10 requests per IP per minute)
+ *         description: >
+ *           Rate limit exceeded (max 10 requests per trusted client per minute).
+ *           The response body is `{ "error": "...", "retryAfter": <seconds> }`
+ *           and the `RateLimit` and `Retry-After` headers are set.
+ *         headers:
+ *           RateLimit:
+ *             description: Rate limit policy and remaining quota
+ *             schema:
+ *               type: string
+ *           Retry-After:
+ *             description: Seconds until the client may retry
+ *             schema:
+ *               type: integer
  *       500:
  *         description: Internal server error
  */
@@ -111,8 +123,23 @@ router.post('/sep10', sep10Limiter, validate(sep10Schema), async (req, res) => {
  *         description: Missing or malformed parameters
  *       401:
  *         description: Invalid signature or nonce mismatch
+ *       429:
+ *         description: >
+ *           Rate limit exceeded (max 10 verification attempts per trusted
+ *           client per minute). The response body is
+ *           `{ "error": "...", "retryAfter": <seconds> }` and the `RateLimit`
+ *           and `Retry-After` headers are set.
+ *         headers:
+ *           RateLimit:
+ *             description: Rate limit policy and remaining quota
+ *             schema:
+ *               type: string
+ *           Retry-After:
+ *             description: Seconds until the client may retry
+ *             schema:
+ *               type: integer
  */
-router.post('/verify', validate(verifySchema), bruteForceGuard, (req, res) => {
+router.post('/verify', verifyLimiter, validate(verifySchema), bruteForceGuard, (req, res) => {
   const { transaction, nonce } = req.body;
   const ip = req.ip || req.socket?.remoteAddress || 'unknown';
 

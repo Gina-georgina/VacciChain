@@ -2,6 +2,7 @@ const request = require('supertest');
 const express = require('express');
 const errorHandler = require('../src/middleware/errorHandler');
 const requestId = require('../src/middleware/requestId');
+const logger = require('../src/utils/logger');
 
 function makeApp(routeHandler) {
   const app = express();
@@ -77,5 +78,85 @@ describe('errorHandler middleware', () => {
     const res = await request(app).get('/test');
     expect(res.status).toBe(503);
     expect(res.body.error).toBe('Internal Server Error');
+  });
+
+  describe('log redaction', () => {
+    const JWT =
+      'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U';
+    const SECRET_KEY = 'sk_live_super_secret_key_value_1234567890';
+    const SIGNED_XDR =
+      'AAAAAgAAAABsignedTransactionPayloadEnvelopeBase64EncodedValueXYZ1234567890==';
+
+    let logSpy;
+
+    beforeEach(() => {
+      logSpy = jest.spyOn(logger, 'error').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      logSpy.mockRestore();
+    });
+
+    function emittedLogText() {
+      return logSpy.mock.calls
+        .map((args) => args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '))
+        .join('\n');
+    }
+
+    it('redacts JWTs, secret keys and signed payloads from error logs', async () => {
+      const app = makeApp((req, _res, next) => {
+        const err = new Error('payment failed');
+        err.statusCode = 400;
+        err.details = {
+          authorization: `Bearer ${JWT}`,
+          secretKey: SECRET_KEY,
+          signedXdr: SIGNED_XDR,
+        };
+        req.headers.authorization = `Bearer ${JWT}`;
+        req.body = { secretKey: SECRET_KEY, signedXdr: SIGNED_XDR };
+        next(err);
+      });
+
+      await request(app)
+        .get('/test')
+        .set('Authorization', `Bearer ${JWT}`)
+        .set('X-Api-Key', SECRET_KEY);
+
+      const text = emittedLogText();
+      expect(text).not.toContain(JWT);
+      expect(text).not.toContain(SECRET_KEY);
+      expect(text).not.toContain(SIGNED_XDR);
+    });
+
+    it('does not leak secrets embedded in error messages', async () => {
+      const app = makeApp((_req, _res, next) => {
+        const err = new Error(`invalid token ${JWT} with key ${SECRET_KEY}`);
+        next(err);
+      });
+
+      await request(app).get('/test');
+
+      const text = emittedLogText();
+      expect(text).not.toContain(JWT);
+      expect(text).not.toContain(SECRET_KEY);
+    });
+
+    it('omits unnecessary internal details from health log records', async () => {
+      const app = makeApp((_req, _res, next) => {
+        const err = new Error('health check failed');
+        err.statusCode = 503;
+        err.health = {
+          database: { host: '10.0.0.5', user: 'admin', password: SECRET_KEY },
+          uptime: 12345,
+        };
+        next(err);
+      });
+
+      await request(app).get('/test');
+
+      const text = emittedLogText();
+      expect(text).not.toContain(SECRET_KEY);
+      expect(text).not.toContain('10.0.0.5');
+    });
   });
 });

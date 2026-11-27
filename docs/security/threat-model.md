@@ -111,11 +111,14 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 | B-T1 | Tampering | Attacker injects malicious wallet address into `/vaccination/issue` body | `wallet.js` middleware validates Stellar public key format (starts with `G`, 56 chars); Soroban contract re-validates | Low |
 | B-T2 | Tampering | Attacker tampers with audit log to hide actions | Audit log is append-only NDJSON; no delete endpoint exists | Medium — filesystem access enables tampering; use write-once storage in production |
 | B-R1 | Repudiation | Issuer denies calling `/vaccination/issue` | `auditLog.js` middleware records every mutating request with wallet, role, endpoint, timestamp, and response status | Low |
-| B-I1 | Information Disclosure | Secret keys leaked via error responses or logs | `config.js` validates env vars at startup; logger uses structured JSON (no raw error stack to client) | Medium — review all error handlers before mainnet |
+| B-I1 | Information Disclosure | Secret keys leaked via error responses or logs | `config.js` validates env vars at startup; logger uses structured JSON (no raw error stack to client); request/error log serializers redact sensitive headers (`Authorization`, `X-API-Key`, cookies) and payload fields (`secret`, `secretKey`, `signedTx`, `jwt`, `apiKey`), and health endpoints omit internal detail (issue #58) | Low — redaction covered by automated tests asserting representative secrets never appear in emitted log records |
 | B-I2 | Information Disclosure | CORS misconfiguration exposes API to arbitrary origins | CORS configured in `app.js`; verify allowed origins are restricted in production | Medium — confirm production CORS allowlist |
-| B-D1 | Denial of Service | Flood `/auth/sep10` to exhaust Horizon account sequence numbers | `sep10Limiter`: 10 req/IP/min; `verifyLimiter`: 60 req/IP/min | Low |
+| B-D1 | Denial of Service | Flood `/auth/sep10` to exhaust Horizon account sequence numbers | Rate limiters on auth, public verification, onboarding, and batch verification use a trusted client identity resolver: `req.ip` is only trusted when the request comes from a configured trusted proxy (`TRUSTED_PROXIES` / Express `trust proxy`), otherwise the socket address is used. Responses include documented `Retry-After` and `RateLimit-*` headers (issue #55) | Low — spoofed `X-Forwarded-For` from untrusted peers is ignored; covered by tests |
 | B-D2 | Denial of Service | Oversized request body crashes the parser | `body-limit` middleware enforced (tested in `body-limit.test.js`) | Low |
 | B-D3 | Denial of Service | Soroban RPC unavailability blocks all minting | `withRetry` in `soroban.js` retries with exponential backoff up to `SOROBAN_RPC_MAX_RETRIES` | Medium — no circuit breaker; prolonged RPC outage blocks all writes |
+| B-D4 | Denial of Service | Distributed deployment bypasses per-IP limits because each instance counts independently | Per-instance in-memory counters; document that multi-instance deployments must front the API with a shared limiter (e.g., nginx `limit_req` or Redis-backed store) | Medium — single-instance limits only; see OR-10 |
+| B-T3 | Tampering | Corrupt or inaccessible indexer DB silently replaced with an empty database, hiding data loss | Startup and readiness checks validate schema version, required tables, and DB accessibility; corruption raises an actionable operator alert and fails fast instead of initializing an empty replacement (issue #63) | Low |
+| B-T4 | Tampering | Ambiguous or offset-bearing vaccination dates shift across time zones, misrepresenting record dates | API schema documents date-only (`YYYY-MM-DD`, interpreted as UTC calendar date) versus timestamp (RFC 3339 with explicit offset, normalized to UTC) fields and rejects ambiguous values (issue #64) | Low |
 | B-E1 | Elevation of Privilege | Patient JWT used to call issuer-only `/vaccination/issue` | `issuerMiddleware` checks `req.user.role === 'issuer'` after `authMiddleware` | Low |
 | B-E2 | Elevation of Privilege | Verifier API key used to call authenticated patient/issuer routes | Verifier routes use `verifierApiKey` middleware, not JWT; separate middleware chains | Low |
 | B-E3 | Elevation of Privilege | `ADMIN_SECRET_KEY` used for `register_patient` on behalf of patient | `register_patient` calls `patient.require_auth()` on-chain — backend cannot satisfy this with admin key alone. **Frontend must build an unsigned tx and have the patient sign via Freighter before mainnet.** | **High — must fix before mainnet** |
@@ -156,10 +159,13 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 | OR-7 | CORS allowlist not verified for production — may be open | **Medium** | Backend | Restrict `Access-Control-Allow-Origin` to known frontend domain |
 | OR-8 | Soroban RPC outage has no circuit breaker — prolonged outage blocks all writes with no user feedback | **Low** | Backend | Add circuit breaker or health-check endpoint |
 | OR-9 | `nonceStore` is in-memory — restarting the backend invalidates all in-flight SEP-10 challenges | **Low** | Backend | Acceptable for single-instance; use Redis-backed store for multi-instance deployments |
-| OR-10 | Admin key recovery/rotation flow not implemented — a lost, compromised, or unavailable admin key cannot be safely replaced without unilateral control | **Critical** | Contracts + DevOps | Implement threshold-approved rotation with delay, cancellation, and emergency path; cover proposal/acceptance, expiry, replay, and unauthorized attempts in contract tests |
-| OR-11 | Revocation scope not formally specified — verifiers may interpret a revoked record as a revoked wallet or issuer | **High** | Contracts + Backend | Document record-scoped, irreversible revocation in contract and API specs; add tests revoking one of multiple records and verifying the remainder |
-| OR-12 | Duplicate-record detection rules not documented — formatting variants or concurrent calls may bypass uniqueness | **High** | Contracts + Backend | Define and normalize the duplicate key consistently across API and contract; test exact duplicates, semantically equivalent values, and legitimate repeat doses |
-| OR-13 | Issuer lifecycle transitions (add, revoke, re-add, admin handoff) lack state-machine tests; repeated operations have undefined semantics | **Medium** | Contracts | Add state-machine tests for allowed and disallowed transitions; define idempotent-or-error semantics for repeats |
+| OR-10 | Rate limits are per-instance and keyed on trusted client identity; behind an untrusted or misconfigured proxy, limits may be bypassed or over-applied | **Medium** | Backend / Infra | Configure `TRUSTED_PROXIES` to match the deployment topology; add shared limiter for multi-instance deployments |
+| OR-11 | Log redaction is deny-by-allowlist on known fields — new endpoints may log unredacted payloads | **Medium** | Backend | Extend redaction tests when adding endpoints; review serializers in code review |
+| OR-12 | Date/timezone normalization rejects ambiguous input — legacy records with offset-bearing dates may need migration | **Low** | Backend | Backfill historical records to UTC; document accepted formats in API schema |
+| OR-13 | Admin key recovery/rotation flow not implemented — a lost, compromised, or unavailable admin key cannot be safely replaced without unilateral control | **Critical** | Contracts + DevOps | Implement threshold-approved rotation with delay, cancellation, and emergency path; cover proposal/acceptance, expiry, replay, and unauthorized attempts in contract tests |
+| OR-14 | Revocation scope not formally specified — verifiers may interpret a revoked record as a revoked wallet or issuer | **High** | Contracts + Backend | Document record-scoped, irreversible revocation in contract and API specs; add tests revoking one of multiple records and verifying the remainder |
+| OR-15 | Duplicate-record detection rules not documented — formatting variants or concurrent calls may bypass uniqueness | **High** | Contracts + Backend | Define and normalize the duplicate key consistently across API and contract; test exact duplicates, semantically equivalent values, and legitimate repeat doses |
+| OR-16 | Issuer lifecycle transitions (add, revoke, re-add, admin handoff) lack state-machine tests; repeated operations have undefined semantics | **Medium** | Contracts | Add state-machine tests for allowed and disallowed transitions; define idempotent-or-error semantics for repeats |
 
 ---
 
@@ -172,10 +178,14 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 - [ ] OR-5: Audit log shipped to tamper-evident sink
 - [ ] OR-6: Rate limiting on analytics service
 - [ ] OR-7: CORS restricted to production frontend domain
-- [ ] OR-10: Admin key recovery/rotation flow implemented with threshold, delay, cancellation, and emergency behavior
-- [ ] OR-11: Revocation scope documented in contract and API specs; per-record revocation tests passing
-- [ ] OR-12: Duplicate key definition documented and normalized consistently across API and contract
-- [ ] OR-13: Issuer lifecycle state-machine tests passing with explicit repeat semantics
+- [ ] OR-10: Trusted proxy configuration verified; shared rate limiter in place for multi-instance deployment
+- [ ] OR-11: Log redaction tests cover all request/error serializers
+- [ ] OR-13: Admin key recovery/rotation flow implemented with threshold, delay, cancellation, and emergency behavior
+- [ ] OR-14: Revocation scope documented in contract and API specs; per-record revocation tests passing
+- [ ] OR-15: Duplicate key definition documented and normalized consistently across API and contract
+- [ ] OR-16: Issuer lifecycle state-machine tests passing with explicit repeat semantics
+- [ ] Database integrity checks enabled at startup and readiness; operator alerting wired for corruption
+- [ ] Date/timezone normalization documented in API schema and historical records backfilled to UTC
 - [ ] All secret keys rotated from testnet values
 - [ ] `STELLAR_NETWORK` set to `mainnet` with correct `STELLAR_NETWORK_PASSPHRASE`
 - [ ] Threat model reviewed and signed off by security reviewer
@@ -187,4 +197,5 @@ Key boundary: **on-chain vs. off-chain**. The contract is the source of truth. T
 | Date | Version | Author | Notes |
 |---|---|---|---|
 | 2026-04-28 | 1.0 | — | Initial full threat model (issue #112) |
-| 2026-04-28 | 1.1 | — | Added revocation scope, duplicate detection, issuer lifecycle, and admin recovery/rotation threats (issues #79–#82) |
+| 2026-04-28 | 1.1 | — | Added trusted-proxy rate limiting, log redaction, DB integrity checks, and date/timezone normalization (issues #55, #58, #63, #64) |
+| 2026-04-28 | 1.2 | — | Added revocation scope, duplicate detection, issuer lifecycle, and admin recovery/rotation threats (issues #79–#82) |
