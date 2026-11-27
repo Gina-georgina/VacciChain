@@ -1,20 +1,32 @@
 const express = require('express');
 const StellarSdk = require('@stellar/stellar-sdk');
 const authMiddleware = require('../middleware/auth');
+const { adminAuthMiddleware, requireWalletAccess } = require('../middleware/auth');
 const issuerMiddleware = require('../middleware/issuer');
 const { validateStellarPublicKey } = require('../middleware/wallet');
 const { invokeContract, simulateContract, mintVaccination, sendRpcTimeout, SorobanTimeoutError } = require('../stellar/soroban');
 const { resolveContractErrorMessage, mapContractError } = require('../stellar/contractErrors');
 const { audit } = require('../middleware/auditLog');
+const { AppError } = require('../middleware/errors');
 const validate = require('../middleware/validate');
 const { hasConsented } = require('../indexer/db');
+const { toApiRecords } = require('../schemas/vaccinationRecord');
 const { issueSchema, revokeSchema, vaccinationListQuerySchema } = require('./schemas/vaccination.schemas');
+const { createRateLimiter } = require('../middleware/rateLimit');
 const idempotency = require('../middleware/idempotency');
 
 const MAX_PAGE_SIZE = Number(process.env.VACCINATION_MAX_PAGE_SIZE) || 100;
 const DEFAULT_PAGE_SIZE = Math.min(Number(process.env.VACCINATION_DEFAULT_PAGE_SIZE) || 20, MAX_PAGE_SIZE);
 
 const router = express.Router();
+
+// Batch verification is expensive (multiple contract simulations per request),
+// so it gets a tighter limit than single-record verification.
+const batchVerifyLimiter = createRateLimiter({
+  name: 'vaccination-batch-verify',
+  windowMs: Number(process.env.BATCH_VERIFY_RATE_WINDOW_MS) || 60 * 1000,
+  max: Number(process.env.BATCH_VERIFY_RATE_MAX) || 10,
+});
 
 /**
  * @swagger
@@ -259,11 +271,116 @@ router.post(
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
+/**
+ * @swagger
+ * /vaccination/batch-verify:
+ *   post:
+ *     summary: Verify vaccination status for multiple wallets
+ *     tags:
+ *       - Vaccination
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               wallets:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *             required:
+ *               - wallets
+ *     responses:
+ *       200:
+ *         description: Verification results per wallet
+ *       400:
+ *         description: Invalid request body
+ *       401:
+ *         description: Unauthorized
+ *       429:
+ *         description: Too many batch verification requests
+ *         headers:
+ *           Retry-After:
+ *             description: Seconds until the next request is allowed
+ *             schema:
+ *               type: integer
+ *           RateLimit-Limit:
+ *             description: Request quota for the current window
+ *             schema:
+ *               type: integer
+ *           RateLimit-Remaining:
+ *             description: Requests remaining in the current window
+ *             schema:
+ *               type: integer
+ *           RateLimit-Reset:
+ *             description: Seconds until the current window resets
+ *             schema:
+ *               type: integer
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 error:
+ *                   type: string
+ *                 retryAfter:
+ *                   type: integer
+ *                 limit:
+ *                   type: integer
+ *                 remaining:
+ *                   type: integer
+ *                 reset:
+ *                   type: integer
+ */
+// POST /vaccination/batch-verify — verify multiple wallets (rate limited)
+router.post('/batch-verify', authMiddleware, batchVerifyLimiter, async (req, res) => {
+  const { wallets } = req.body || {};
+
+  if (!Array.isArray(wallets) || wallets.length === 0) {
+    return res.status(400).json({ error: 'wallets must be a non-empty array' });
+  }
+  if (wallets.length > 50) {
+    return res.status(400).json({ error: 'wallets must contain at most 50 entries' });
+  }
+
+  const invalid = wallets.find((w) => typeof w !== 'string' || !StellarSdk.StrKey.isValidEd25519PublicKey(w));
+  if (invalid !== undefined) {
+    return res.status(400).json({ error: `Invalid Stellar public key: ${invalid}` });
+  }
+
+  try {
+    const results = await Promise.all(
+      wallets.map(async (wallet) => {
+        try {
+          const args = [StellarSdk.Address.fromString(wallet).toScVal()];
+          const result = await simulateContract('verify_vaccination', args);
+          const [vaccinated, records] = StellarSdk.scValToNative(result);
+          return { wallet, vaccinated, recordCount: records.length };
+        } catch (err) {
+          if (err instanceof SorobanTimeoutError) throw err;
+          return { wallet, error: resolveContractErrorMessage(err) };
+        }
+      })
+    );
+
+    res.json({ results });
+  } catch (err) {
+    if (err instanceof SorobanTimeoutError) return sendRpcTimeout(res);
+    const errorMessage = resolveContractErrorMessage(err);
+    next(new AppError('rpc_error', errorMessage, 500));
+  }
+});
+
 // GET /vaccination/:wallet — fetch paginated records for a wallet
+// #45: patients may only read their own wallet; issuers (re-verified on-chain) and admins may read any.
 router.get(
   '/:wallet',
-  authMiddleware,
+  adminAuthMiddleware,
   validateStellarPublicKey('params', 'wallet'),
+  requireWalletAccess('wallet'),
   validate(vaccinationListQuerySchema, 'query'),
   async (req, res) => {
     const { wallet } = req.params;
@@ -294,7 +411,7 @@ router.get(
 
       const total = sorted.length;
       const start = (rawPage - 1) * rawLimit;
-      const data = sorted.slice(start, start + rawLimit);
+      const data = toApiRecords(sorted.slice(start, start + rawLimit));
       const hasMore = start + data.length < total;
 
       res.json({

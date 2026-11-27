@@ -1,5 +1,6 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useAuth } from './useFreighter';
+import { apiUrl } from '../config';
 
 /**
  * useConsent — manages patient consent state.
@@ -22,36 +23,25 @@ export function useConsent() {
   const [consented, setConsented] = useState(null);
   const [consentStatus, setConsentStatus] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
+  // Tracks the wallet whose consent state is currently reflected in `consented`.
+  const activeWalletRef = useRef(null);
 
-  const applyStatus = useCallback((data) => {
-    const status = {
-      consented: data?.consented ?? null,
-      scope: data?.scope ?? null,
-      updatedAt: data?.updatedAt ?? null,
-    };
-    setConsentStatus(status);
-    setConsented(status.consented);
-    return status;
-  }, []);
-
-  const refreshConsent = useCallback(async (wallet) => {
-    const target = wallet || publicKey;
-    if (!target) return null;
+  const checkConsent = useCallback(async (wallet) => {
+    if (!wallet) return;
+    // Ignore results for a wallet that is no longer active.
+    if (wallet !== activeWalletRef.current) return null;
     setLoading(true);
     setError(null);
     try {
-      const res = await apiFetch(`/v1/patient/consent/${target}`);
-      if (!res.ok) {
-        throw new Error(`Failed to load consent (${res.status})`);
-      }
+      const res = await apiFetch(apiUrl(`/v1/patient/consent/${wallet}`));
       const data = await res.json();
-      return applyStatus(data);
-    } catch (err) {
-      setError(err?.message || 'Failed to load consent');
+      if (wallet !== activeWalletRef.current) return null;
+      setConsented(data.consented);
+      return data.consented;
+    } catch {
       return null;
     } finally {
-      setLoading(false);
+      if (wallet === activeWalletRef.current) setLoading(false);
     }
   }, [apiFetch, publicKey, applyStatus]);
 
@@ -60,18 +50,32 @@ export function useConsent() {
     return status ? status.consented : null;
   }, [refreshConsent]);
 
+  // Clear wallet-specific state and re-check consent whenever the active
+  // account changes or the wallet disconnects.
+  useEffect(() => {
+    activeWalletRef.current = publicKey || null;
+    setConsented(null);
+    setLoading(false);
+    if (publicKey) {
+      checkConsent(publicKey);
+    }
+  }, [publicKey, checkConsent]);
+
   const giveConsent = useCallback(async () => {
     if (!publicKey) return false;
+    const wallet = publicKey;
     setLoading(true);
     setError(null);
     try {
-      const res = await apiFetch('/v1/patient/consent', {
+      const res = await apiFetch(apiUrl('/v1/patient/consent'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ wallet: publicKey }),
+        body: JSON.stringify({ wallet }),
       });
-      if (!res.ok) {
-        throw new Error(`Failed to update consent (${res.status})`);
+      if (wallet !== activeWalletRef.current) return false;
+      if (res.ok) {
+        setConsented(true);
+        return true;
       }
     } catch (err) {
       setError(err?.message || 'Failed to update consent');
@@ -103,7 +107,7 @@ export function useConsent() {
       await refreshConsent(publicKey);
       return false;
     } finally {
-      setLoading(false);
+      if (wallet === activeWalletRef.current) setLoading(false);
     }
     const status = await refreshConsent(publicKey);
     return status ? status.consented === false : false;

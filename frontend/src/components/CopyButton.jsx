@@ -1,56 +1,41 @@
 import { useState, useCallback } from 'react';
+import { useAnnounce } from '../hooks/useAnnounce';
 
 /**
  * A small copy-to-clipboard button with a brief 'Copied!' tooltip.
  * Accessible via keyboard (focusable, responds to Enter/Space).
+ * Success and failure are also announced via a polite live region.
  */
 export default function CopyButton({ text, label }) {
-  const [status, setStatus] = useState('idle'); // 'idle' | 'copied' | 'error'
-
-  const resetStatus = useCallback(() => {
-    setStatus('idle');
-  }, []);
+  const [copied, setCopied] = useState(false);
+  const announce = useAnnounce();
 
   const handleCopy = useCallback(async (e) => {
     e.stopPropagation();
-    let success = false;
-
-    // Primary path: async Clipboard API (may reject on permission denial).
-    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      announce(label ? `${label} copied to clipboard` : 'Copied to clipboard');
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
       try {
-        await navigator.clipboard.writeText(text);
-        success = true;
-      } catch {
-        success = false;
-      }
-    }
-
-    // Fallback for older browsers or denied clipboard permission.
-    if (!success) {
-      try {
+        // fallback for older browsers
         const el = document.createElement('textarea');
         el.value = text;
         el.style.position = 'fixed';
         el.style.opacity = '0';
-        el.setAttribute('readonly', '');
         document.body.appendChild(el);
         el.select();
-        el.setSelectionRange(0, text.length);
-        success = document.execCommand('copy');
+        document.execCommand('copy');
         document.body.removeChild(el);
+        setCopied(true);
+        announce(label ? `${label} copied to clipboard` : 'Copied to clipboard');
+        setTimeout(() => setCopied(false), 1500);
       } catch {
-        success = false;
+        announce('Copy failed. Please copy manually.', { assertive: true });
       }
     }
-
-    if (success) {
-      setStatus('copied');
-      setTimeout(resetStatus, 1500);
-    } else {
-      setStatus('error');
-      setTimeout(resetStatus, 4000);
-    }
-  }, [text, resetStatus]);
+  }, [text, label, announce]);
 
   const handleKeyDown = useCallback((e) => {
     if (e.key === 'Enter' || e.key === ' ') {

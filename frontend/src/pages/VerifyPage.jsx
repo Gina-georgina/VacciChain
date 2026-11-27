@@ -1,10 +1,18 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useSearchParams } from 'react-router-dom';
 import VerificationBadge from '../components/VerificationBadge';
 import NFTCard from '../components/NFTCard';
 import CopyButton from '../components/CopyButton';
 import { useToast } from '../hooks/useToast';
+import { API_BASE_URL } from '../config';
 import { pageContainerNarrow } from '../layout.js';
+
+const STELLAR_ADDRESS_RE = /^G[A-Z2-7]{55}$/;
+
+export function isValidStellarAddress(address) {
+  return typeof address === 'string' && STELLAR_ADDRESS_RE.test(address);
+}
 
 // Redact anything that looks like a token/secret and strip record details from
 // messages before they reach the console, toasts, or error UI.
@@ -26,11 +34,11 @@ function deriveStatus(result) {
 }
 
 const styles = {
+  page: { margin: '2rem 0' },
   input: { padding: '0.6rem 0.75rem', background: 'var(--input-bg)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: '1rem', width: '100%' },
+  inputInvalid: { borderColor: '#f87171' },
   btn: { padding: '0.6rem 1.5rem', background: 'var(--btn-primary)', color: '#fff', border: 'none', borderRadius: 8, fontSize: '1rem', marginTop: '0.75rem' },
-  urlBox: { marginTop: '1rem', padding: '0.75rem', background: 'var(--input-bg)', border: '1px solid var(--border)', borderRadius: 8 },
-  urlText: { margin: '0.5rem 0 0', color: 'var(--text)', fontSize: '0.9rem', wordBreak: 'break-all', userSelect: 'all', WebkitUserSelect: 'all', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '0.25rem' },
-  retryBtn: { padding: '0.4rem 1rem', background: 'transparent', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 8, fontSize: '0.9rem', marginTop: '0.5rem', cursor: 'pointer' },
+  fieldError: { color: '#f87171', marginTop: '0.5rem', fontSize: '0.9rem' },
 };
 
 // Only surface messages we control; never leak raw provider/network internals.
@@ -48,113 +56,158 @@ function safeErrorMessage(e) {
 export default function VerifyPage() {
   const { t } = useTranslation();
   const toast = useToast();
-  const [wallet, setWallet] = useState('');
+  const [searchParams, setSearchParams] = useSearchParams();
+  const urlWallet = (searchParams.get('wallet') || '').trim();
+  const [wallet, setWallet] = useState(urlWallet);
   const [result, setResult] = useState(null);
+  const [resultWallet, setResultWallet] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [lastAddress, setLastAddress] = useState('');
 
   const verify = async (address) => {
     const trimmed = address.trim();
+    setLastAddress(trimmed);
     setLoading(true);
     setResult(null);
+    setResultWallet(null);
     setError(null);
     setLastAddress(trimmed);
     try {
-      const res = await fetch(`/v1/verify/${encodeURIComponent(trimmed)}`);
-      let data = null;
-      try {
-        data = await res.json();
-      } catch {
-        data = null;
-      }
-      if (!res.ok) throw new Error((data && data.error) || GENERIC_ERROR);
+      const res = await fetch(`/v1/verify/${trimmed}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      if (requestId !== requestIdRef.current) return;
       setResult(data);
+      setResultWallet(address);
     } catch (e) {
-      const message = sanitizeMessage(safeErrorMessage(e));
+      if (requestId !== requestIdRef.current) return;
+      const message = sanitizeMessage(e.message);
       setError(message);
       toast(message, 'error');
+      announce(`Verification failed: ${message}`, 'error');
     } finally {
-      setLoading(false);
+      if (requestId === requestIdRef.current) setLoading(false);
     }
-  };
-
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const w = params.get('wallet');
-    if (w) {
-      setWallet(w);
-      verify(w);
-    }
-  }, []);
-
-  const handleVerify = (e) => {
-    e.preventDefault();
-    const trimmed = wallet.trim();
-    const url = new URL(window.location);
-    url.searchParams.set('wallet', trimmed);
-    window.history.pushState({}, '', url);
-    verify(trimmed);
   };
 
   const handleRetry = () => {
     if (lastAddress) verify(lastAddress);
   };
 
-  const verificationUrl = lastAddress
-    ? `${window.location.origin}${window.location.pathname}?wallet=${encodeURIComponent(lastAddress)}`
-    : '';
+  useEffect(() => {
+    setWallet(urlWallet);
+    setValidationError(null);
+    if (!urlWallet) {
+      requestIdRef.current += 1;
+      setResult(null);
+      setResultWallet(null);
+      setError(null);
+      setLoading(false);
+      return;
+    }
+    if (!isValidStellarAddress(urlWallet)) {
+      requestIdRef.current += 1;
+      setResult(null);
+      setResultWallet(null);
+      setError(null);
+      setLoading(false);
+      return;
+    }
+    verify(urlWallet);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urlWallet]);
+
+  const handleChange = (e) => {
+    const value = e.target.value;
+    setWallet(value);
+    setValidationError(null);
+    // Editing the input invalidates any displayed result.
+    requestIdRef.current += 1;
+    setResult(null);
+    setResultWallet(null);
+    setError(null);
+    setLoading(false);
+    const trimmed = value.trim();
+    if (trimmed) {
+      setSearchParams({ wallet: trimmed }, { replace: true });
+    } else {
+      setSearchParams({}, { replace: true });
+    }
+  };
+
+  const handleVerify = (e) => {
+    e.preventDefault();
+    const trimmed = wallet.trim();
+    if (!isValidStellarAddress(trimmed)) {
+      setValidationError('Enter a valid Stellar public key (56 characters, starting with G).');
+      requestIdRef.current += 1;
+      setResult(null);
+      setResultWallet(null);
+      setError(null);
+      setLoading(false);
+      return;
+    }
+    setValidationError(null);
+    if (trimmed !== urlWallet) {
+      setSearchParams({ wallet: trimmed });
+    } else {
+      verify(trimmed);
+    }
+  };
+
+  const showResult = result && resultWallet && resultWallet === urlWallet;
 
   return (
-    <div style={{ ...pageContainerNarrow, marginTop: '2rem', marginBottom: '2rem' }}>
+    <div className="page-container page-section content-medium" style={{ ...pageContainerNarrow, ...styles.page }}>
       <h2 style={{ marginBottom: '1.5rem', color: 'var(--text)' }}>Verify Vaccination Status</h2>
-      <form onSubmit={handleVerify}>
+      <form onSubmit={handleVerify} noValidate>
         <label htmlFor="wallet-input" style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0,0,0,0)' }}>
           Stellar wallet address
         </label>
         <input
           id="wallet-input"
-          style={styles.input}
+          style={validationError ? { ...styles.input, ...styles.inputInvalid } : styles.input}
           placeholder={t('verify.placeholder')}
           value={wallet}
-          onChange={(e) => setWallet(e.target.value)}
+          onChange={handleChange}
           aria-label="Stellar wallet address to verify"
+          aria-invalid={validationError ? 'true' : 'false'}
+          aria-describedby={validationError ? 'wallet-input-error' : undefined}
           required
         />
         <button style={styles.btn} type="submit" disabled={loading} aria-disabled={loading}>
           {loading ? 'Checking…' : 'Verify'}
         </button>
+        {validationError && (
+          <p id="wallet-input-error" role="alert" style={styles.fieldError}>
+            {validationError}
+          </p>
+        )}
       </form>
 
       <div aria-live="polite" aria-atomic="true">
+        {loading && (
+          <p style={{ color: 'var(--text)', marginTop: '1rem' }} role="status">
+            Checking vaccination status…
+          </p>
+        )}
         {error && (
-          <div role="alert" style={{ marginTop: '1rem' }}>
-            <p style={{ color: '#f87171', margin: 0 }}>Error: {error}</p>
-            {lastAddress && (
-              <button type="button" style={styles.retryBtn} onClick={handleRetry} disabled={loading}>
-                Retry verification
-              </button>
-            )}
+          <div style={{ marginTop: '1rem' }} role="alert">
+            <p style={{ color: '#f87171' }}>Error: {error}</p>
+            <button
+              type="button"
+              style={styles.btn}
+              onClick={handleRetry}
+              disabled={loading || !lastAddress}
+            >
+              Retry
+            </button>
           </div>
         )}
       </div>
 
-      {verificationUrl && (
-        <section style={styles.urlBox} aria-labelledby="verify-url-heading">
-          <h3 id="verify-url-heading" style={{ margin: 0, fontSize: '0.95rem', color: 'var(--text)' }}>
-            Verification link (text alternative to QR code)
-          </h3>
-          <p style={{ margin: '0.25rem 0 0', color: '#64748b', fontSize: '0.85rem' }}>
-            If you cannot scan a QR code, select or copy the link below and open it in your browser to verify this wallet.
-          </p>
-          <p style={styles.urlText}>
-            <span>{verificationUrl}</span>
-            <CopyButton text={verificationUrl} label="verification link" />
-          </p>
-        </section>
-      )}
-
-      {result && (
+      {!loading && !error && result && (
         <div style={{ marginTop: '1.5rem' }} aria-live="polite">
           <VerificationBadge
             status={deriveStatus(result)}
@@ -162,11 +215,11 @@ export default function VerifyPage() {
             recordCount={result.record_count}
           />
           <p style={{ color: '#64748b', fontSize: '0.85rem', marginTop: '1rem', wordBreak: 'break-all', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '0.25rem' }}>
-            Wallet: {wallet}
-            <CopyButton text={wallet} label="wallet address" />
+            Wallet: {resultWallet}
+            <CopyButton text={resultWallet} label="wallet address" />
           </p>
           <div style={{ marginTop: '1rem' }}>
-            {result.records?.map((r) => <NFTCard key={r.token_id} record={r} />)}
+            {result.records?.map((r) => <NFTCard key={r.token_id} record={r} patientWallet={result.wallet} />)}
           </div>
         </div>
       )}

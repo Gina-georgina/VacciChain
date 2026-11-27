@@ -1,6 +1,39 @@
 {
   "accessibility": {
-    "skipToContent": "Skip to main content"
+    "skipToContent": "Skip to main content",
+    "opensInNewTab": "(opens in new tab)"
+  },
+  "announcer": {
+    "walletConnected": "Wallet connected: {{address}}",
+    "walletDisconnected": "Wallet disconnected",
+    "walletConnectionError": "Wallet connection failed: {{message}}",
+    "mintSuccess": "Vaccination NFT minted successfully. Token ID: {{tokenId}}",
+    "mintError": "Minting failed: {{message}}",
+    "verifySuccess": "Verification complete: {{count}} record found",
+    "verifySuccess_other": "Verification complete: {{count}} records found",
+    "verifyError": "Verification failed: {{message}}",
+    "copySuccess": "{{label}} copied to clipboard",
+    "copyError": "Could not copy {{label}} to clipboard"
+  },
+  "network": {
+    "configured": "Configured network: {{network}}",
+    "walletNetwork": "Wallet network: {{network}}",
+    "mismatchTitle": "Network mismatch detected",
+    "mismatchBody": "Your wallet is connected to {{walletNetwork}}, but this app is configured for {{configuredNetwork}}. Signing is disabled until the networks match.",
+    "mismatchRecovery": "To continue, open your wallet extension, switch the network to {{configuredNetwork}}, then reconnect your wallet.",
+    "signingBlocked": "Transaction signing is blocked due to a network mismatch."
+  },
+  "asyncState": {
+    "loading": "Loading…",
+    "loadingAria": "Loading content",
+    "empty": "No data available.",
+    "partial": "Some data could not be loaded.",
+    "partialDetails": "Showing {{loaded}} of {{total}} items.",
+    "error": "Something went wrong while loading data.",
+    "errorDetails": "Error: {{message}}",
+    "retry": "Retry",
+    "retrying": "Retrying…",
+    "retryAria": "Retry loading data"
   },
   "nav": {
     "home": "Home",
@@ -46,6 +79,8 @@
     "validation": {
       "invalidAddress": "Must be a valid Stellar public key (G…, 56 chars)",
       "vaccineRequired": "Vaccine name is required",
+      "dosePositive": "Must be a positive whole number",
+      "doseExceedsSeries": "Dose number cannot exceed doses in series",
       "dateRequired": "Date is required",
       "dateFuture": "Date cannot be in the future"
     }
@@ -87,7 +122,7 @@
     "tokenId": "Token ID",
     "issuerAddress": "Issuer Address",
     "txHash": "Transaction Hash",
-    "viewExplorer": "View on Stellar Explorer ↗",
+    "viewExplorer": "View on Stellar Explorer",
     "noTxHash": "Transaction hash not available for this record."
   },
   "wallet": {
