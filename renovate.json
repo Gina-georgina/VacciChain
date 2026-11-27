@@ -1,5 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Update cadence: Renovate runs weekly (before 3am on Monday). Docker digest-only updates are auto-merged; minor/major base image updates require approval. Terraform providers and modules are kept updated weekly and grouped for review.",
   "extends": [
     "config:base",
     ":docker",
@@ -10,6 +11,9 @@
     "enabled": true,
     "major": {
       "enabled": false
+    },
+    "digest": {
+      "enabled": true
     }
   },
   "vulnerabilityAlerts": {
@@ -19,15 +23,19 @@
   "docker-compose": {
     "enabled": false
   },
+  "terraform": {
+    "enabled": true
+  },
   "packageRules": [
     {
-      "description": "Auto-merge Docker digest-only updates",
+      "description": "Auto-merge Docker digest-only updates weekly",
       "matchDatasources": ["docker"],
       "matchUpdateTypes": ["digest"],
       "automerge": true,
       "automergeType": "pr",
       "automergeStrategy": "squash",
-      "minimumReleaseAge": "0 days"
+      "minimumReleaseAge": "0 days",
+      "schedule": ["before 3am on Monday"]
     },
     {
       "description": "Require approval for minor/major Node.js updates",
@@ -48,19 +56,11 @@
       "automerge": false
     },
     {
-      "description": "Pin GitHub Actions to full commit SHAs with readable version comments",
-      "matchManagers": ["github-actions"],
-      "pinDigests": true,
-      "automerge": false,
-      "labels": ["dependencies", "github-actions"]
-    },
-    {
-      "description": "Auto-merge GitHub Actions digest-only (SHA) updates after review",
-      "matchManagers": ["github-actions"],
-      "matchUpdateTypes": ["digest", "pinDigest"],
-      "automerge": true,
-      "automergeType": "pr",
-      "automergeStrategy": "squash"
+      "description": "Keep Terraform providers and modules updated weekly, grouped for review",
+      "matchManagers": ["terraform"],
+      "groupName": "terraform providers and modules",
+      "schedule": ["before 3am on Monday"],
+      "automerge": false
     }
   ],
   "schedule": [

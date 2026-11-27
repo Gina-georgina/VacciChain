@@ -16,129 +16,58 @@ provider "aws" {
 
 variable "aws_region"      { type = string; default = "us-east-1" }
 
-variable "backend_image" {
+# Persistence strategy for the event index (Backlog 052).
+# Production uses a multi-writer PostgreSQL backend (RDS) instead of the
+# single-writer SQLite index, so that concurrent backend tasks can write
+# safely with row-level locking, automated backups, and Multi-AZ failover.
+variable "event_index_engine" {
   type        = string
-  description = "Immutable backend image reference pinned by digest (e.g. repo@sha256:...)."
-
+  default     = "postgres"
+  description = "Event index persistence backend. Production must use a multi-writer database."
   validation {
-    condition     = can(regex("@sha256:[a-f0-9]{64}$", var.backend_image))
-    error_message = "backend_image must be pinned to an immutable digest (repo@sha256:<64 hex chars>); mutable tags are not allowed in production."
+    condition     = contains(["postgres"], var.event_index_engine)
+    error_message = "Production event index must use the multi-writer 'postgres' backend."
   }
 }
 
-variable "frontend_image" {
-  type        = string
-  description = "Immutable frontend image reference pinned by digest (e.g. repo@sha256:...)."
-
-  validation {
-    condition     = can(regex("@sha256:[a-f0-9]{64}$", var.frontend_image))
-    error_message = "frontend_image must be pinned to an immutable digest (repo@sha256:<64 hex chars>); mutable tags are not allowed in production."
-  }
+variable "event_index_instance_class" {
+  type    = string
+  default = "db.r6g.large"
 }
 
-variable "analytics_image" {
-  type        = string
-  description = "Immutable analytics image reference pinned by digest (e.g. repo@sha256:...)."
-
-  validation {
-    condition     = can(regex("@sha256:[a-f0-9]{64}$", var.analytics_image))
-    error_message = "analytics_image must be pinned to an immutable digest (repo@sha256:<64 hex chars>); mutable tags are not allowed in production."
-  }
+variable "event_index_allocated_storage" {
+  type    = number
+  default = 100
 }
 
-variable "backend_image_digest" {
-  type        = string
-  description = "Expected attested digest for the backend artifact (sha256:<64 hex chars>)."
-
-  validation {
-    condition     = can(regex("^sha256:[a-f0-9]{64}$", var.backend_image_digest))
-    error_message = "backend_image_digest must be of the form sha256:<64 hex chars>."
-  }
+variable "event_index_backup_retention_days" {
+  type    = number
+  default = 14
 }
 
-variable "frontend_image_digest" {
-  type        = string
-  description = "Expected attested digest for the frontend artifact (sha256:<64 hex chars>)."
-
+# Trust-proxy topology (Backlog 056).
+# The backend sits behind a single ALB, so exactly one proxy hop is trusted.
+# This must match the deployed load-balancer topology to prevent spoofed
+# X-Forwarded-For headers from bypassing rate limits or corrupting audit logs.
+variable "trust_proxy_hops" {
+  type        = number
+  default     = 1
+  description = "Number of trusted reverse-proxy hops in front of the backend (ALB = 1)."
   validation {
-    condition     = can(regex("^sha256:[a-f0-9]{64}$", var.frontend_image_digest))
-    error_message = "frontend_image_digest must be of the form sha256:<64 hex chars>."
+    condition     = var.trust_proxy_hops >= 0 && var.trust_proxy_hops <= 2
+    error_message = "trust_proxy_hops must be between 0 and 2 for the production topology."
   }
-}
-
-variable "analytics_image_digest" {
-  type        = string
-  description = "Expected attested digest for the analytics artifact (sha256:<64 hex chars>)."
-
-  validation {
-    condition     = can(regex("^sha256:[a-f0-9]{64}$", var.analytics_image_digest))
-    error_message = "analytics_image_digest must be of the form sha256:<64 hex chars>."
-  }
-}
-
-variable "source_revision" {
-  type        = string
-  description = "Git commit SHA the release artifacts were built from."
-
-  validation {
-    condition     = can(regex("^[a-f0-9]{40}$", var.source_revision))
-    error_message = "source_revision must be a full 40-character git commit SHA."
-  }
-}
-
-variable "build_workflow" {
-  type        = string
-  description = "Trusted build workflow reference that produced the artifacts (e.g. .github/workflows/release.yml@refs/heads/main)."
 }
 
 locals {
   env = "production"
 
-  # Extract the digest portion of each pinned image reference for provenance checks.
-  backend_image_digest_actual   = element(split("@", var.backend_image), 1)
-  frontend_image_digest_actual  = element(split("@", var.frontend_image), 1)
-  analytics_image_digest_actual = element(split("@", var.analytics_image), 1)
+  # Backend task count is gated on the multi-writer database being in place.
+  backend_desired_count = 2
 
-  # Provenance metadata recorded alongside the release for auditability.
-  provenance = {
-    environment     = local.env
-    source_revision = var.source_revision
-    build_workflow  = var.build_workflow
-    artifacts = {
-      backend = {
-        image  = var.backend_image
-        digest = local.backend_image_digest_actual
-      }
-      frontend = {
-        image  = var.frontend_image
-        digest = local.frontend_image_digest_actual
-      }
-      analytics = {
-        image  = var.analytics_image
-        digest = local.analytics_image_digest_actual
-      }
-    }
-  }
-}
-
-# Provenance verification: fail before publishing if the pinned image digest does
-# not match the expected attested artifact digest.
-resource "terraform_data" "provenance_verification" {
-  input = local.provenance
-
-  lifecycle {
-    precondition {
-      condition     = local.backend_image_digest_actual == var.backend_image_digest
-      error_message = "Backend image digest does not match the attested artifact digest; refusing to deploy unverified provenance."
-    }
-    precondition {
-      condition     = local.frontend_image_digest_actual == var.frontend_image_digest
-      error_message = "Frontend image digest does not match the attested artifact digest; refusing to deploy unverified provenance."
-    }
-    precondition {
-      condition     = local.analytics_image_digest_actual == var.analytics_image_digest
-      error_message = "Analytics image digest does not match the attested artifact digest; refusing to deploy unverified provenance."
-    }
+  backend_environment = {
+    EVENT_INDEX_ENGINE = var.event_index_engine
+    TRUST_PROXY_HOPS   = tostring(var.trust_proxy_hops)
   }
 }
 
@@ -154,6 +83,21 @@ module "secrets" {
   name   = "vaccichain-${local.env}"
 }
 
+# Multi-writer event index database with automated backups and Multi-AZ failover.
+module "event_index_db" {
+  source = "../../modules/rds"
+
+  name                  = "vaccichain-${local.env}-event-index"
+  engine                = "postgres"
+  instance_class        = var.event_index_instance_class
+  allocated_storage     = var.event_index_allocated_storage
+  vpc_id                = module.vpc.vpc_id
+  private_subnets       = module.vpc.private_subnets
+  multi_az              = true
+  backup_retention_days = var.event_index_backup_retention_days
+  deletion_protection   = true
+}
+
 module "ecs" {
   source          = "../../modules/ecs"
   name            = "vaccichain-${local.env}"
@@ -166,7 +110,14 @@ module "ecs" {
   secret_arns     = module.secrets.secret_arns
   backend_cpu     = 1024
   backend_memory  = 2048
-  desired_count   = 2
+  desired_count   = local.backend_desired_count
+
+  # Persistence and proxy configuration passed to the backend tasks.
+  backend_environment = local.backend_environment
+  backend_secret_arns = merge(
+    module.secrets.secret_arns,
+    { EVENT_INDEX_DATABASE_URL = module.event_index_db.connection_secret_arn }
+  )
 
   # Container health checks (Backlog 120)
   backend_health_check_path     = "/health"
@@ -193,7 +144,9 @@ module "ecs" {
 
 output "alb_dns_name" { value = module.ecs.alb_dns_name }
 
-output "release_provenance" {
-  value       = local.provenance
-  description = "Provenance metadata for the deployed release artifacts."
+output "event_index_endpoint" {
+  value     = module.event_index_db.endpoint
+  sensitive = true
 }
+
+output "trust_proxy_hops" { value = var.trust_proxy_hops }

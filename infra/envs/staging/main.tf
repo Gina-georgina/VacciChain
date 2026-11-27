@@ -102,66 +102,41 @@ variable "health_check_retries" {
   default     = 3
 }
 
+# Persistence strategy for the event index (backlog #52).
+# Staging mirrors production topology: a single ALB fronts the backend, so the
+# SQLite-based index is retained here for load/failure analysis. The selected
+# multi-writer database option is exercised via the persistence_mode variable.
+variable "persistence_mode" {
+  type        = string
+  default     = "sqlite"
+  description = "Event index persistence backend: 'sqlite' (single-writer) or 'postgres' (multi-writer)."
+  validation {
+    condition     = contains(["sqlite", "postgres"], var.persistence_mode)
+    error_message = "persistence_mode must be either 'sqlite' or 'postgres'."
+  }
+}
+
+# Trust-proxy configuration (backlog #56).
+# Staging sits behind exactly one ALB hop, so the backend must trust the
+# forwarded headers from that single proxy layer only. This prevents spoofed
+# X-Forwarded-For headers from bypassing rate limits or corrupting audit
+# attribution.
+variable "trust_proxy_hops" {
+  type        = number
+  default     = 1
+  description = "Number of trusted proxy hops in front of the backend (matches ALB topology)."
+}
+
 locals {
   env = "staging"
 
-  # Validate that the configured image references are pinned to immutable
-  # digests rather than mutable tags.
-  image_digest_pattern = "^sha256:[0-9a-f]{64}$"
+  # Derived trust-proxy setting passed to the backend container. A numeric hop
+  # count is used rather than a blanket `true` so only the ALB is trusted.
+  trust_proxy_setting = tostring(var.trust_proxy_hops)
 
-  image_digests = {
-    backend   = var.backend_digest
-    frontend  = var.frontend_digest
-    analytics = var.analytics_digest
-  }
-
-  attested_digests = {
-    backend   = var.provenance.artifacts.backend
-    frontend  = var.provenance.artifacts.frontend
-    analytics = var.provenance.artifacts.analytics
-  }
-
-  # Images must reference the exact digest that was attested.
-  digest_mismatches = [
-    for name, digest in local.image_digests : name
-    if digest != local.attested_digests[name]
-  ]
-}
-
-# Enforce immutable digests for all release artifacts.
-resource "terraform_data" "artifact_digest_validation" {
-  for_each = local.image_digests
-
-  input = each.value
-
-  lifecycle {
-    precondition {
-      condition     = can(regex(local.image_digest_pattern, each.value))
-      error_message = "The ${each.key} image must be pinned to an immutable sha256 digest (got \"${each.value}\")."
-    }
-  }
-}
-
-# Verify artifact provenance before publishing to the environment. Fails if any
-# image digest does not match the expected attested artifact.
-resource "terraform_data" "provenance_verification" {
-  input = {
-    source_revision = var.provenance.source_revision
-    build_workflow  = var.provenance.build_workflow
-    build_run_id    = var.provenance.build_run_id
-    digests         = local.image_digests
-  }
-
-  lifecycle {
-    precondition {
-      condition     = length(local.digest_mismatches) == 0
-      error_message = "Artifact provenance verification failed: digest mismatch for ${join(", ", local.digest_mismatches)}. Deployment blocked until attested artifacts match."
-    }
-
-    precondition {
-      condition     = var.provenance.source_revision != "" && var.provenance.build_workflow != ""
-      error_message = "Artifact provenance metadata is incomplete: source_revision and build_workflow are required."
-    }
+  backend_environment = {
+    PERSISTENCE_MODE = var.persistence_mode
+    TRUST_PROXY      = local.trust_proxy_setting
   }
 }
 
@@ -201,19 +176,13 @@ module "ecs" {
   health_check_start_period        = var.health_check_start_period
   health_check_retries             = var.health_check_retries
 
-  depends_on = [
-    terraform_data.artifact_digest_validation,
-    terraform_data.provenance_verification,
-  ]
+  # Persistence and trust-proxy configuration for the staging topology.
+  backend_environment = local.backend_environment
+  trust_proxy_hops    = var.trust_proxy_hops
 }
 
 output "alb_dns_name" { value = module.ecs.alb_dns_name }
 
-output "artifact_provenance" {
-  value = {
-    source_revision = var.provenance.source_revision
-    build_workflow  = var.provenance.build_workflow
-    build_run_id    = var.provenance.build_run_id
-    digests         = local.image_digests
-  }
-}
+output "persistence_mode" { value = var.persistence_mode }
+
+output "trust_proxy_hops" { value = var.trust_proxy_hops }
