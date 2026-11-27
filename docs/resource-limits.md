@@ -3,6 +3,8 @@
 > **Scope:** this document covers **container** resource limits (Docker CPU/memory).
 > For **contract input and collection bounds** enforced by the Soroban contracts
 > themselves, see [Contract input and collection bounds](#contract-input-and-collection-bounds) below.
+> For **on-chain storage lifecycle** (rent, TTL, retention), see
+> [Soroban contract storage lifecycle](#soroban-contract-storage-lifecycle) below.
 
 ## Rationale
 
@@ -107,3 +109,42 @@ Each bound has tests at **zero**, **maximum valid**, and **maximum + 1**:
 Multi-byte UTF-8 input is tested explicitly to confirm limits are enforced on
 byte length, so a 33-character string of 2-byte code points is rejected even
 though its character count is under the limit.
+
+## Soroban contract storage lifecycle
+
+Container limits above do not bound on-chain state. Soroban persistent entries
+(vaccination histories, issuer records) are rented storage: each entry carries a
+TTL measured in ledgers, and rent is charged on write and on TTL extension.
+
+### Storage-size estimates
+
+| Entry type | Approx. size | Expected volume | Notes |
+|---|---|---|---|
+| Vaccination record | ~200–400 B | 1 per dose per patient | Grows linearly with doses; never overwritten |
+| Patient index entry | ~100–200 B | 1 per patient | Maps patient ID → record keys |
+| Issuer record | ~300–500 B | 1 per issuer | Small, near-static set |
+| Issuer revocation entry | ~100 B | 1 per revoked credential | Append-only for audit |
+
+Rent implications: persistent entries are billed per ledger of TTL retained, so
+cost scales with `entry_size × TTL_ledgers × entry_count`. Long-lived vaccination
+histories dominate cost; issuer records are negligible by comparison.
+
+### TTL extension assumptions
+
+- Persistent entries are extended on write and on read-triggered bumps, targeting
+  a TTL comfortably longer than the expected audit retention window.
+- TTL extension is treated as best-effort: a failed extension must not corrupt
+  state, and reads of expired entries must return a recoverable "not found"
+  rather than panicking.
+- Authorization checks must never fail open when required state is absent or
+  expired; missing entries are treated as deny.
+
+### Retention, compaction, and archival
+
+- Records are append-only for audit purposes; compaction never deletes or mutates
+  historical vaccination or revocation entries.
+- Archival is achieved by indexing (off-chain index of record keys) and by
+  extending TTLs for entries still within the audit window, rather than by
+  removing entries.
+- Any future compaction must preserve the ability to prove historical state and
+  must be documented and approved before implementation.

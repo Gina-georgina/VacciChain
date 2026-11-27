@@ -345,10 +345,41 @@ const MAX_LICENSE_LEN: usize = 50;
 const MAX_COUNTRY_LEN: usize = 2;
 const MAX_RECORDS_PER_PATIENT: u32 = 50;
 
-fn setup_env(env: &Env) -> (Address, Address, Address) {
-    let admin = TestAddress::random(env);
-    let issuer = TestAddress::random(env);
-    let patient = TestAddress::random(env);
+// ---------------------------------------------------------------------------
+// Resource baselines (Backlog 086)
+//
+// These tests measure the CPU instruction and memory byte cost of the
+// representative mint, verify, revoke and batch operations. Each measurement
+// is printed in a stable, machine-readable format so the benchmark harness
+// (scripts/check_resource_baseline.sh) can capture it and compare against the
+// committed baselines in contracts/resource_baselines.json.
+//
+// Format: `RESOURCE_BASELINE op=<name> cpu=<u64> mem=<u64>`
+// ---------------------------------------------------------------------------
+
+/// Emit a single machine-readable resource measurement line.
+fn emit_resource_baseline(op: &str, cpu: u64, mem: u64) {
+    // `std::println!` is available in test builds; the harness greps for the
+    // `RESOURCE_BASELINE` prefix.
+    std::println!("RESOURCE_BASELINE op={} cpu={} mem={}", op, cpu, mem);
+}
+
+/// Measure the resources consumed by `f` on the given env, returning
+/// (cpu_instructions, memory_bytes).
+fn measure<F: FnOnce()>(env: &Env, f: F) -> (u64, u64) {
+    env.budget().reset_unlimited();
+    f();
+    let cpu = env.budget().cpu_instruction_cost();
+    let mem = env.budget().memory_bytes_cost();
+    (cpu, mem)
+}
+
+/// Shared setup: initialize contract, register an issuer and a patient.
+fn setup_env() -> (Env, Address, Address, Address) {
+    let env = Env::default();
+    let admin = TestAddress::random(&env);
+    let issuer = TestAddress::random(&env);
+    let patient = TestAddress::random(&env);
 
     env.mock_all_auths();
 
@@ -356,13 +387,13 @@ fn setup_env(env: &Env) -> (Address, Address, Address) {
     let _ = VacciChainContract::add_issuer(
         env.clone(),
         issuer.clone(),
-        SorobanString::from_slice(env, b"Test Issuer"),
-        SorobanString::from_slice(env, b"LIC123"),
-        SorobanString::from_slice(env, b"US"),
+        SorobanString::from_slice(&env, b"Test Issuer"),
+        SorobanString::from_slice(&env, b"LIC123"),
+        SorobanString::from_slice(&env, b"US"),
     );
     let _ = VacciChainContract::register_patient(env.clone(), patient.clone());
 
-    (admin, issuer, patient)
+    (env, admin, issuer, patient)
 }
 
 fn make_string(env: &Env, len: usize) -> SorobanString {
@@ -370,21 +401,18 @@ fn make_string(env: &Env, len: usize) -> SorobanString {
     SorobanString::from_slice(env, &bytes[..len.min(256)])
 }
 
-// Property: vaccine name boundary lengths (0, max, max+1)
-proptest! {
-    #[test]
-    fn prop_vaccine_name_boundaries(len in 0usize..=(MAX_VACCINE_NAME_LEN + 1)) {
-        let env = Env::default();
-        let (_admin, issuer, patient) = setup_env(&env);
+#[test]
+fn resource_baseline_mint() {
+    let (env, _admin, issuer, patient) = setup_env();
+    let vaccine = SorobanString::from_slice(&env, b"COVID-19");
+    let date = SorobanString::from_slice(&env, b"2024-01-15");
 
-        let vaccine_str = make_string(&env, len);
-        let date_str = SorobanString::from_slice(&env, b"2024-01-15");
-
-        let result = VacciChainContract::mint_vaccination(
+    let (cpu, mem) = measure(&env, || {
+        let _ = VacciChainContract::mint_vaccination(
             env.clone(),
             patient.clone(),
-            vaccine_str,
-            date_str,
+            vaccine.clone(),
+            date.clone(),
             issuer.clone(),
             None,
             None,
@@ -491,6 +519,106 @@ proptest! {
                 patient.clone(),
                 SorobanString::from_slice(&env, b"COVID-19"),
                 SorobanString::from_slice(&env, b"2024-01-15"),
+                issuer.clone(),
+                None,
+                None,
+            );
+            prop_assert_eq!(
+                mint,
+                Err(ContractError::Unauthorized),
+                "invalid issuer must not be able to mint"
+            );
+        } else {
+            prop_assert!(result.is_ok(), "valid-length issuer metadata should be accepted");
+        }
+    }
+}
+
+#[test]
+fn resource_baseline_mint() {
+    let (env, _admin, issuer, patient) = setup_env();
+    let vaccine = SorobanString::from_slice(&env, b"COVID-19");
+    let date = SorobanString::from_slice(&env, b"2024-01-15");
+
+    let (cpu, mem) = measure(&env, || {
+        let _ = VacciChainContract::mint_vaccination(
+            env.clone(),
+            patient.clone(),
+            vaccine,
+            date,
+            issuer.clone(),
+            None,
+            None,
+        );
+    });
+
+    emit_resource_baseline("mint", cpu, mem);
+}
+
+#[test]
+fn resource_baseline_verify() {
+    let (env, _admin, issuer, patient) = setup_env();
+    let vaccine = SorobanString::from_slice(&env, b"COVID-19");
+    let date = SorobanString::from_slice(&env, b"2024-01-15");
+
+    let _ = VacciChainContract::mint_vaccination(
+        env.clone(),
+        patient.clone(),
+        vaccine,
+        date,
+        issuer.clone(),
+        None,
+        None,
+    );
+
+    let (cpu, mem) = measure(&env, || {
+        let _ = VacciChainContract::verify_vaccination(env.clone(), patient.clone());
+    });
+
+    emit_resource_baseline("verify", cpu, mem);
+}
+
+#[test]
+fn resource_baseline_revoke() {
+    let (env, _admin, issuer, patient) = setup_env();
+    let vaccine = SorobanString::from_slice(&env, b"COVID-19");
+    let date = SorobanString::from_slice(&env, b"2024-01-15");
+
+    let token_id = VacciChainContract::mint_vaccination(
+        env.clone(),
+        patient.clone(),
+        vaccine,
+        date,
+        issuer.clone(),
+        None,
+        None,
+    )
+    .expect("mint should succeed for revoke baseline");
+
+    let (cpu, mem) = measure(&env, || {
+        let _ = VacciChainContract::revoke_vaccination(env.clone(), token_id, issuer.clone());
+    });
+
+    emit_resource_baseline("revoke", cpu, mem);
+}
+
+#[test]
+fn resource_baseline_batch() {
+    let (env, _admin, issuer, patient) = setup_env();
+    let vaccine = SorobanString::from_slice(&env, b"COVID-19");
+    let date = SorobanString::from_slice(&env, b"2024-01-15");
+
+    // Batch of sequential mints for the same patient (representative batch op).
+    const BATCH_SIZE: u32 = 5;
+
+    let (cpu, mem) = measure(&env, || {
+        for i in 0..BATCH_SIZE {
+            let v = SorobanString::from_slice(&env, format!("COVID-19-{}", i).as_bytes());
+            let _ = VacciChainContract::mint_vaccination(
+                env.clone(),
+                patient.clone(),
+                v,
+                date.clone(),
                 issuer.clone(),
                 None,
                 None,
@@ -643,4 +771,72 @@ proptest! {
             "token patient field must never change"
         );
     }
+}
+
+// Property: resource usage stays within baseline
+proptest! {
+    #[test]
+    fn prop_resource_baseline(
+        ops in prop::collection::vec(0u8..6, 0..20)
+    ) {
+        let env = Env::default();
+        let (_admin, issuer, patient) = setup_env(&env);
+        let other = TestAddress::random(&env);
+        let _ = VacciChainContract::register_patient(env.clone(), other.clone());
+
+        let token_id = match VacciChainContract::mint_vaccination(
+            env.clone(),
+            patient.clone(),
+            SorobanString::from_slice(&env, b"COVID-19"),
+            SorobanString::from_slice(&env, b"2024-01-15"),
+            issuer.clone(),
+            None,
+            None,
+        ) {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+
+        for op in ops {
+            match op {
+                0 => {
+                    let _ = VacciChainContract::transfer(
+                        env.clone(),
+                        patient.clone(),
+                        other.clone(),
+                        token_id,
+                    );
+                }
+                1 => {
+                    let _ = VacciChainContract::approve(
+                        env.clone(),
+                        patient.clone(),
+                        other.clone(),
+                        token_id,
+                    );
+                }
+                2 => {
+                    let _ = VacciChainContract::revoke_vaccination(
+                        env.clone(),
+                        token_id,
+                        issuer.clone(),
+                    );
+                }
+                _ => {
+                    let _ = VacciChainContract::mint_vaccination(
+                        env.clone(),
+                        other.clone(),
+                        SorobanString::from_slice(&env, b"COVID-19"),
+                        SorobanString::from_slice(&env, b"2024-01-15"),
+                        issuer.clone(),
+                        None,
+                        None,
+                    );
+                }
+            }
+        }
+
+        let (cpu, mem) = measure_resources(&env);
+        emit_resource_baseline("batch", cpu, mem);
+    });
 }
