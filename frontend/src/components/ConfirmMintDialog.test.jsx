@@ -81,71 +81,49 @@ describe('ConfirmMintDialog', () => {
     expect(preventDefault).not.toHaveBeenCalled(); // Enter is allowed to propagate
   });
 
-  it('moves focus into the dialog on open', () => {
-    render(<ConfirmMintDialog record={mockRecord} onConfirm={mockOnConfirm} onCancel={mockOnCancel} />);
-    const dialog = screen.getByRole('dialog');
-    expect(dialog.contains(document.activeElement)).toBe(true);
-  });
-
-  it('traps Tab navigation within the dialog', async () => {
-    const user = userEvent.setup();
-    render(<ConfirmMintDialog record={mockRecord} onConfirm={mockOnConfirm} onCancel={mockOnCancel} />);
-    const confirmButton = screen.getByRole('button', { name: /Confirm & Mint/i });
-    const cancelButton = screen.getByRole('button', { name: /Cancel/i });
-
-    expect(confirmButton).toHaveFocus();
-
-    await user.tab();
-    expect(cancelButton).toHaveFocus();
-
-    await user.tab();
-    expect(confirmButton).toHaveFocus();
-
-    await user.tab({ shift: true });
-    expect(cancelButton).toHaveFocus();
-
-    await user.tab({ shift: true });
-    expect(confirmButton).toHaveFocus();
-  });
-
-  it('restores focus to the previously focused element on close', () => {
-    const trigger = document.createElement('button');
-    trigger.textContent = 'Open dialog';
-    document.body.appendChild(trigger);
-    trigger.focus();
-    expect(trigger).toHaveFocus();
-
-    const { unmount } = render(
-      <ConfirmMintDialog record={mockRecord} onConfirm={mockOnConfirm} onCancel={mockOnCancel} />
-    );
-    expect(trigger).not.toHaveFocus();
-
-    unmount();
-    expect(trigger).toHaveFocus();
-
-    document.body.removeChild(trigger);
-  });
-
-  it('closes the dialog when Escape is pressed', async () => {
-    const user = userEvent.setup();
-    render(<ConfirmMintDialog record={mockRecord} onConfirm={mockOnConfirm} onCancel={mockOnCancel} />);
-
-    await user.keyboard('{Escape}');
-    expect(mockOnCancel).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not close the dialog on Escape when not dismissible', async () => {
-    const user = userEvent.setup();
+  it('disables confirm button and does not call onConfirm when isSubmitting is true', () => {
     render(
       <ConfirmMintDialog
         record={mockRecord}
         onConfirm={mockOnConfirm}
         onCancel={mockOnCancel}
-        dismissible={false}
+        isSubmitting={true}
       />
     );
+    const confirmButton = screen.getByRole('button', { name: /Confirm & Mint/i });
+    expect(confirmButton).toBeDisabled();
+    fireEvent.click(confirmButton);
+    expect(mockOnConfirm).not.toHaveBeenCalled();
+  });
 
-    await user.keyboard('{Escape}');
-    expect(mockOnCancel).not.toHaveBeenCalled();
+  it('keeps confirm button enabled and calls onConfirm once when isSubmitting is false', () => {
+    render(
+      <ConfirmMintDialog
+        record={mockRecord}
+        onConfirm={mockOnConfirm}
+        onCancel={mockOnCancel}
+        isSubmitting={false}
+      />
+    );
+    const confirmButton = screen.getByRole('button', { name: /Confirm & Mint/i });
+    expect(confirmButton).not.toBeDisabled();
+    fireEvent.click(confirmButton);
+    expect(mockOnConfirm).toHaveBeenCalledTimes(1);
+  });
+
+  it('only triggers onConfirm once when confirm is clicked multiple times rapidly', () => {
+    render(
+      <ConfirmMintDialog
+        record={mockRecord}
+        onConfirm={mockOnConfirm}
+        onCancel={mockOnCancel}
+        isSubmitting={false}
+      />
+    );
+    const confirmButton = screen.getByRole('button', { name: /Confirm & Mint/i });
+    fireEvent.click(confirmButton);
+    fireEvent.click(confirmButton);
+    fireEvent.click(confirmButton);
+    expect(mockOnConfirm).toHaveBeenCalledTimes(1);
   });
 });

@@ -58,6 +58,8 @@
     "validation": {
       "invalidAddress": "Doit être une clé publique Stellar valide (G…, 56 caractères)",
       "vaccineRequired": "Le nom du vaccin est requis",
+      "dosePositive": "Doit être un nombre entier positif",
+      "doseExceedsSeries": "Le numéro de dose ne peut pas dépasser le nombre de doses de la série",
       "dateRequired": "La date est requise",
       "dateFuture": "La date ne peut pas être dans le futur"
     }

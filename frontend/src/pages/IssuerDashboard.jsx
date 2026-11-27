@@ -25,7 +25,9 @@ const styles = {
 const STELLAR_ADDRESS_RE = /^G[A-Z2-7]{55}$/;
 const today = () => new Date().toISOString().split('T')[0];
 const FORM_KEY = 'issuer_form_draft';
-const EMPTY_FORM = { patient_address: '', vaccine_name: '', date_administered: '' };
+const EMPTY_FORM = { patient_address: '', vaccine_name: '', date_administered: '', dose_number: '', dose_series: '' };
+const MAX_U32 = 4294967295;
+const isValidDose = (value) => /^\d+$/.test(value) && Number(value) >= 1 && Number(value) <= MAX_U32;
 
 // Only non-sensitive fields are persisted. Patient-identifying data
 // (patient_address) is intentionally excluded from the draft schema.
@@ -69,12 +71,21 @@ export default function IssuerDashboard() {
   const { publicKey, role, connect } = useAuth();
   const { issueVaccination, checkIssuerStatus, loading } = useVaccination();
 
-  const [form, setForm] = useState(readDraft);
+  const [form, setForm] = useState(() => {
+    try {
+      const saved = sessionStorage.getItem(FORM_KEY);
+      return saved ? { ...EMPTY_FORM, ...JSON.parse(saved) } : EMPTY_FORM;
+    } catch {
+      return EMPTY_FORM;
+    }
+  });
   const [touched, setTouched] = useState({});
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(null);
   const [mintResult, setMintResult] = useState(null);
   const [confirming, setConfirming] = useState(false);
+  const [pendingMint, setPendingMint] = useState(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [isAuthorized, setIsAuthorized] = useState(null);
   const [authStatus, setAuthStatus] = useState('idle');
   const [authError, setAuthError] = useState(null);
@@ -89,6 +100,12 @@ export default function IssuerDashboard() {
       errors.date_administered = t('issuer.validation.dateRequired');
     else if (f.date_administered > today())
       errors.date_administered = t('issuer.validation.dateFuture');
+    for (const key of ['dose_number', 'dose_series']) {
+      if (f[key] && !isValidDose(f[key])) errors[key] = t('issuer.validation.dosePositive');
+    }
+    if (f.dose_number && f.dose_series && !errors.dose_number && !errors.dose_series
+      && Number(f.dose_number) > Number(f.dose_series))
+      errors.dose_number = t('issuer.validation.doseExceedsSeries');
     return errors;
   };
 
@@ -167,22 +184,47 @@ export default function IssuerDashboard() {
     );
   }
 
-  const handleSubmit = async (e) => {
+  const handleSubmit = (e) => {
     e.preventDefault();
-    setError(null);
-    setSuccess(null);
-    const result = await issueVaccination(form);
-    if (result) {
-      setMintResult(result);
-      setSuccess(true);
-      // Successful issuance clears both in-memory fields and the persisted draft.
-      setForm(EMPTY_FORM);
-      setTouched({});
-      clearDraft();
-    } else {
-      // Failed issuance preserves user-entered values and the draft.
-      setError(t('issuer.issueFailed', 'Issuance failed. Your entries have been preserved.'));
+    if (isSubmitting || loading || !isAuthorized) return;
+    if (errors.dose_number || errors.dose_series) return;
+    if (!isValid) {
+      setTouched({ patient_address: true, vaccine_name: true, date_administered: true });
+      return;
     }
+    setPendingMint({
+      patient_address: form.patient_address.trim(),
+      vaccine_name: form.vaccine_name.trim(),
+      date_administered: form.date_administered,
+    });
+    setConfirming(true);
+  };
+
+  const handleConfirmMint = async () => {
+    if (isSubmitting || !pendingMint) return;
+    setIsSubmitting(true);
+    setError(null);
+    try {
+      const result = await issueVaccination(pendingMint);
+      if (result) {
+        setMintResult(result);
+        setForm(EMPTY_FORM);
+        sessionStorage.removeItem(FORM_KEY);
+      } else {
+        setError(t('issuer.mintFailed', 'Mint failed. Please try again.'));
+      }
+    } catch (err) {
+      setError(err?.message || t('issuer.mintFailed', 'Mint failed. Please try again.'));
+    } finally {
+      setIsSubmitting(false);
+      setConfirming(false);
+      setPendingMint(null);
+    }
+  };
+
+  const handleCancelMint = () => {
+    setConfirming(false);
+    setPendingMint(null);
   };
 
   const fields = [
@@ -204,36 +246,54 @@ export default function IssuerDashboard() {
           { key: 'patient_address', label: 'Patient Stellar Address', placeholder: 'G...' },
           { key: 'vaccine_name', label: 'Vaccine Name', placeholder: 'e.g. COVID-19' },
           { key: 'date_administered', label: 'Date Administered', placeholder: 'YYYY-MM-DD' },
-        ].map(({ key, label, placeholder }) => (
+          { key: 'dose_number', label: 'Dose Number (optional)', placeholder: 'e.g. 1', optional: true },
+          { key: 'dose_series', label: 'Doses in Series (optional)', placeholder: 'e.g. 2', optional: true },
+        ].map(({ key, label, placeholder, optional }) => (
           <div key={key}>
-            <label htmlFor={key} style={styles.label}>{label}</label>
+            <label htmlFor={key} style={styles.label}>
+              {label} <span aria-hidden="true" style={{ color: '#f87171' }}>*</span>
+              <span style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>(required)</span>
+            </label>
             <input
               id={key}
               style={errors[key] ? styles.inputError : styles.input}
               placeholder={placeholder}
               value={form[key]}
               onChange={(e) => setForm((f) => ({ ...f, [key]: e.target.value }))}
-              required
+              onBlur={() => setTouched((prev) => ({ ...prev, [key]: true }))}
+              required={!optional}
+              aria-required="true"
+              inputMode={optional ? 'numeric' : undefined}
+              aria-invalid={Boolean(errors[key])}
+              aria-describedby={errors[key] ? `${key}-error` : undefined}
             />
-            {errors[key] && <p style={styles.fieldError}>{errors[key]}</p>}
+            {errors[key] && (
+              <p id={`${key}-error`} style={styles.fieldError} role="alert">
+                {errors[key]}
+              </p>
+            )}
           </div>
         ))}
-        <button style={isAuthorized ? styles.btn : styles.btnDisabled} type="submit" disabled={loading || !isAuthorized} aria-disabled={loading || !isAuthorized}>
-          {loading ? 'Minting…' : 'Issue Vaccination NFT'}
+        <button
+          style={isAuthorized && !isSubmitting ? styles.btn : styles.btnDisabled}
+          type="submit"
+          disabled={loading || isSubmitting || !isAuthorized}
+          aria-disabled={loading || isSubmitting || !isAuthorized}
+        >
+          {loading || isSubmitting ? 'Minting…' : 'Issue Vaccination NFT'}
         </button>
       </form>
+      <ConfirmMintDialog
+        open={confirming}
+        values={pendingMint}
+        submitting={isSubmitting}
+        onConfirm={handleConfirmMint}
+        onCancel={handleCancelMint}
+      />
       <div aria-live="polite" aria-atomic="true">
         {error && (
-          <div style={{ marginTop: '1rem', padding: '0.75rem 1rem', background: '#7f1d1d', borderRadius: 8, color: '#fecaca' }}>
-            <p>{error}</p>
-            <button
-              type="button"
-              style={{ ...styles.btn, marginTop: '0.5rem' }}
-              onClick={handleSubmit}
-              disabled={loading || !isAuthorized}
-            >
-              {t('common.retry', 'Retry')}
-            </button>
+          <div role="alert" style={{ marginTop: '1rem', padding: '0.75rem 1rem', background: '#7f1d1d', borderRadius: 8, color: '#f87171' }}>
+            {error}
           </div>
         )}
         {mintResult && (

@@ -14,9 +14,9 @@ const mockAnomalies = { anomalies: [] };
 beforeEach(() => {
   jest.clearAllMocks();
   global.fetch = jest.fn().mockImplementation((url) => {
-    if (url.includes('/analytics/rates')) return Promise.resolve({ json: () => Promise.resolve(mockRates) });
-    if (url.includes('/analytics/issuers')) return Promise.resolve({ json: () => Promise.resolve(mockIssuers) });
-    if (url.includes('/analytics/anomalies')) return Promise.resolve({ json: () => Promise.resolve(mockAnomalies) });
+    if (url.includes('/analytics/rates')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(mockRates) });
+    if (url.includes('/analytics/issuers')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(mockIssuers) });
+    if (url.includes('/analytics/anomalies')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(mockAnomalies) });
     return Promise.reject(new Error('Unknown URL'));
   });
   jest.useFakeTimers();
@@ -34,37 +34,37 @@ describe('AnalyticsDashboard', () => {
   });
 
   it('renders dashboard heading for issuers', async () => {
-    useAuth.mockReturnValue({ role: 'issuer', apiFetch: jest.fn() });
+    useAuth.mockReturnValue({ role: 'issuer', apiFetch: global.fetch });
     await act(async () => { render(<AnalyticsDashboard />); });
     expect(screen.getByText(/Analytics Dashboard/i)).toBeInTheDocument();
   });
 
   it('renders vaccination rates section', async () => {
-    useAuth.mockReturnValue({ role: 'issuer', apiFetch: jest.fn() });
+    useAuth.mockReturnValue({ role: 'issuer', apiFetch: global.fetch });
     await act(async () => { render(<AnalyticsDashboard />); });
     expect(screen.getByText(/Vaccination Rates by Vaccine Type/i)).toBeInTheDocument();
   });
 
   it('renders issuer activity section', async () => {
-    useAuth.mockReturnValue({ role: 'issuer', apiFetch: jest.fn() });
+    useAuth.mockReturnValue({ role: 'issuer', apiFetch: global.fetch });
     await act(async () => { render(<AnalyticsDashboard />); });
     expect(screen.getByText(/Issuer Activity/i)).toBeInTheDocument();
   });
 
   it('renders anomaly flags section', async () => {
-    useAuth.mockReturnValue({ role: 'issuer', apiFetch: jest.fn() });
+    useAuth.mockReturnValue({ role: 'issuer', apiFetch: global.fetch });
     await act(async () => { render(<AnalyticsDashboard />); });
     expect(screen.getByText(/Anomaly Flags/i)).toBeInTheDocument();
   });
 
   it('shows no anomalies message when list is empty', async () => {
-    useAuth.mockReturnValue({ role: 'issuer', apiFetch: jest.fn() });
+    useAuth.mockReturnValue({ role: 'issuer', apiFetch: global.fetch });
     await act(async () => { render(<AnalyticsDashboard />); });
     expect(screen.getByText(/No anomalies detected/i)).toBeInTheDocument();
   });
 
   it('shows vaccine names in bar chart', async () => {
-    useAuth.mockReturnValue({ role: 'issuer', apiFetch: jest.fn() });
+    useAuth.mockReturnValue({ role: 'issuer', apiFetch: global.fetch });
     await act(async () => { render(<AnalyticsDashboard />); });
     expect(screen.getByText('COVID-19')).toBeInTheDocument();
     expect(screen.getByText('Flu')).toBeInTheDocument();
@@ -72,7 +72,7 @@ describe('AnalyticsDashboard', () => {
 
   it('shows error message when fetch fails', async () => {
     global.fetch = jest.fn().mockRejectedValue(new Error('Network error'));
-    useAuth.mockReturnValue({ role: 'issuer', apiFetch: jest.fn() });
+    useAuth.mockReturnValue({ role: 'issuer', apiFetch: global.fetch });
     await act(async () => { render(<AnalyticsDashboard />); });
     expect(screen.getByRole('alert')).toBeInTheDocument();
   });
@@ -137,7 +137,7 @@ describe('AnalyticsDashboard', () => {
   });
 
   it('auto-refreshes after 60 seconds', async () => {
-    useAuth.mockReturnValue({ role: 'issuer', apiFetch: jest.fn() });
+    useAuth.mockReturnValue({ role: 'issuer', apiFetch: global.fetch });
     await act(async () => { render(<AnalyticsDashboard />); });
     const callsBefore = global.fetch.mock.calls.length;
     await act(async () => { jest.advanceTimersByTime(60_000); });
@@ -146,16 +146,36 @@ describe('AnalyticsDashboard', () => {
 
   it('shows anomaly severity badge when anomalies exist', async () => {
     global.fetch = jest.fn().mockImplementation((url) => {
-      if (url.includes('/analytics/rates')) return Promise.resolve({ json: () => Promise.resolve(mockRates) });
-      if (url.includes('/analytics/issuers')) return Promise.resolve({ json: () => Promise.resolve(mockIssuers) });
+      if (url.includes('/analytics/rates')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(mockRates) });
+      if (url.includes('/analytics/issuers')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(mockIssuers) });
       if (url.includes('/analytics/anomalies')) return Promise.resolve({
-        json: () => Promise.resolve({ anomalies: [{ issuer: 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVWXYZ', count: 200, severity: 'high', reason: 'Spike detected' }] }),
+        ok: true, status: 200, json: () => Promise.resolve({ anomalies: [{ issuer: 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVWXYZ', count: 200, severity: 'high', reason: 'Spike detected' }] }),
       });
       return Promise.reject(new Error('Unknown URL'));
     });
-    useAuth.mockReturnValue({ role: 'issuer', apiFetch: jest.fn() });
+    useAuth.mockReturnValue({ role: 'issuer', apiFetch: global.fetch });
     await act(async () => { render(<AnalyticsDashboard />); });
     expect(screen.getByText('high')).toBeInTheDocument();
     expect(screen.getByText('Spike detected')).toBeInTheDocument();
+  });
+
+  it('uses same-origin URLs and renders the service response shape', async () => {
+    const bodies = {
+      '/analytics/rates': { rates: { MMR: 4 } },
+      '/analytics/issuers': { issuers: [{ issuer: 'GISSUER1234567890', total_issued: 60, last_ledger: 9 }] },
+      '/analytics/anomalies': { flagged_issuers: [{ issuer: 'GISSUER1234567890', total_issued: 60 }] },
+    };
+    const apiFetch = jest.fn(async (url) => ({ ok: true, status: 200, json: async () => bodies[url] }));
+    useAuth.mockReturnValue({ role: 'issuer', apiFetch });
+    await act(async () => { render(<AnalyticsDashboard />); });
+    expect(apiFetch.mock.calls.map(([url]) => url)).toEqual(Object.keys(bodies));
+    expect(screen.getByText('MMR')).toBeInTheDocument();
+    expect(screen.getByText('Ledger 9')).toBeInTheDocument();
+  });
+
+  it.each([[403, /not authorized/], [502, /unavailable/]])('explains a %i response', async (status, message) => {
+    useAuth.mockReturnValue({ role: 'issuer', apiFetch: jest.fn().mockResolvedValue({ ok: false, status }) });
+    await act(async () => { render(<AnalyticsDashboard />); });
+    expect(screen.getByRole('alert')).toHaveTextContent(message);
   });
 });

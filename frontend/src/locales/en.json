@@ -58,6 +58,8 @@
     "validation": {
       "invalidAddress": "Must be a valid Stellar public key (G…, 56 chars)",
       "vaccineRequired": "Vaccine name is required",
+      "dosePositive": "Must be a positive whole number",
+      "doseExceedsSeries": "Dose number cannot exceed doses in series",
       "dateRequired": "Date is required",
       "dateFuture": "Date cannot be in the future"
     }

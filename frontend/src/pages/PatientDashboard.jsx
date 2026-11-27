@@ -21,7 +21,7 @@ const styles = {
 export default function PatientDashboard() {
   const { t } = useTranslation();
   const { publicKey, connect, disconnect } = useAuth();
-  const { records, loading, error, refetch } = useVaccination(publicKey);
+  const { records, loading, error, refetch, page = 1, totalPages = 1, total = records.length, setPage } = useVaccination(publicKey);
   const { consented, giveConsent, loading: consentLoading } = useConsent();
   const [qrRecord, setQrRecord] = useState(null);
 
@@ -77,9 +77,9 @@ export default function PatientDashboard() {
           <h2 style={{ color: '#e2e8f0', margin: 0 }}>{t('patient.title')}</h2>
           <RoleBadge role="patient" />
         </div>
-        {records.length > 0 && (
+        {total > 0 && (
           <span style={{ color: '#64748b', fontSize: '0.85rem' }}>
-            {t('patient.recordCount', { count: records.length })}
+            {t('patient.recordCount', { count: total })}
           </span>
         )}
       </div>
@@ -104,25 +104,21 @@ export default function PatientDashboard() {
         </div>
       )}
 
-      {isEmpty && <EmptyState />}
+      {!loading && !error && records.map((r) => (
+        <NFTCard
+          key={r.token_id}
+          record={r}
+          patientWallet={publicKey}
+          onShowQR={setQrRecord}
+        />
+      ))}
 
-      {isRefreshing && (
-        <p role="status" aria-live="polite" style={{ color: '#94a3b8', fontSize: '0.85rem', marginBottom: '0.75rem' }}>
-          Refreshing records…
-        </p>
-      )}
-
-      {isPartial && (
-        <>
-          {isRefreshing && <NFTCardSkeleton count={1} />}
-          {records.map((r) => (
-            <NFTCard
-              key={r.token_id}
-              record={r}
-              onShowQR={setQrRecord}
-            />
-          ))}
-        </>
+      {total > 0 && totalPages > 1 && (
+        <nav aria-label="Vaccination records pagination" style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem' }}>
+          <button style={styles.btn} onClick={() => setPage(page - 1)} disabled={loading || page <= 1}>Previous</button>
+          <span aria-live="polite" style={{ color: '#94a3b8' }}>Page {page} of {totalPages}</span>
+          <button style={styles.btn} onClick={() => setPage(page + 1)} disabled={loading || page >= totalPages}>Next</button>
+        </nav>
       )}
 
       {qrRecord && (

@@ -98,6 +98,21 @@ describe('PatientDashboard', () => {
       expect(screen.getByText(/2 records/i)).toBeInTheDocument();
     });
 
+    it.each([[1, 'Previous', 'Next'], [3, 'Next', 'Previous']])('paginates from page %i', (page, off, on) => {
+      const setPage = jest.fn();
+      useVaccination.mockReturnValue({ records: [{ token_id: '1', vaccine_name: 'Flu' }], loading: false, error: null, refetch: jest.fn(), page, totalPages: 3, total: 24, setPage });
+      render(<PatientDashboard />);
+      expect(screen.getByText(`Page ${page} of 3`)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: off })).toBeDisabled();
+      screen.getByRole('button', { name: on }).click();
+      expect(setPage).toHaveBeenCalledWith(2);
+    });
+
+    it('hides pagination when empty', () => {
+      render(<PatientDashboard />);
+      expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
+    });
+
     it('shows singular record count when exactly one record exists', () => {
       const records = [
         { token_id: '1', vaccine_name: 'COVID-19', date_administered: '2024-01-15', issuer: 'G123' },

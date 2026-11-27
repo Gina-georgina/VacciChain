@@ -31,7 +31,7 @@ describe('useVaccination', () => {
 
     expect(mockApiFetch).toHaveBeenCalledTimes(1);
     expect(mockApiFetch).toHaveBeenCalledWith(
-      `/v1/vaccination/${WALLET}`,
+      `/v1/vaccination/${WALLET}?page=1&limit=10`,
       expect.objectContaining({ signal: expect.any(AbortSignal) })
     );
     expect(result.current.records).toEqual(RECORDS);
@@ -112,6 +112,16 @@ describe('useVaccination', () => {
 
     expect(result.current.error).toBe('Unauthorized');
     expect(result.current.records).toEqual([]);
+  });
+
+  it('uses API metadata and requests the selected page', async () => {
+    mockApiFetch.mockResolvedValue({ ok: true, json: async () => ({ data: RECORDS, total: 24, limit: 10 }) });
+    const { result } = renderHook(() => useVaccination(WALLET));
+    await waitFor(() => expect(result.current.totalPages).toBe(3));
+    act(() => result.current.setPage(3));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(mockApiFetch.mock.calls.at(-1)[0]).toBe(`/v1/vaccination/${WALLET}?page=3&limit=10`);
+    expect(result.current.page).toBe(3);
   });
 
   it('does not fetch when walletAddress is null', () => {

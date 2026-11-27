@@ -78,9 +78,17 @@ describe('GET /verify/public/:wallet', () => {
   });
 
   describe('Rate limiting', () => {
+    const validWallet = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF';
+    const rateLimit = require('../src/middleware/rateLimit');
+
+    beforeEach(() => {
+      // Reset limiter state so each test starts from a clean budget.
+      if (typeof rateLimit.reset === 'function') {
+        rateLimit.reset();
+      }
+    });
+
     it('should be rate limited to 60 requests per minute per IP', async () => {
-      const validWallet = 'GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXNMWX5UXVJ5BNLHF';
-      
       // Make multiple requests to test rate limiting
       // Note: This test may not work in all environments due to rate limiter configuration
       const res = await request(app)
@@ -92,6 +100,88 @@ describe('GET /verify/public/:wallet', () => {
             expect(res.body.error).toContain('Too many requests');
           }
         });
+    });
+
+    it('should document RateLimit and Retry-After headers on responses', async () => {
+      const res = await request(app).get(`/v1/verify/public/${validWallet}`);
+
+      // Standard RateLimit headers (draft-ietf-httpapi-ratelimit-headers).
+      expect(res.headers).toHaveProperty('ratelimit-limit');
+      expect(res.headers).toHaveProperty('ratelimit-remaining');
+      expect(res.headers).toHaveProperty('ratelimit-reset');
+      expect(Number(res.headers['ratelimit-limit'])).toBeGreaterThan(0);
+      expect(Number(res.headers['ratelimit-remaining'])).toBeGreaterThanOrEqual(0);
+    });
+
+    it('should return 429 with retry metadata on burst requests', async () => {
+      const limit = Number(
+        (await request(app).get(`/v1/verify/public/${validWallet}`)).headers[
+          'ratelimit-limit'
+        ]
+      );
+
+      let limited;
+      // Burst well past the configured window budget.
+      for (let i = 0; i < limit + 5; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        const res = await request(app).get(`/v1/verify/public/${validWallet}`);
+        if (res.status === 429) {
+          limited = res;
+          break;
+        }
+      }
+
+      expect(limited).toBeDefined();
+      expect(limited.status).toBe(429);
+      expect(limited.body).toHaveProperty('error');
+      expect(limited.body.error).toContain('Too many requests');
+      // Documented retry metadata.
+      expect(limited.headers).toHaveProperty('retry-after');
+      expect(Number(limited.headers['retry-after'])).toBeGreaterThan(0);
+      expect(limited.body).toHaveProperty('retryAfter');
+      expect(Number(limited.body.retryAfter)).toBeGreaterThan(0);
+      expect(limited.headers['ratelimit-remaining']).toBe('0');
+    });
+
+    it('should not trust spoofed X-Forwarded-For headers from untrusted clients', async () => {
+      const limit = Number(
+        (await request(app).get(`/v1/verify/public/${validWallet}`)).headers[
+          'ratelimit-limit'
+        ]
+      );
+
+      let limited;
+      // Rotate spoofed forwarding headers; if they were trusted, each request
+      // would appear to come from a new client and never hit the limit.
+      for (let i = 0; i < limit + 5; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        const res = await request(app)
+          .get(`/v1/verify/public/${validWallet}`)
+          .set('X-Forwarded-For', `203.0.113.${i % 250}`)
+          .set('X-Real-IP', `198.51.100.${i % 250}`);
+        if (res.status === 429) {
+          limited = res;
+          break;
+        }
+      }
+
+      expect(limited).toBeDefined();
+      expect(limited.status).toBe(429);
+    });
+
+    it('should key limits on the trusted client identity behind a proxy', async () => {
+      // When the app is configured to trust a proxy, the forwarded client
+      // identity should be used, so distinct clients get distinct budgets.
+      const resA = await request(app)
+        .get(`/v1/verify/public/${validWallet}`)
+        .set('X-Forwarded-For', '203.0.113.10');
+      const resB = await request(app)
+        .get(`/v1/verify/public/${validWallet}`)
+        .set('X-Forwarded-For', '203.0.113.11');
+
+      // Both requests should be accounted for independently.
+      expect(resA.headers).toHaveProperty('ratelimit-remaining');
+      expect(resB.headers).toHaveProperty('ratelimit-remaining');
     });
   });
 

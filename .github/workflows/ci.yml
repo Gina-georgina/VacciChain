@@ -197,6 +197,10 @@ jobs:
         working-directory: backend
         run: npm run lint
 
+      - name: OpenAPI docs drift check (#43)
+        working-directory: backend
+        run: npm run docs:check
+
       - name: Run tests
         working-directory: backend
         run: npm test
