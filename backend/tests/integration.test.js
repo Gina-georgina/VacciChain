@@ -245,6 +245,115 @@ describe('Integration Tests - Protected Routes', () => {
       expect(res.status).toBe(400);
     });
   });
+
+  describe('POST /vaccination/issue idempotency', () => {
+    const soroban = require('../src/stellar/soroban');
+    const issuePayload = {
+      patient_address: VALID_WALLET,
+      vaccine_name: 'COVID-19',
+      date_administered: '2024-01-15',
+    };
+
+    const otherIssuerToken = jwt.sign(
+      {
+        publicKey: 'GOTHERISSUERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX',
+        role: 'issuer',
+        sub: 'GOTHERISSUERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX',
+        wallet: 'GOTHERISSUERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX',
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+
+    beforeEach(() => {
+      soroban.invokeContract.mockClear();
+    });
+
+    it('returns the original outcome for a repeated key and payload without a second mint', async () => {
+      const key = 'idem-repeat-key-1';
+
+      const first = await request(app)
+        .post('/vaccination/issue')
+        .set('Authorization', `Bearer ${issuerToken}`)
+        .set('Idempotency-Key', key)
+        .send(issuePayload);
+      expect(first.status).toBe(200);
+      const mintCallsAfterFirst = soroban.invokeContract.mock.calls.length;
+
+      const second = await request(app)
+        .post('/vaccination/issue')
+        .set('Authorization', `Bearer ${issuerToken}`)
+        .set('Idempotency-Key', key)
+        .send(issuePayload);
+      expect(second.status).toBe(200);
+      expect(second.body).toEqual(first.body);
+      expect(soroban.invokeContract.mock.calls.length).toBe(mintCallsAfterFirst);
+    });
+
+    it('rejects key reuse with a different payload with 409', async () => {
+      const key = 'idem-conflict-key-1';
+
+      const first = await request(app)
+        .post('/vaccination/issue')
+        .set('Authorization', `Bearer ${issuerToken}`)
+        .set('Idempotency-Key', key)
+        .send(issuePayload);
+      expect(first.status).toBe(200);
+
+      const conflict = await request(app)
+        .post('/vaccination/issue')
+        .set('Authorization', `Bearer ${issuerToken}`)
+        .set('Idempotency-Key', key)
+        .send({ ...issuePayload, vaccine_name: 'Influenza' });
+      expect(conflict.status).toBe(409);
+    });
+
+    it('persists idempotency entries across a simulated restart', async () => {
+      const key = 'idem-restart-key-1';
+
+      const first = await request(app)
+        .post('/vaccination/issue')
+        .set('Authorization', `Bearer ${issuerToken}`)
+        .set('Idempotency-Key', key)
+        .send(issuePayload);
+      expect(first.status).toBe(200);
+
+      // Simulate a service restart: drop cached modules and re-require the app
+      // so the idempotency store is rebuilt from its persistent backing store.
+      jest.resetModules();
+      const restartedApp = require('../src/app');
+      const restartedSoroban = require('../src/stellar/soroban');
+      restartedSoroban.invokeContract.mockClear();
+
+      const replay = await request(restartedApp)
+        .post('/vaccination/issue')
+        .set('Authorization', `Bearer ${issuerToken}`)
+        .set('Idempotency-Key', key)
+        .send(issuePayload);
+      expect(replay.status).toBe(200);
+      expect(replay.body).toEqual(first.body);
+      expect(restartedSoroban.invokeContract).not.toHaveBeenCalled();
+    });
+
+    it('scopes keys per issuer so two issuers can use the same key independently', async () => {
+      const key = 'idem-shared-key-1';
+
+      const first = await request(app)
+        .post('/vaccination/issue')
+        .set('Authorization', `Bearer ${issuerToken}`)
+        .set('Idempotency-Key', key)
+        .send(issuePayload);
+      expect(first.status).toBe(200);
+
+      const second = await request(app)
+        .post('/vaccination/issue')
+        .set('Authorization', `Bearer ${otherIssuerToken}`)
+        .set('Idempotency-Key', key)
+        .send(issuePayload);
+      expect(second.status).toBe(200);
+      expect(second.body).not.toEqual(first.body);
+    });
+  });
 });
 
 describe('Integration Tests - Public Verify Endpoint', () => {
@@ -280,5 +389,88 @@ describe('Integration Tests - Error Handling', () => {
       .set('Content-Type', 'application/json')
       .send('{ invalid json }');
     expect(res.status).toBe(400);
+  });
+});
+
+describe('Integration Tests - Graceful Shutdown', () => {
+  const shutdown = require('../src/shutdown');
+  const db = require('../src/db');
+  const poller = require('../src/poller');
+
+  const SHUTDOWN_TIMEOUT_MS = 2000;
+
+  beforeEach(() => {
+    shutdown.reset();
+    jest.restoreAllMocks();
+  });
+
+  afterEach(async () => {
+    await shutdown.reset();
+  });
+
+  it('drains an in-flight request before the timeout', async () => {
+    let releaseSlowRequest;
+    const slowRequestGate = new Promise((resolve) => {
+      releaseSlowRequest = resolve;
+    });
+
+    // Register a slow in-flight operation with the shutdown coordinator.
+    const inFlight = shutdown.track(async () => {
+      await slowRequestGate;
+      return 'completed';
+    });
+
+    const shutdownPromise = shutdown.gracefulShutdown({ timeoutMs: SHUTDOWN_TIMEOUT_MS });
+
+    // Release the in-flight work shortly after shutdown begins.
+    setTimeout(() => releaseSlowRequest(), 50);
+
+    const result = await shutdownPromise;
+
+    await expect(inFlight).resolves.toBe('completed');
+    expect(result.drained).toBe(true);
+    expect(result.timedOut).toBe(false);
+    expect(result.inFlightCompleted).toBe(1);
+    expect(result.inFlightFailed).toBe(0);
+  });
+
+  it('explicitly fails in-flight work that exceeds the timeout', async () => {
+    const neverResolves = new Promise(() => {});
+    const inFlight = shutdown.track(async () => {
+      await neverResolves;
+    });
+
+    const result = await shutdown.gracefulShutdown({ timeoutMs: 100 });
+
+    await expect(inFlight).rejects.toThrow(/shutdown/i);
+    expect(result.timedOut).toBe(true);
+    expect(result.drained).toBe(false);
+    expect(result.inFlightFailed).toBe(1);
+  });
+
+  it('returns 503 for new requests while draining', async () => {
+    const shutdownPromise = shutdown.gracefulShutdown({ timeoutMs: SHUTDOWN_TIMEOUT_MS });
+
+    const res = await request(app).get(`/verify/${VALID_WALLET}`);
+
+    expect(res.status).toBe(503);
+    expect(res.body.error).toMatch(/shutting down/i);
+
+    await shutdownPromise;
+  });
+
+  it('closes poller and database in order during shutdown', async () => {
+    const order = [];
+    jest.spyOn(poller, 'stop').mockImplementation(async () => {
+      order.push('poller');
+    });
+    jest.spyOn(db, 'close').mockImplementation(async () => {
+      order.push('db');
+    });
+
+    const result = await shutdown.gracefulShutdown({ timeoutMs: SHUTDOWN_TIMEOUT_MS });
+
+    expect(order).toEqual(['poller', 'db']);
+    expect(result.closed).toEqual(['poller', 'db']);
   });
 });

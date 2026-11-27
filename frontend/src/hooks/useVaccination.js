@@ -49,7 +49,31 @@ function buildResult(status, extra = {}) {
     support: SUPPORT_PATH,
   };
 }
-=======
+
+// Redaction utility for client-side diagnostics. Strips tokens, patient
+// identifiers and record details before anything is logged or surfaced.
+const SENSITIVE_KEY_PATTERN = /(token|secret|password|authorization|auth|jwt|key|wallet|address|patient|name|dob|birth|record|vaccin|issuer|hash)/i;
+const TOKEN_LIKE_PATTERN = /\b(?:bearer\s+)?[A-Za-z0-9_-]{20,}\b/gi;
+
+export function redactForDiagnostics(input) {
+  if (input == null) return input;
+  if (typeof input === 'string') {
+    return input.replace(TOKEN_LIKE_PATTERN, '[REDACTED]');
+  }
+  if (typeof input !== 'object') return input;
+  if (Array.isArray(input)) return input.map(redactForDiagnostics);
+  const out = {};
+  for (const [key, value] of Object.entries(input)) {
+    out[key] = SENSITIVE_KEY_PATTERN.test(key) ? '[REDACTED]' : redactForDiagnostics(value);
+  }
+  return out;
+}
+
+// Produce a safe, user-facing error message that never includes raw payloads.
+function safeErrorMessage(e, fallback) {
+  const raw = (e && typeof e.message === 'string' && e.message) || fallback;
+  return redactForDiagnostics(raw);
+}
 
 export function useVaccination(walletAddress) {
   const { apiFetch } = useAuth();
@@ -77,7 +101,7 @@ export function useVaccination(walletAddress) {
       return list;
     } catch (e) {
       if (e.name === 'AbortError') return;
-      const msg = e.message || 'Failed to fetch records.';
+      const msg = safeErrorMessage(e, 'Failed to fetch records.');
       setError(msg);
       toastRef.current(msg, 'error');
       return null;
@@ -203,7 +227,7 @@ export function useVaccination(walletAddress) {
       });
     } catch (e) {
       const category = categorizeError(e);
-      toastRef.current('Failed to issue vaccination. Please retry or contact support.', 'error');
+      toastRef.current(safeErrorMessage(e, 'Failed to issue vaccination. Please retry or contact support.'), 'error');
       return buildResult('failed', {
         transactionHash: txHash,
         error: category,
