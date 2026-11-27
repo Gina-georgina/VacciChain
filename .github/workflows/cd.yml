@@ -6,23 +6,16 @@ on:
       - main
     paths:
       - "contracts/**"
-  release:
-    types:
-      - published
   workflow_dispatch:
     inputs:
-      target_contract:
-        description: "Contract ID to upgrade (required when action resolves to upgrade)"
-        required: false
-        type: string
-      override_existing:
-        description: "Allow creating a new production contract even if the manifest already records one"
-        required: false
-        type: boolean
-        default: false
-
-permissions:
-  contents: write
+      network:
+        description: "Stellar network to deploy to (explicitly required)"
+        type: choice
+        required: true
+        default: testnet
+        options:
+          - testnet
+          - mainnet
 
 jobs:
   decide:
@@ -148,11 +141,28 @@ jobs:
         working-directory: contracts
 
     steps:
+      - name: Validate network input
+        run: |
+          NETWORK="${{ github.event.inputs.network }}"
+          if [ -z "$NETWORK" ]; then
+            echo "::error::An explicit network (testnet or mainnet) must be provided."
+            exit 1
+          fi
+          case "$NETWORK" in
+            testnet|mainnet) ;;
+            *)
+              echo "::error::Unsupported network '$NETWORK'. Expected testnet or mainnet."
+              exit 1
+              ;;
+          esac
+          echo "NETWORK=$NETWORK" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.84.0"
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
@@ -167,76 +177,63 @@ jobs:
 
       - name: Install Stellar CLI
         run: |
-          cargo install --locked stellar-cli --features opt
+          cargo install --locked stellar-cli --version 22.0.1 --features opt
 
       - name: Build WASM
         run: make build
 
-      - name: Deploy or upgrade contract
+      - name: Generate and record WASM artifact hash
+        id: wasm_hash
+        run: |
+          WASM=target/wasm32-unknown-unknown/release/vaccichain.wasm
+          SHA256=$(sha256sum "$WASM" | awk '{print $1}')
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "WASM SHA-256: $SHA256"
+          echo "$SHA256  vaccichain.wasm" > vaccichain.wasm.sha256
+          echo "### WASM artifact hash" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$SHA256  vaccichain.wasm" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload WASM artifact and hash
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaccichain-wasm-${{ github.sha }}
+          path: |
+            contracts/target/wasm32-unknown-unknown/release/vaccichain.wasm
+            contracts/vaccichain.wasm.sha256
+          if-no-files-found: error
+
+      - name: Deploy to Stellar Testnet
         id: deploy
         env:
           ADMIN_SECRET_KEY: ${{ secrets.ADMIN_SECRET_KEY }}
-          ACTION: ${{ needs.decide.outputs.action }}
-          TARGET_CONTRACT: ${{ needs.decide.outputs.target_contract }}
+          EXPECTED_WASM_SHA256: ${{ steps.wasm_hash.outputs.sha256 }}
         run: |
-          set -euo pipefail
           WASM=target/wasm32-unknown-unknown/release/vaccichain.wasm
-          if [ "$ACTION" = "deploy" ]; then
-            CONTRACT_ID=$(stellar contract deploy \
-              --wasm "$WASM" \
-              --source "$ADMIN_SECRET_KEY" \
-              --network testnet)
-          elif [ "$ACTION" = "upgrade" ]; then
-            if [ -z "$TARGET_CONTRACT" ]; then
-              echo "::error::Upgrade requires an explicit target contract."
-              exit 1
-            fi
-            stellar contract upload \
-              --wasm "$WASM" \
-              --source "$ADMIN_SECRET_KEY" \
-              --network testnet >/dev/null
-            stellar contract invoke \
-              --id "$TARGET_CONTRACT" \
-              --source "$ADMIN_SECRET_KEY" \
-              --network testnet \
-              -- upgrade \
-              --new_wasm_hash "$(stellar contract upload --wasm "$WASM" --source "$ADMIN_SECRET_KEY" --network testnet)"
-            CONTRACT_ID="$TARGET_CONTRACT"
-          else
-            echo "::error::Unexpected action '$ACTION'."
+          ACTUAL_SHA256=$(sha256sum "$WASM" | awk '{print $1}')
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_WASM_SHA256" ]; then
+            echo "WASM hash mismatch: expected $EXPECTED_WASM_SHA256, got $ACTUAL_SHA256" >&2
             exit 1
           fi
+          echo "Verified WASM SHA-256: $ACTUAL_SHA256"
+          CONTRACT_ID=$(stellar contract deploy \
+            --wasm target/wasm32-unknown-unknown/release/vaccichain.wasm \
+            --source "$ADMIN_SECRET_KEY" \
+            --network testnet)
           echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Record contract ID in deployment manifest
+      - name: Smoke test deployed contract
         env:
-          CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
-          ACTION: ${{ needs.decide.outputs.action }}
+          ADMIN_SECRET_KEY: ${{ secrets.ADMIN_SECRET_KEY }}
         run: |
           set -euo pipefail
-          MANIFEST=deployments.json
-          if [ ! -f "$MANIFEST" ]; then
-            echo '{}' > "$MANIFEST"
-          fi
-          jq --arg id "$CONTRACT_ID" --arg action "$ACTION" \
-            '.production = {contract_id: $id, last_action: $action}' \
-            "$MANIFEST" > "$MANIFEST.tmp"
-          mv "$MANIFEST.tmp" "$MANIFEST"
-
-      - name: Commit manifest
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add deployments.json
-          if git diff --cached --quiet; then
-            echo "Manifest unchanged; nothing to commit."
-          else
-            git commit -m "chore: record production contract ${{ steps.deploy.outputs.contract_id }}"
-            git push
-          fi
+          make smoke-test \
+            NETWORK="$NETWORK" \
+            CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}" \
+            EXPECTED_CONTRACT_ID="$EXPECTED_CONTRACT_ID" \
+            RPC_URL="$RPC_URL" \
+            NETWORK_PASSPHRASE="$NETWORK_PASSPHRASE"
 
       - name: Store contract ID as secret
         env:
@@ -247,7 +244,7 @@ jobs:
             --repo "${{ github.repository }}"
 
       - name: Print contract ID
-        run: echo "Deployed contract ID ${{ steps.deploy.outputs.contract_id }}"
+        run: echo "Deployed contract ID ${{ steps.deploy.outputs.contract_id }} on $NETWORK"
 
   restore-drill:
     # Scheduled restore drills are defined in .github/workflows/restore-drill.yml

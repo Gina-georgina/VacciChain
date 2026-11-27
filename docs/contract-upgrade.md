@@ -2,71 +2,40 @@
 
 VacciChain uses Soroban's native WASM upgrade mechanism. The contract's storage and address remain unchanged — only the executable code is replaced.
 
-> **CI-driven deployments.** Contract-path pushes no longer deploy a fresh contract by default. The deployment workflow classifies each run as **deploy**, **upgrade**, or **no-op** (see [CI deploy/upgrade/no-op decision](#ci-deployupgradeno-op-decision) below). Manual steps in this document are for break-glass situations only.
+## Supported toolchain policy
 
-## CI deploy/upgrade/no-op decision
+The contract is built and tested against the following pinned versions. These are declared in `contracts/rust-toolchain.toml`, `contracts/Cargo.toml`, and the CI workflow; CI fails if the local toolchain does not match.
 
-The `contracts-deploy` workflow inspects the deployment manifest and the pushed changes, then takes exactly one path:
+| Component | Supported version | Declared in |
+|-----------|-------------------|-------------|
+| Rust | pinned stable channel (see `rust-toolchain.toml`) | `contracts/rust-toolchain.toml` |
+| `soroban-sdk` | version pinned in `contracts/Cargo.toml` | `contracts/Cargo.toml` |
+| Stellar CLI (`soroban`) | version pinned in CI workflow | `.github/workflows/` |
 
-| Path | When | Effect |
-| --- | --- | --- |
-| **deploy** | No manifest entry exists for the target network, or the manifest explicitly marks the contract as `absent` | Uploads WASM and instantiates a **new** contract, then records its ID in the manifest |
-| **upgrade** | A manifest entry exists for the target network **and** `target_contract` is provided | Uploads the new WASM and invokes `upgrade(new_wasm_hash)` on the **existing** contract |
-| **no-op** | The computed WASM hash matches the hash recorded in the manifest for the target network | Nothing is uploaded or invoked; the run exits successfully |
+CI verifies the declared toolchain on every push and runs `cargo audit` (or equivalent advisory check) against the locked dependency graph. A failing advisory check blocks merge.
 
-The workflow fails fast (no deploy, no upgrade) when:
+### Dependency upgrade procedure
 
-- A manifest entry exists but `target_contract` is **not** supplied — upgrades require an explicit target.
-- `target_contract` is supplied but does not match the manifest entry for that network.
-- The manifest is missing or unreadable for a network that already has a recorded contract.
+Any change to Rust, `soroban-sdk`, or the Stellar CLI version must go through a dedicated PR that:
 
-### Required input: `target_contract`
+1. **Passes all tests** — unit tests, integration tests, and the full contract test suite must be green.
+2. **Compares resources** — record CPU instructions and memory usage for the key entry points (`verify_vaccination`, `mint`, `upgrade`) before and after the bump, and include the comparison in the PR description. Significant regressions must be justified.
+3. **Updates release notes** — add an entry to `CHANGELOG.md` describing the version change and any behavioral impact.
+4. **Updates this document** — keep the toolchain table above in sync with the pinned versions.
 
-Upgrades **must** pass the existing contract ID explicitly:
+Dependency upgrades are reviewed by at least one maintainer with contracts experience before merge.
 
-```yaml
-# .github/workflows/contracts-deploy.yml (excerpt)
-on:
-  workflow_dispatch:
-    inputs:
-      target_contract:
-        description: "Existing contract ID to upgrade (required for upgrades)"
-        required: false
-        type: string
-```
+## Version-specific behavior and compatibility
 
-- `target_contract` is **required** whenever the manifest shows an existing deployment for the selected network.
-- It is **ignored** on the deploy path (a new contract is created and its ID recorded).
-- The workflow refuses to run an upgrade if `target_contract` is empty, so a re-run can never silently create a second production contract.
+The contract exposes a stable public interface. Callers can rely on the following guarantees across upgrades:
 
-### Deployment manifest
+- **Function signatures** — public method names and argument types are treated as stable. Removing or renaming a public method, or changing an argument's type, is a breaking change and requires a major version bump plus a migration note in the release notes.
+- **Authorization** — the auth model (admin-gated `upgrade`, issuer-gated `mint`, public `verify_vaccination`) is part of the contract's contract. Changes to who may call a method are breaking changes.
+- **Error codes** — error variants are stable identifiers. New variants may be added, but existing variants must not be renumbered or repurposed. The backend maps each contract error to a stable API response; see the backend mapping tests for the authoritative mapping.
+- **Storage layout** — existing storage keys and value shapes are preserved across upgrades. Any layout change must include a migration path documented in the release notes.
+- **Events** — event topics and payload fields are additive-only; existing fields are not removed or reordered.
 
-The workflow reads and writes `deployments/<network>.json`, which is committed back to the repository (or stored as a workflow artifact plus a protected branch commit):
-
-```json
-{
-  "network": "testnet",
-  "contract_id": "C...",
-  "wasm_hash": "abc123...",
-  "deployed_at": "2025-01-01T00:00:00Z",
-  "deployed_by": "ci"
-}
-```
-
-- The manifest is the **single source of truth** for "does a contract already exist on this network?".
-- Before any deploy, the workflow checks the manifest. If an entry exists, the run is classified as **upgrade** (with `target_contract`) or **no-op** (matching hash) — never **deploy**.
-- After a successful deploy or upgrade, the manifest is updated with the new `wasm_hash` (and `contract_id` on first deploy) so subsequent re-runs become no-ops.
-- Re-running a completed deployment is therefore idempotent: the hash matches and the run is a no-op.
-
-### Policy gate for production upgrades
-
-Production (`mainnet`) upgrades are gated:
-
-- The workflow requires approval from the `production-contracts` GitHub Environment before the upgrade step executes.
-- The approval request includes the `target_contract`, the current manifest `wasm_hash`, and the new `wasm_hash` for review.
-- Upgrades without approval are blocked; the job fails without touching the network.
-- Testnet upgrades run automatically after the testnet smoke tests pass.
-=======
+Behavior that differs between contract versions is documented in `CHANGELOG.md` under the corresponding version heading.
 
 ## How it works
 
@@ -79,17 +48,104 @@ All existing storage (patient records, issuers, admin) is preserved across upgra
 
 ---
 
-## Manual step-by-step (break-glass only)
+## Authorization and approval
 
-Prefer the CI workflow above. Use these steps only when CI is unavailable and you have explicit approval.
+Upgrades are gated by the contract's stored admin address. There is no separate
+proposer role in the contract: **the admin is the only authorized proposer and
+executor of an upgrade.** Any call to `upgrade` that is not authorized by the
+stored admin fails with an auth error and leaves contract state untouched
+(verified in `upgrade_tests.rs`).
+
+Because the contract enforces a single admin signature, the approval process is
+an off-chain governance requirement that must be completed *before* the admin
+key is used:
+
+1. **Proposal** — A maintainer opens a PR containing the source changes and a
+   completed upgrade checklist. The PR must reference the target release tag.
+2. **Approval** — At least two maintainers (one of whom must be a contract
+   owner) review and approve the PR. The admin key holder is not permitted to
+   self-approve.
+3. **Artifact review** — Reviewers verify the built WASM hash matches the
+   approved commit (see below) before the hash is submitted on-chain.
+4. **Execution** — Only after 1–3 are complete may the admin key holder upload
+   and invoke the upgrade.
+
+### Artifact review steps
+
+- Build from the tagged, reviewed commit in a clean environment (`make build`).
+- Record the SHA-256 of `vacci_chain.wasm` and the resulting on-chain
+  `new_wasm_hash` in the PR.
+- Confirm the uploaded WASM hash equals the hash produced from the reviewed
+  commit; a mismatch aborts the upgrade.
+- Confirm the diff contains no changes to storage keys or data layouts unless a
+  migration is explicitly documented (see *Migration responsibilities*).
+
+### Rollback limitations
+
+Soroban's upgrade mechanism is **forward-only**: `update_current_contract_wasm`
+replaces the code in place and there is no built-in revert. To roll back you
+must perform another upgrade to a previously reviewed WASM hash, which means:
+
+- The previous WASM must still be uploaded and its hash known; keep the last
+  known-good hash recorded for every release.
+- A rollback is itself an upgrade and requires the same authorization and
+  approval steps.
+- Rollback cannot undo storage writes made by the faulty version. If the new
+  version wrote data in an incompatible layout, a rollback may leave state
+  unreadable — this is why migrations must be additive and backward compatible.
+- There is no time-lock or automatic rollback; recovery depends on the admin key
+  remaining available.
+
+---
+
+## Client compatibility guarantees
+
+- The contract address and all storage keys are stable across upgrades; clients
+  do not need to re-point at a new contract ID.
+- Existing entry points (`register_issuer`, `mint_vaccination`,
+  `verify_vaccination`, etc.) keep their signatures across patch and minor
+  upgrades. Removing or changing an entry point signature is a breaking change
+  and requires a major version bump plus a client migration note.
+- Events keep their topic and data shape for existing event types; new fields
+  are only ever appended.
+- Clients should tolerate unknown event types and unknown trailing fields so
+  that additive changes do not break them.
+
+## Migration responsibilities
+
+- The upgrade author is responsible for any storage migration and must document
+  it in the PR, including how old records remain readable.
+- Migrations must be additive: never delete or reinterpret existing keys in a
+  way that makes previously written records unreadable by the new code.
+- Post-upgrade, the author must spot-check existing records via
+  `verify_vaccination` and confirm state validity, as covered by the
+  state-preservation tests in `upgrade_tests.rs`.
+
+---
+
+## Step-by-step
 
 ### 1. Build the new WASM
 
+The WASM must be built from the audited, pinned source revision recorded in the security audit (see [security-audit.md](./security-audit.md)). Do not upgrade from an unreviewed branch or working tree.
+
 ```bash
 cd contracts
+git checkout <AUDITED_COMMIT_SHA>   # pinned, audited revision
 make build
 # outputs: target/wasm32-unknown-unknown/release/vacci_chain.wasm
 ```
+
+Record the SHA-256 hash of the built artifact and confirm it matches the audited WASM hash:
+
+```bash
+sha256sum target/wasm32-unknown-unknown/release/vacci_chain.wasm
+# compare against the audited WASM hash in docs/security-audit.md
+```
+
+If the hash does not match the audited artifact, stop — the build is not the audited code.
+
+> **Re-audit required:** Any upgrade that changes contract code after the audit must trigger a re-audit of the changed code (authorization, storage, lifecycle, upgrade, and privacy properties) before mainnet deployment. Record the new findings and pinned revision in [security-audit.md](./security-audit.md).
 
 ### 2. Upload the WASM to the network (testnet first)
 
@@ -221,14 +277,18 @@ If an unsupported upgrade is attempted or detected:
 
 ## Security checklist
 
-- [ ] New WASM built from a tagged, reviewed commit
+- [ ] New WASM built from the audited, pinned commit (recorded in `docs/security-audit.md`)
+- [ ] Built WASM SHA-256 hash matches the audited WASM hash
+- [ ] Any post-audit code change has been re-audited and findings recorded
+- [ ] PR approved by at least two maintainers (no self-approval by key holder)
+- [ ] Built WASM hash matches the reviewed commit and the uploaded hash
+- [ ] Storage migration (if any) documented and backward compatible
 - [ ] Upgrade tested end-to-end on testnet
+- [ ] Unauthorized upgrade attempt confirmed to fail (see `upgrade_tests.rs`)
 - [ ] `schema_version` checked against the new WASM's expected version
 - [ ] Migration test for the prior-state fixture passes (if schema changed)
 - [ ] Prior release WASM hash recorded for rollback
 - [ ] Admin key used from a hardware wallet or secure key management system
 - [ ] `upgraded` event confirmed on-chain after execution
 - [ ] Existing records spot-checked via `verify_vaccination` post-upgrade
-- [ ] `target_contract` matched the manifest entry for the network
-- [ ] Deployment manifest updated with the new `wasm_hash`
-- [ ] Production upgrade approved via the `production-contracts` environment gate
+- [ ] Last known-good WASM hash recorded for potential rollback

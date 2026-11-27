@@ -1,6 +1,6 @@
 # VaccinationRecord Migration Guide
 
-This document outlines the migration path for `VaccinationRecord` schema changes in the VacciChain contract.
+This document outlines the migration path for `VaccinationRecord` schema changes in the VacciChain contract, the versioned event schemas emitted by the contract, and the authorization rules governing contract upgrades.
 
 ## Current Schema (Version 1)
 
@@ -13,15 +13,63 @@ pub struct VaccinationRecord {
     pub issuer: Address,
     pub timestamp: u64,
     pub schema_version: u32, // Added in #47
+    pub revoked: bool,
+    pub dose_number: u32,
+    pub dose_series: u32,
 }
 ```
+
+## Privacy Field Policy
+
+The on-chain schema is deliberately minimized to avoid embedding personally identifying
+information (PII) or clinically sensitive data in immutable public contract state. Every field
+is classified as follows:
+
+| Field | Classification | Rationale |
+| --- | --- | --- |
+| `token_id` | Identifier (non-PII) | Opaque token reference; not derived from patient identity. |
+| `patient` | Pseudonymous identifier | Stellar `Address`; linkable to the holder but not a name or contact detail. |
+| `vaccine_name` | Minimal clinical detail | Required to verify the credential; no lot numbers, reactions, or diagnoses. |
+| `date_administered` | Minimal clinical detail | Coarse administration date only; no time-of-day or location. |
+| `issuer` | Public identifier | Issuing authority address; already public by design. |
+| `timestamp` | Metadata | Ledger timestamp of record creation. |
+| `schema_version` | Metadata | Schema evolution marker. |
+| `revoked` | Status flag | Revocation state; no reason or clinical justification stored. |
+| `dose_number` | Minimal clinical detail | Dose ordinal within a series; no batch or product details. |
+| `dose_series` | Minimal clinical detail | Series identifier; no manufacturer or clinical notes. |
+
+**Excluded fields (must never be added):** patient names, contact data (email, phone,
+address), government/national ID numbers, dates of birth, free-text clinical notes,
+adverse-event details, diagnoses, and any field that could re-identify a patient when
+combined with off-chain data.
+
+### Residual Linkability Risks
+
+Even with the minimized schema, the following residual risks are documented and accepted:
+
+-   **Address linkability:** The `patient` address is stable across records, so all
+    credentials held by the same address are correlatable on-chain.
+-   **Issuer + date correlation:** Combining `issuer`, `date_administered`, and
+    `vaccine_name` may narrow the set of individuals for a small issuer population.
+-   **Dose series patterns:** `dose_number`/`dose_series` reveal vaccination cadence,
+    which may be sensitive in aggregate.
+-   **Off-chain joins:** Any off-chain mapping of `token_id` or `patient` to identity
+    re-identifies the record; such mappings must be access-controlled and never published.
+
+Any proposed schema change must be reviewed against this policy before implementation.
+=======
 
 ## Strategy for Schema Evolution
 
 ### 1. Adding Optional Fields
 To add new fields without breaking existing records, use `Option<T>`. Soroban will deserialize missing fields as `None`.
 
-### 2. Breaking Changes (Major Version Bump)
+### 2. Privacy Constraints on Schema Changes
+No future schema version may add PII or unnecessary clinical fields. All additions must be
+justified against the Privacy Field Policy above and pass privacy review. When in doubt,
+store the data off-chain and keep only an opaque reference or hash on-chain.
+
+### 3. Breaking Changes (Major Version Bump)
 For breaking changes (e.g., removing fields or changing types):
 1.  Define a new struct (e.g., `VaccinationRecordV2`).
 2.  Update the `DataKey::Token` to store an `enum` wrapper:
@@ -36,70 +84,61 @@ For breaking changes (e.g., removing fields or changing types):
     -   When reading a record, check its version.
     -   If it's an old version, optionally migrate it to the latest version in storage when it's next accessed.
 
-### 3. Graceful Handling in `verify_vaccination`
+### 4. Graceful Handling in `verify_vaccination`
 The `verify_vaccination` function should continue to support older versions by:
 -   Using a common trait or converting older records to the latest internal representation before returning them to the caller.
 -   Ignoring records that cannot be parsed if they are considered "corrupt" or from a version no longer supported.
 
-## Contract Deployment: Idempotent Deploy / Upgrade / No-Op Semantics
+## Versioned Event Schemas
 
-Contract deployment is managed by the deployment workflow (see `.github/workflows/`). The workflow is **idempotent**: re-running it against an already-deployed contract will never silently create a second production contract. Instead, every run resolves to exactly one of three paths — **deploy**, **upgrade**, or **no-op** — based on the recorded deployment state and the requested action.
+Every state-changing action emits an event whose name, fields, and version are part of the contract's public interface. Indexers must be able to interpret events emitted before and after an upgrade without misclassifying payloads.
 
-### Deployment Manifest Format
+### Event Naming and Versioning Rules
 
-The workflow reads and writes a deployment manifest that records the authoritative state of each deployed contract. The manifest is checked into the repository (or stored as a workflow artifact) and is the single source of truth for "what is currently deployed where."
+-   Event names are stable and never reused for a different payload shape.
+-   Every event payload includes a `version: u32` field as its first data element. The version is bumped whenever the payload shape changes.
+-   Additive changes (new trailing fields) bump the minor version and keep the event name; indexers must tolerate unknown trailing fields.
+-   Breaking changes (removed fields, changed types, reordered fields) require a new event name suffixed with the major version (e.g. `record_issued_v2`) and the old event is deprecated but still emitted for at least one upgrade cycle.
+-   Topics are `(event_name, version)` so indexers can filter by version without decoding the payload.
 
-```json
-{
-  "network": "testnet",
-  "contracts": {
-    "vaccination_record": {
-      "contract_id": "CABC...XYZ",
-      "wasm_hash": "9f2c...e41a",
-      "schema_version": 1,
-      "deployed_at_ledger": 123456,
-      "deployed_at": "2024-01-01T00:00:00Z",
-      "deployed_by": "github-actions[bot]"
-    }
-  }
-}
-```
+### Event Catalogue (Version 1)
 
-Manifest fields:
+| Event name | Emitted by | Fields (in order) |
+| --- | --- | --- |
+| `record_issued` | `issue_vaccination` | `version: u32`, `token_id: u64`, `patient: Address`, `issuer: Address`, `schema_version: u32` |
+| `record_verified` | `verify_vaccination` | `version: u32`, `token_id: u64`, `verifier: Address`, `valid: bool` |
+| `record_revoked` | `revoke_vaccination` | `version: u32`, `token_id: u64`, `issuer: Address` |
+| `record_migrated` | lazy migration path | `version: u32`, `token_id: u64`, `from_schema: u32`, `to_schema: u32` |
+| `contract_upgraded` | `upgrade` | `version: u32`, `from_wasm_hash: BytesN<32>`, `to_wasm_hash: BytesN<32>`, `proposer: Address` |
 
-| Field | Description |
-| --- | --- |
-| `network` | Target network (`testnet`, `futurenet`, `mainnet`). One manifest per network. |
-| `contracts.<name>.contract_id` | The deployed contract address. Present only after a successful deploy. |
-| `contracts.<name>.wasm_hash` | Hash of the WASM currently deployed. Used to detect whether an upgrade is needed. |
-| `contracts.<name>.schema_version` | The `VaccinationRecord` schema version the deployed contract understands. |
-| `contracts.<name>.deployed_at_ledger` | Ledger sequence of the last deploy/upgrade. |
-| `contracts.<name>.deployed_at` | Timestamp of the last deploy/upgrade. |
-| `contracts.<name>.deployed_by` | Actor that performed the last deploy/upgrade. |
+### Indexer Guidance
 
-### Path Resolution
+1.  Decode the `version` field first and dispatch to the matching payload parser. Never infer the version from field count alone.
+2.  Keep parsers for every previously published event version; do not delete old parsers when a new version ships.
+3.  Treat unknown trailing fields as forward-compatible additions and ignore them.
+4.  If an event name is unknown, record it as `unclassified` rather than dropping it, so operators can detect indexer lag after an upgrade.
+5.  Fixtures under `contracts/fixtures/events/` contain one serialized sample per event version; contract tests assert emitted events match these fixtures byte-for-byte.
 
-On each run the workflow compares the manifest entry for the target contract against the WASM being built:
+## Upgrade Authorization and Compatibility
 
-1.  **No-op** — A `contract_id` exists in the manifest **and** its recorded `wasm_hash` matches the hash of the newly built WASM. The workflow performs no on-chain action and reports success. This is the default outcome for re-runs of a completed deployment.
-2.  **Upgrade** — A `contract_id` exists in the manifest **but** its recorded `wasm_hash` differs from the newly built WASM. The workflow invokes the contract's upgrade entry point against the **existing** `contract_id` and then updates the manifest's `wasm_hash`, `schema_version`, `deployed_at_ledger`, `deployed_at`, and `deployed_by`.
-3.  **Deploy** — No `contract_id` exists in the manifest for the target contract. The workflow deploys a new contract, records the resulting `contract_id` and `wasm_hash` in the manifest, and commits the updated manifest.
+### Authorized Upgrade Process
 
-### Explicit Target Contract for Upgrades
+1.  **Proposer:** Only the address stored under `DataKey::Admin` may call `upgrade`. The proposal must include the new WASM hash and a changelog entry describing state and event changes.
+2.  **Approval:** Upgrades require approval from the configured approver set (multisig). A single admin signature is insufficient once approvers are configured.
+3.  **Artifact review:** The new WASM must be reviewed for storage layout compatibility, event schema changes, and migration code before approval. The review record is referenced in the upgrade proposal.
+4.  **Execution:** On approval, the contract emits `contract_upgraded` and runs any registered migration entrypoint before accepting new state changes.
 
-Upgrades **must** name an explicit target contract. The workflow refuses to run an upgrade unless the target `contract_id` is supplied (via the manifest entry or an explicit `target_contract` input) and matches the manifest. This prevents an upgrade from accidentally being applied to the wrong contract, and prevents an ambiguous state from being resolved by guessing.
+### Rollback Limitations
 
-If the manifest records a `contract_id` but the requested action is `deploy`, the workflow fails fast rather than deploying a second contract. To intentionally deploy a fresh contract, the operator must first remove the manifest entry (or bump the contract name) in a reviewed change.
+-   Rollback to a previous WASM hash is permitted only if no storage migration has run; migrations are not automatically reversible.
+-   If a migration has run, rollback requires a forward-fix upgrade with an explicit reverse migration and a new approval.
+-   The `contract_upgraded` event history is the authoritative record of which WASM hash was active at any point.
 
-### Preventing a Second Production Contract on Re-Run
+### State Compatibility Across Supported Upgrades
 
-The following invariants guarantee that re-running a completed deployment cannot silently create an unintended second production contract:
-
--   **Manifest is authoritative.** The workflow always reads the manifest before deciding which path to take. A `contract_id` present in the manifest forces the run into the **upgrade** or **no-op** path — never **deploy**.
--   **Hash-based no-op detection.** Re-running with an unchanged WASM resolves to **no-op**, so no on-chain transaction is submitted.
--   **Deploy requires an empty slot.** The **deploy** path is only reachable when the manifest has no `contract_id` for the target contract. Any attempt to deploy over an existing entry fails the run.
--   **Manifest is updated atomically with the on-chain action.** The manifest is written only after the deploy/upgrade transaction is confirmed, and the updated manifest is committed as part of the same workflow run. A failed or interrupted run leaves the manifest unchanged, so the next run re-evaluates from a consistent state.
--   **Production networks require explicit confirmation.** For `mainnet`, the workflow requires an explicit `confirm: true` input and a matching `target_contract` for upgrades, so an accidental re-run cannot mutate production state without an intentional signal.
+-   Supported upgrade paths are documented per release; skipping more than one major schema version requires an explicit migration.
+-   Storage keys are never repurposed. Deprecated keys remain readable until a major version removes them with a documented migration.
+-   Tests must verify that unauthorized callers cannot upgrade, and that state written before an upgrade remains valid and readable after each supported upgrade path.
 
 ## Supported Schema Changes and Migration Fixtures
 
